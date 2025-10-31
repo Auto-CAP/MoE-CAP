@@ -1,0 +1,4 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "precision": "bfloat16"
+}
