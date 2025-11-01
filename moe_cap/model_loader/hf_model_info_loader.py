@@ -1,6 +1,7 @@
 from .base_model_info_loader import BaseModelInfoRetriever
 from typing import Any, Dict
 from transformers import AutoConfig
+from moe_cap.configs import CAPConfig
 
 
 def _pick(d: Dict[str, Any], *keys, default=None):
@@ -52,7 +53,7 @@ def _has_kw_recursive(d: Dict[str, Any], keywords) -> bool:
 
 class HFModelInfoRetriever(BaseModelInfoRetriever):
 
-    def __init__(self, config):
+    def __init__(self, config: CAPConfig):
         super().__init__(config)
 
         valid_precisions = [
@@ -68,7 +69,7 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
 
         self.hf_config = AutoConfig.from_pretrained(
             self.config.model_id,
-            revision=self.config.revision,
+            # revision=self.config.revision,
             trust_remote_code=True
         )
         self.cfg = self.hf_config.to_dict()

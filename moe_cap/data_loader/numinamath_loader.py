@@ -1,6 +1,6 @@
 import re
 from .base_data_loader import DataLoader
-from configs.cap_config import CAPConfig
+from moe_cap.configs.cap_config import CAPConfig
 from datasets import load_dataset
 from typing import List, Dict, Any
 
