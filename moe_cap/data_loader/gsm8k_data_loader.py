@@ -1,7 +1,7 @@
 from .base_data_loader import DataLoader
 from typing import Any, Dict, List, Optional, Tuple
 from datasets import Dataset
-from configs.cap_config import CAPConfig
+from moe_cap.configs.cap_config import CAPConfig
 from datasets import load_dataset
 import re
 
