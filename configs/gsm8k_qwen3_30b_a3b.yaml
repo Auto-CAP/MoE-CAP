@@ -1,0 +1,5 @@
+dataset_names: ["gsm8k"]
+
+metrics: ["accuracy", "f1"]
+
+model_id: Qwen/Qwen3-30B-A3B

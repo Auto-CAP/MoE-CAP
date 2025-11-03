@@ -15,6 +15,7 @@ from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable
+from sglang.srt.environ import envs
 
 from typing import Optional, Tuple, Union, List, Literal
 import time
@@ -27,6 +28,16 @@ import json
 
 
 _OutputMode = Literal["file", "object"]
+
+def _dump_to_file(name, data):
+    save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
+    path_output = f"{save_dir}/{name}"
+    logger.info(f"Write expert distribution to {path_output}")
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save(data, str(path_output))
+
+sglang_eplb_expert_distribution._dump_to_file = _dump_to_file
 
 class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
     def __init__(
@@ -167,8 +178,11 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         if output_mode == "file":
-            save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp"))
-            path_output = save_dir / "expert_distribution_record.jsonl"
+            save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp")
+            path_output = os.path.join(save_dir, f"{self._server_args.model_path}/expert_distribution_record.jsonl")
+            out_dirs = os.path.dirname(path_output)
+            if not os.path.exists(out_dirs):
+                os.makedirs(out_dirs, exist_ok=True)
             logger.info(f"Write expert distribution jsonl to {path_output}")
             with open(path_output, "w", encoding="utf-8") as f:
                 for record in self.expert_record_list:
@@ -180,7 +194,7 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         return self._recording
 
 
-os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.getcwd(), "activation_profiling_layer_count")
+os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.getcwd(), "outputs")
 
 _original_forward = ModelRunner.forward
 def forward_expert_record(
@@ -197,6 +211,7 @@ def forward_expert_record(
             self.forward_pass_id,
             forward_batch,
         ):  
+            torch.cuda.synchronize()
             start_time = time.perf_counter()
             output = self._forward_raw(
                 forward_batch,
@@ -205,6 +220,8 @@ def forward_expert_record(
                 reinit_attn_backend,
                 split_forward_count,
             )
+            
+            torch.cuda.synchronize()
             end_time = time.perf_counter()
             latency = end_time - start_time
 

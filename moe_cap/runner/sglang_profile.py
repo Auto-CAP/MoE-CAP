@@ -4,6 +4,7 @@ import os
 from collections import defaultdict, Counter
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.sgl_utils import _calculate_continuous_metrics_sglang
+from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader import GSM8KLoader
 from moe_cap.data_loader.loader_registry import get_loader_for_task
@@ -120,7 +121,13 @@ class SGLangMoEActivationAnalyzer:
 
     @sgl.function
     def run_sgl(s, question, max_new_tokens):
+        s += sgl.system_begin()
+        s += "You are an expert problem solver. Provide concise answers."
+        s += sgl.system_end()
+        s += sgl.user_begin()
         s += question
+        s += sgl.user_end()
+        s += sgl.assistant_begin()
         s += sgl.gen(
             "answer",
             max_tokens=max_new_tokens,
@@ -137,6 +144,15 @@ class SGLangMoEActivationAnalyzer:
             # Load and prepare inputs
             all_input_raw, max_new_tokens = self._load_data_for_task(dataset_name)
             batched_inputs = self._prepare_inputs(all_input_raw, max_new_tokens)
+            batched_inputs = batched_inputs
+
+            # Get ground truth targets for evaluation
+            try:
+                loader, _ = get_loader_for_task(dataset_name, self.config)
+                ground_truth = loader.get_target()
+            except Exception as e:
+                print(f"Warning: Could not load ground truth for {dataset_name}: {e}")
+                ground_truth = None
 
             # Start recording
             response = requests.post(f"http://localhost:{port}/start_expert_distribution_record")
@@ -163,7 +179,7 @@ class SGLangMoEActivationAnalyzer:
             tmp_record = os.path.join(self.output_dir, "expert_distribution_record.jsonl")
             dest_dir = os.path.join(self.output_dir, self.get_model_simple_name())
             os.makedirs(dest_dir, exist_ok=True)
-            dest_record = os.path.join(dest_dir, f"expert_distribution_record_{dataset_name}.jsonl")
+            dest_record = os.path.join(dest_dir, f"expert_distribution_record.jsonl")
             if os.path.exists(tmp_record):
                 # atomic replace if possible
                 try:
@@ -180,6 +196,30 @@ class SGLangMoEActivationAnalyzer:
             with open(dest_record, 'r', encoding='utf-8') as f:
                 all_experts_record = [json.loads(line.strip()) for line in f]
             res_dict = self.get_metrics(all_experts_record)
+
+            # Compute accuracy metrics if ground truth is available
+            if ground_truth is not None:
+                try:
+                    # Extract predictions from states
+                    predictions = [state["answer"] for state in states]
+                    # print(f"Predictions: {predictions}")
+                    # print(f"Ground truth: {ground_truth}")
+                    
+                    # Compute exact match using utility function
+                    accuracy_metrics = compute_accuracy_metrics(
+                        predictions=predictions,
+                        targets=ground_truth,
+                        dataset_name=dataset_name,
+                        extract_answers=True
+                    )
+                    res_dict.update(accuracy_metrics)
+                    
+                    # Print formatted accuracy summary
+                    summary = format_accuracy_summary(accuracy_metrics)
+                    print(f"Accuracy for {dataset_name}: {summary}")
+                except Exception as e:
+                    print(f"Warning: Could not compute accuracy metrics: {e}")
+            
             print(f"Metrics for {dataset_name}: {res_dict}")
 
             output_path = os.path.join(dest_dir, f"cap_metrics_{dataset_name}.json")
@@ -189,8 +229,8 @@ class SGLangMoEActivationAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, required=True)
-    parser.add_argument("--datasets", nargs='+', default=["gsm8k"], help="One or more dataset names (e.g. gsm8k)")
+    parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
+    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
     parser.add_argument("--output_dir", type=str)
@@ -221,9 +261,25 @@ def main():
     merged['precision'] = args.precision or merged.get('precision')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
 
+    # Validate required fields
+    if not merged.get('model_id'):
+        parser.error("--model_name is required (or 'model_id' must be specified in the config file)")
+    if not merged.get('dataset_names'):
+        parser.error("--datasets is required (or 'dataset_names' must be specified in the config file)")
+
+    # Validate that all datasets have registered loaders
+    from moe_cap.data_loader.loader_registry import _REGISTRY
+    unsupported = [ds for ds in merged['dataset_names'] if ds.lower() not in _REGISTRY]
+    if unsupported:
+        available = sorted(_REGISTRY.keys())
+        parser.error(
+            f"Unsupported dataset(s): {', '.join(unsupported)}. "
+            f"Available datasets: {', '.join(available)}"
+        )
+
     # Build CAPConfig and pass it to the analyzer (new API)
     cap_cfg = CAPConfig(
-        dataset_names=merged.get('dataset_names', ["gsm8k"]),
+        dataset_names=merged.get('dataset_names'),
         metrics=merged.get('metrics', []),
         model_id=merged.get('model_id'),
         precision=merged.get('precision', 'bfloat16'),

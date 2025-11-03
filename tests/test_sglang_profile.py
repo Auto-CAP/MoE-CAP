@@ -62,6 +62,9 @@ class TestSGLangProfileFlow(unittest.TestCase):
                 # monkeypatch the registry function and requests.post on the imported module
                 mod.get_loader_for_task = lambda task, cfg: (FakeGSM8KLoader(cfg), 256)
                 mod.requests.post = fake_post_factory(tmpdir)
+                # Prevent RuntimeEndpoint from making network calls and make set_default_backend a no-op
+                mod.RuntimeEndpoint = lambda url: SimpleNamespace(url=url)
+                mod.set_default_backend = lambda backend: None
 
                 # import analyzer from the already-loaded module
                 SGLangMoEActivationAnalyzer = mod.SGLangMoEActivationAnalyzer

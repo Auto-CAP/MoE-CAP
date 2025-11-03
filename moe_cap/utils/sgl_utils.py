@@ -7,51 +7,51 @@ from moe_cap.utils.basic_utils import (
     _process_outputs,
     _process_outputs_continuous,
     _calculate_throughput_metrics,
-    _calculate_smbu_smfu,
+    # _calculate_smbu_smfu,
     _calculate_prefill_metrics,
     _calculate_decoding_metrics
 )
 
-def _calculate_batch_metrics_sglang(outputs, decoding_tp, n_layers, d_model, 
-                                n_attn_heads, d_head, n_kv_heads, n_experts_per_tok, d_ff, 
-                                avg_activated_experts, hf_config, num_gpus, model_name, 
-                                used_dtype, batch_size, precision, ttft=None, prefill_tp=None):
-    """Calculate metrics for a batch of outputs"""
-    # Initialize hardware specs and output lists
-    hardware_specs = _get_hardware_specs(used_dtype)
-    output_data = _extract_output_data(outputs)
+# def _calculate_batch_metrics_sglang(outputs, decoding_tp, n_layers, d_model, 
+#                                 n_attn_heads, d_head, n_kv_heads, n_experts_per_tok, d_ff, 
+#                                 avg_activated_experts, hf_config, num_gpus, model_name, 
+#                                 used_dtype, batch_size, precision, ttft=None, prefill_tp=None):
+#     """Calculate metrics for a batch of outputs"""
+#     # Initialize hardware specs and output lists
+#     hardware_specs = _get_hardware_specs(used_dtype)
+#     output_data = _extract_output_data(outputs)
     
-    # Calculate model-specific sizes
-    per_token_kv_size = _calculate_kv_size(model_name, hf_config, n_layers, d_head, n_kv_heads)
-    attention_size_per_token = _calculate_attention_size(model_name, hf_config, d_model, n_attn_heads, d_head, n_kv_heads)
-    expert_config = _calculate_expert_config(model_name, hf_config, d_ff, d_model, n_layers)
+#     # Calculate model-specific sizes
+#     per_token_kv_size = _calculate_kv_size(model_name, hf_config, n_layers, d_head, n_kv_heads)
+#     attention_size_per_token = _calculate_attention_size(model_name, hf_config, d_model, n_attn_heads, d_head, n_kv_heads)
+#     expert_config = _calculate_expert_config(model_name, hf_config, d_ff, d_model, n_layers)
     
-    # Process outputs and calculate metrics
-    metrics_data = _process_outputs(output_data, per_token_kv_size, attention_size_per_token, 
-                                  model_name, hf_config, n_layers, n_attn_heads, d_head)
+#     # Process outputs and calculate metrics
+#     metrics_data = _process_outputs(output_data, per_token_kv_size, attention_size_per_token, 
+#                                   model_name, hf_config, n_layers, n_attn_heads, d_head)
 
-    # Calculate throughput metrics
-    if ttft is None or prefill_tp is None:
-        ttft, prefill_tp = _calculate_throughput_metrics(batch_size, output_data['prefill_lengths'],
-                                                       output_data['max_duration'])
+#     # Calculate throughput metrics
+#     if ttft is None or prefill_tp is None:
+#         ttft, prefill_tp = _calculate_throughput_metrics(batch_size, output_data['prefill_lengths'],
+#                                                        output_data['max_duration'])
 
     
-    # Calculate S-MBU and S-MFU
-    smbu_smfu_metrics = _calculate_smbu_smfu(model_name, n_layers, attention_size_per_token,
-                                           expert_config, avg_activated_experts, metrics_data,
-                                           hardware_specs, num_gpus, precision, ttft, prefill_tp,
-                                           batch_size, decoding_tp)
+#     # Calculate S-MBU and S-MFU
+#     smbu_smfu_metrics = _calculate_smbu_smfu(model_name, n_layers, attention_size_per_token,
+#                                            expert_config, avg_activated_experts, metrics_data,
+#                                            hardware_specs, num_gpus, precision, ttft, prefill_tp,
+#                                            batch_size, decoding_tp)
     
-    return {
-        'prefill_smbu': smbu_smfu_metrics['prefill_smbu'],
-        'prefill_smfu': smbu_smfu_metrics['prefill_smfu'],
-        'decoding_smbu': smbu_smfu_metrics['decoding_smbu'],
-        'decoding_smfu': smbu_smfu_metrics['decoding_smfu'],
-        'kv_size': metrics_data['true_kv_size'],
-        'decoding_throughput': decoding_tp,
-        'prefill_tp': prefill_tp,
-        'ttft': ttft
-    }
+#     return {
+#         'prefill_smbu': smbu_smfu_metrics['prefill_smbu'],
+#         'prefill_smfu': smbu_smfu_metrics['prefill_smfu'],
+#         'decoding_smbu': smbu_smfu_metrics['decoding_smbu'],
+#         'decoding_smfu': smbu_smfu_metrics['decoding_smfu'],
+#         'kv_size': metrics_data['true_kv_size'],
+#         'decoding_throughput': decoding_tp,
+#         'prefill_tp': prefill_tp,
+#         'ttft': ttft
+#     }
 
 def _calculate_continuous_metrics_sglang(n_layers, d_model, 
                                 n_attn_heads, d_head, n_kv_heads, d_ff, hf_config, num_gpus, model_name, 
