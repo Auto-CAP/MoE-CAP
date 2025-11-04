@@ -32,8 +32,8 @@ python -m moe_cap.runner.sglang_profile \
 
 The results will be stored under `outputs/`.
 
-## Benchmark Implementation Pipeline
-![Benchmark Implementation Pipeline](assets/cap_design.png)
+## Benchmark Pipeline
+![Benchmark Pipeline](assets/cap_design.png)
 
 ## Radar Plot Example:
 ![CAP Radar](assets/radar.png)
