@@ -13,6 +13,7 @@ from sglang.lang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 import sglang as sgl
 import json
+from transformers import AutoTokenizer
 
 class SGLangMoEActivationAnalyzer:
     def __init__(self, config: CAPConfig, output_dir: str = None):
@@ -91,8 +92,15 @@ class SGLangMoEActivationAnalyzer:
     def _prepare_inputs(self, all_input_raw, max_new_tokens):
         """Prepare inputs for the model"""       
         # Create batches
-        arguments = [{"question": q, "max_new_tokens": max_new_tokens} for q in all_input_raw]
-        return arguments  # Single batch for auto mode
+        tokenizer = AutoTokenizer.from_pretrained(self.hf_model_name)
+        system_prompt = "You are an expert problem solver. Provide concise answers."
+        chat_prompts = [[{"role": "system", "content": system_prompt},
+                        {"role": "user", "content": q}] for q in all_input_raw]
+        chat_prompts = tokenizer.apply_chat_template(chat_prompts, 
+                                                     add_generation_prompt=True,
+                                                     tokenize=False)
+        arguments = [{"question": q, "max_new_tokens": max_new_tokens} for q in chat_prompts]
+        return arguments  # Single batch for auto mod
     
     def get_metrics(self, records):
         res_dict = _calculate_continuous_metrics_sglang(
