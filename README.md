@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/moe-cap-logo.png" alt="MoE-CAP" width="220">
+  <img src="assets/moe-cap-logo.png" alt="MoE-CAP" width="320">
 </p>
 
 # MoE-CAP
