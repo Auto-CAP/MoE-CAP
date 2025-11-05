@@ -44,7 +44,7 @@ The results will be stored under `outputs/`.
 
 ## Contributing to MoE-CAP
 
-Thank you for your interest in contributing to the MoE-CAP project! We welcome contributions from everyone. Below you'll find guidance on how to set up your development environment, understand our architecture, and contribute effectively. If you have any questions or wish to discuss your contributions, please reach out to Yinsicheng Jiang or Yao Fu via email at [ysc.jiang@ed.ac.uk](mailto:ysc.jiang@ed.ac.uk) or [Y.Fu@ed.ac.uk](mailto:y.fu@ed.ac.uk).
+Thank you for your interest in contributing to the MoE-CAP project! We welcome contributions from everyone. Below you'll find guidance on how to set up your development environment, understand our architecture, and contribute effectively. If you have any questions or wish to discuss your contributions, please reach out to Yinsicheng Jiang, Yao Fu or Yeqi Huang via email at [ysc.jiang@ed.ac.uk](mailto:ysc.jiang@ed.ac.uk), [Y.Fu@ed.ac.uk](mailto:y.fu@ed.ac.uk) or [yeqi.huang@ed.ac.uk](mailto:yeqi.huang@ed.ac.uk).
 
 ### What We're Looking For in Contributions
 
