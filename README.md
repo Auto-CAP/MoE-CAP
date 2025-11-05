@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/moe-cap-logo.png" alt="MoE-CAP" width="220">
+</p>
+
 # MoE-CAP
 
 MoE-CAP is a benchmarking method designed to evaluate sparse MoE systems by integrating Cost, Accuracy, and Performance across these three dimensions.
