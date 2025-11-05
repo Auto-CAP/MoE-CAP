@@ -59,7 +59,6 @@ Documentation is currently of lower priority, but if you have thoughts or sugges
 Your contributions are crucial to the success and improvement of the MoE-CAP project. We look forward to collaborating with you.
 
 ## RoadMap:
-- [ ] Support vLLM, TensorRT-LLM, MoE-Infinity and Huggingface Transformers
 - [ ] Implement auto-submission CI pipeline.
 - [ ] Implement CAP HTTP Server.
 
