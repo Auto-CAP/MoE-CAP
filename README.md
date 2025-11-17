@@ -46,6 +46,7 @@ The results will be stored under `outputs/sglang/`.
 python -m moe_cap.systems.vllm \ 
         --model Qwen/Qwen3-235B-A22B-Thinking-2507 \
         --port 8000 \
+        --host 0.0.0.0 \
         --tensor-parallel-size 8 \
         --reasoning-parser deepseek_r1 \
         --max-num-batched-tokens 131072 # Set max-num-batched-tokens large referring to vLLM tuning guide.
@@ -55,7 +56,8 @@ python -m moe_cap.systems.vllm \
 ```bash
 python -m moe_cap.runner.openai_api_profile \
         --config-file configs/gsm8k_qwen3_235b_a22b.yaml \
-        --output_dir outputs/vllm/
+        --output_dir outputs/vllm/ \
+        --api-url http://0.0.0.0:8000/v1/completions
 ```
 
 
