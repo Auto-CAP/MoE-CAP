@@ -3,7 +3,7 @@ import argparse
 import os
 from collections import defaultdict, Counter
 from moe_cap.model_loader import HFModelInfoRetriever
-from moe_cap.utils.sgl_utils import _calculate_continuous_metrics_sglang
+from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
 from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader import GSM8KLoader
@@ -103,7 +103,7 @@ class SGLangMoEActivationAnalyzer:
         return arguments  # Single batch for auto mod
     
     def get_metrics(self, records):
-        res_dict = _calculate_continuous_metrics_sglang(
+        res_dict = _calculate_continuous_metrics(
             n_layers=self.n_layers,
             d_model=self.d_model,
             n_attn_heads=self.n_kv_heads,

@@ -21,23 +21,43 @@ pip install -e .
 Then you can import `moe_cap` directly.
 
 ## Quick Example
+### SGLang
 1. Launch our sglang custom server (e.g. H100)
 ```bash
 python -m moe_cap.systems.sglang \ 
         --model-path Qwen/Qwen3-235B-A22B-Thinking-2507 \
         --port 30000 \
         --expert-distribution-recorder-mode stat \
-        --tp-size 8
+        --tp-size 8 \
+        --reasoning-parser deepseek-r1
 ```
 
 2. Run our benchmark
 ```bash
 python -m moe_cap.runner.sglang_profile \
         --config-file configs/gsm8k_qwen3_235b_a22b.yaml \
-        --output_dir outputs/
+        --output_dir outputs/sglang/
 ```
 
-The results will be stored under `outputs/`.
+The results will be stored under `outputs/sglang/`.
+
+### vLLM
+```bash
+python -m moe_cap.systems.vllm \ 
+        --model Qwen/Qwen3-235B-A22B-Thinking-2507 \
+        --port 8000 \
+        --tensor-parallel-size 8 \
+        --reasoning-parser deepseek_r1 \
+        --max-num-batched-tokens 131072 # Set max-num-batched-tokens large referring to vLLM tuning guide.
+                                        # V1's mixed prefill-decode batching makes separate profiling difficult.
+```
+
+```bash
+python -m moe_cap.runner.openai_api_profile \
+        --config-file configs/gsm8k_qwen3_235b_a22b.yaml \
+        --output_dir outputs/vllm/
+```
+
 
 ## Benchmark Pipeline
 ![Benchmark Pipeline](assets/cap_design.png)
@@ -61,10 +81,6 @@ We are looking for contributions in several key areas to enhance the MoE-CAP pro
 Documentation is currently of lower priority, but if you have thoughts or suggestions, please feel free to raise them.
 
 Your contributions are crucial to the success and improvement of the MoE-CAP project. We look forward to collaborating with you.
-
-## RoadMap:
-- [ ] Implement auto-submission CI pipeline.
-- [ ] Implement CAP HTTP Server.
 
 ## Cite our paper
 ```
