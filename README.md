@@ -60,6 +60,7 @@ python -m moe_cap.runner.openai_api_profile \
         --api-url http://0.0.0.0:8000/v1/completions
 ```
 
+The results will be stored under `outputs/vllm/`.
 
 ## Benchmark Pipeline
 ![Benchmark Pipeline](assets/cap_design.png)
