@@ -201,7 +201,7 @@ def parse_nvidia_smi():
             if len(gpu_info) >= 4:
                 gpu_stats.append(gpu_info)
     # print(f"gpu_stats: {gpu_stats}")
-    gpu_name = f"{len(gpu_stats)}x{gpu_name}"
+    gpu_name = f"{gpu_name}"
     gpu_stats_total = {
                         GPU_TEMP: 0,
                         GPU_Power: 0,

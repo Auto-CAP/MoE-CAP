@@ -150,7 +150,7 @@ def execute_model_custom(
     intermediate_tensors: Optional[IntermediateTensors] = None,
 ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
     """Custom execute_model with latency tracking."""
-    
+    world_size = self.vllm_config.parallel_config.world_size
     with record_function_or_nullcontext("Preprocess"):
         with self.synchronize_input_prep():
             # Update persistent batch states.
@@ -346,7 +346,8 @@ def execute_model_custom(
             "latency": latency,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
-            "expert_activation": 0  # Will be populated later with actual expert data
+            "expert_activation": 0,  # Will be populated later with actual expert data,
+            "gpu_num": world_size
         }
         recording_state.add_record(rec_dict)
     

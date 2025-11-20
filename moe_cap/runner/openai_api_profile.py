@@ -13,6 +13,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
 from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
+from moe_cap.utils.hardware_utils import parse_nvidia_smi, GPU_Name
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
 import json
@@ -305,7 +306,8 @@ class OpenAIAPIMoEProfiler:
                     'latency': r.ttft,
                     'seq_lens_sum': prompt_lengths[i] if i < len(prompt_lengths) else 0,
                     'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                    'forward_mode': 'prefill'
+                    'forward_mode': 'prefill',
+                    'gpu_num': "N/A"
                 })
                 
                 # Add decoding record (assuming no batching - batch_size=1)
@@ -318,7 +320,8 @@ class OpenAIAPIMoEProfiler:
                         'latency': tpot,
                         'seq_lens_sum': r.output_len,
                         'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                        'forward_mode': 'decoding'
+                        'forward_mode': 'decoding',
+                        'gpu_num': "N/A"
                     })
 
         
@@ -332,7 +335,7 @@ class OpenAIAPIMoEProfiler:
                 n_kv_heads=self.n_kv_heads,
                 d_ff=self.d_ff,
                 hf_config=getattr(self.model_info, "hf_config", None),
-                num_gpus=4,
+                num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
                 model_name=self.hf_model_name,
                 used_dtype=self.used_dtype,
                 precision=self.precision,
@@ -354,6 +357,8 @@ class OpenAIAPIMoEProfiler:
             "successful_requests": len(successful_results),
             "failed_requests": len(results) - len(successful_results),
         })
+
+
         
         return res_dict
 
@@ -529,6 +534,31 @@ class OpenAIAPIMoEProfiler:
                     print(f"Accuracy for {dataset_name}: {summary}")
                 except Exception as e:
                     print(f"Warning: Could not compute accuracy metrics: {e}")
+            
+            # Auto-detect GPU type and number from hardware_utils
+            gpu_type = None
+            num_gpus = 1
+            try:
+                gpu_stats = parse_nvidia_smi()
+                if gpu_stats and len(gpu_stats) > 0:
+                    gpu_type = gpu_stats[0].get(GPU_Name)
+                    num_gpus = len(gpu_stats)
+            except Exception as e:
+                print(f"Warning: Could not detect GPU type: {e}")
+            
+            # Add metadata fields to the output
+            res_dict["model_name"] = self.hf_model_name
+            res_dict["method"] = "vllm" ## Current hardcoded to vllm
+            res_dict["precision"] = self.used_dtype
+            res_dict["e2e_s"] = round(total_time, 2)
+            res_dict["batch_size"] = batch_size if batch_size else None  # None indicates all inputs sent at once
+            if gpu_type:
+                res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
+            else:
+                res_dict["gpu_type"] = "Unknown"
+            res_dict["dataset"] = dataset_name
+            # Determine model type based on model name (heuristic)
+            res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
             print(f"Metrics for {dataset_name}: {res_dict}")
 
