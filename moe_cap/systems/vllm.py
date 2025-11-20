@@ -51,14 +51,47 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # ============================================================================
+# CRITICAL: Apply expert distribution monkey patching BEFORE any other vLLM imports
+# This must be done early so it applies to all worker processes
+# ============================================================================
+try:
+    # Add path to extracted_expert_dist for imports
+    _current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _expert_dist_path = os.path.join(_current_file_dir, "..", "extracted_expert_dist")
+    _expert_dist_path = os.path.abspath(_expert_dist_path)
+    if _expert_dist_path not in sys.path:
+        sys.path.insert(0, _expert_dist_path)
+    
+    from vllm_integration import apply_vllm_monkey_patching
+    print(f"[PID {os.getpid()}] Applying expert distribution monkey patching...", flush=True)
+    apply_vllm_monkey_patching()
+    print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
+except ImportError as e:
+    print(f"[PID {os.getpid()}] Warning: Could not import expert distribution patching: {e}", flush=True)
+    print(f"[PID {os.getpid()}] Expert distribution recording will not be available.", flush=True)
+except Exception as e:
+    print(f"[PID {os.getpid()}] Warning: Failed to apply expert distribution patching: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
+
+# ============================================================================
 # Global recording state - using file-based flags for multiprocessing safety
 # ============================================================================
 import tempfile
 import threading
+from pathlib import Path
 
 RECORDING_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_batch_recording.flag")
 RECORDING_DATA_FILE = os.path.join(tempfile.gettempdir(), "vllm_batch_records.jsonl")
 _record_lock = threading.Lock()
+
+# Expert distribution recording state
+EXPERT_DISTRIBUTION_RECORDING_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_recording.flag")
+EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
+EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
+_expert_record_lock = threading.Lock()
+_forward_pass_id_counter = 0
+_forward_pass_id_lock = threading.Lock()
 
 class RecordingState:
     """Global state for recording batch statistics - multiprocessing safe."""
@@ -139,6 +172,57 @@ class RecordingState:
         return count
 
 recording_state = RecordingState()
+
+# ============================================================================
+# Expert Distribution Recording State (similar to sglang.py)
+# ============================================================================
+class ExpertDistributionRecordingState:
+    """State for expert distribution recording with automatic JSONL output."""
+    
+    def __init__(self):
+        self.expert_record_list = []
+        self.output_dir = EXPERT_DISTRIBUTION_OUTPUT_DIR
+        self.model_path = None
+        self.enabled = False
+    
+    def set_model_path(self, model_path: str):
+        """Set the model path for output file naming."""
+        self.model_path = model_path.replace("/", "_")  # Sanitize path
+    
+    def enable(self):
+        """Enable automatic expert distribution recording."""
+        self.enabled = True
+        self.expert_record_list = []
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info("Expert distribution automatic recording enabled")
+    
+    def disable(self):
+        """Disable automatic expert distribution recording."""
+        self.enabled = False
+    
+    def add_record(self, record: dict):
+        """Add a record and write to JSONL file."""
+        if not self.enabled:
+            return
+        
+        with _expert_record_lock:
+            self.expert_record_list.append(record)
+            
+            # Write to JSONL file immediately (like sglang.py)
+            if self.model_path:
+                output_file = os.path.join(self.output_dir, f"{self.model_path}/expert_distribution_record.jsonl")
+                output_dir = os.path.dirname(output_file)
+                os.makedirs(output_dir, exist_ok=True)
+                
+                with open(output_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+    
+    def get_records(self):
+        """Get all recorded records."""
+        return self.expert_record_list.copy()
+
+expert_distribution_recording_state = ExpertDistributionRecordingState()
 
 # ============================================================================
 # Custom execute_model implementation
@@ -339,6 +423,52 @@ def execute_model_custom(
     forward_mode = "decode" if uniform_decode else "prefill"
     sum_seq_len = num_input_tokens
     
+    # Track forward pass ID (similar to sglang.py)
+    global _forward_pass_id_counter
+    with _forward_pass_id_lock:
+        _forward_pass_id_counter += 1
+        forward_pass_id = _forward_pass_id_counter
+    
+    # Collect expert distribution data if available
+    expert_activation = 0
+    try:
+        # Try to get expert distribution data from the model runner
+        if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder is not None:
+            # Check if recording is active
+            if hasattr(self.expert_distribution_recorder, '_recording') and self.expert_distribution_recorder._recording:
+                # Get current expert counts from buffer (similar to sglang.py's logical_count calculation)
+                if hasattr(self.expert_distribution_recorder, 'get_expert_counts_buffer'):
+                    buffer = self.expert_distribution_recorder.get_expert_counts_buffer()
+                    if buffer is not None and buffer.numel() > 0:
+                        # Buffer shape for stat mode: [num_layers, num_experts] (accumulated across forward passes)
+                        # Calculate expert_activation similar to sglang.py:
+                        # 1. activated_experts = (buffer > 0).float() -> [num_layers, num_experts]
+                        # 2. activated_per_layer = activated_experts.sum(dim=1) -> [num_layers]
+                        # 3. avg_activated_per_step = activated_per_layer.mean() -> scalar
+                        if buffer.ndim == 2:
+                            # [num_layers, num_experts] - this is the stat mode buffer shape
+                            activated_experts = (buffer > 0).float()  # [num_layers, num_experts]
+                            # Sum across experts dimension to get number of activated experts per layer
+                            activated_per_layer = activated_experts.sum(dim=1)  # [num_layers]
+                            # Average across layers to get one number per step (like sglang.py)
+                            avg_activated_per_step = activated_per_layer.mean().item()
+                            expert_activation = avg_activated_per_step
+                        elif buffer.ndim == 3:
+                            # [num_forwards, num_layers, num_experts] - per-pass mode
+                            # Get the latest forward pass
+                            latest_counts = buffer[-1]  # [num_layers, num_experts]
+                            activated_experts = (latest_counts > 0).float()
+                            activated_per_layer = activated_experts.sum(dim=1)
+                            avg_activated_per_step = activated_per_layer.mean().item()
+                            expert_activation = avg_activated_per_step
+                        else:
+                            # Fallback: count unique active experts
+                            active_experts = (buffer > 0).any(dim=0) if buffer.ndim > 1 else (buffer > 0)
+                            expert_activation = active_experts.sum().item() if active_experts.ndim > 0 else 0
+    except Exception as e:
+        # Don't fail if expert recording is not available or fails
+        logger.debug(f"Could not collect expert distribution data: {e}")
+    
     # Record batch statistics if recording is enabled (file-based check for multiprocessing)
     if recording_state.is_recording():
         rec_dict = {
@@ -346,9 +476,31 @@ def execute_model_custom(
             "latency": latency,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
-            "expert_activation": 0  # Will be populated later with actual expert data
+            "expert_activation": expert_activation
         }
         recording_state.add_record(rec_dict)
+    
+    # Automatic expert distribution recording (sglang.py style)
+    # Only record on rank 0 to avoid duplicates (similar to sglang.py's tp_rank == 0 check)
+    if expert_distribution_recording_state.enabled:
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_group = get_tp_group()
+            tp_rank = tp_group.rank if tp_group is not None else 0
+            
+            if tp_rank == 0:  # Only record on rank 0 (like sglang.py)
+                record_dict = {
+                    "forward_pass_id": forward_pass_id,
+                    "batch_size": batch_size,
+                    "latency": latency,
+                    "seq_lens_sum": sum_seq_len,
+                    "forward_mode": forward_mode,
+                    "expert_activation": expert_activation
+                }
+                expert_distribution_recording_state.add_record(record_dict)
+                logger.info(f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}")
+        except Exception as e:
+            logger.debug(f"Could not record expert distribution automatically: {e}")
     
     if not self.use_async_scheduling:
         return output
@@ -737,7 +889,7 @@ class FlexibleArgumentParser(ArgumentParser):
 # ============================================================================
 def add_custom_endpoints(app):
     """Add custom endpoints to the FastAPI app for batch statistics recording."""
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
     
     @app.post("/start_batch_recording")
@@ -785,6 +937,392 @@ def add_custom_endpoints(app):
             "status": "success",
             "message": f"Cleared {count} records"
         })
+    
+    # Expert distribution endpoints
+    # Helper function to get engine client from request (vLLM v1 pattern)
+    async def get_engine_client_from_request(request):
+        """Get engine client from FastAPI request using vLLM's dependency injection."""
+        # Primary method: Use vLLM's engine_client dependency (vLLM v1 pattern)
+        try:
+            from vllm.entrypoints.openai.api_server import engine_client
+            engine_client_obj = await engine_client(request)
+            if engine_client_obj is not None and hasattr(engine_client_obj, 'collective_rpc'):
+                return engine_client_obj
+        except (ImportError, AttributeError, Exception) as e:
+            logger.debug(f"Could not use vLLM's engine_client: {e}")
+        
+        # Fallback: Try to find engine in app.state
+        try:
+            # Check common locations
+            for attr_name in ['engine', 'llm_engine', 'engine_core']:
+                engine = getattr(request.app.state, attr_name, None)
+                if engine is not None and hasattr(engine, 'collective_rpc'):
+                    return engine
+            
+            # Check app.state._state dictionary
+            if hasattr(request.app.state, '_state') and isinstance(request.app.state._state, dict):
+                for value in request.app.state._state.values():
+                    if hasattr(value, 'collective_rpc'):
+                        return value
+                    if hasattr(value, 'engine'):
+                        engine = getattr(value, 'engine')
+                        if hasattr(engine, 'collective_rpc'):
+                            return engine
+        except Exception as e:
+            logger.debug(f"Error checking app.state: {e}")
+        
+        return None
+    
+    @app.post("/configure_expert_distribution")
+    async def configure_expert_distribution(request: Request, mode: str = "stat", verbose: bool = False):
+        """Configure expert distribution recording mode.
+        
+        Supported modes:
+        - "stat": Aggregate statistics across tokens (default, fastest)
+        - "per_token": Records per-token expert selections in detail (most detailed)
+        - "per_pass": Records per-forward-pass expert activation metrics (balanced)
+        
+        Example:
+            POST /configure_expert_distribution?mode=per_token
+            POST /configure_expert_distribution?mode=per_pass
+            POST /configure_expert_distribution?mode=stat
+        """
+        try:
+            # Validate and normalize mode
+            valid_modes = {"stat", "per_token", "per_pass"}
+            mode_lower = mode.lower().strip()
+            
+            # Normalize common typos
+            mode_normalizations = {
+                "per_path": "per_pass",  # Common typo
+                "stats": "stat",  # Plural form
+                "per-token": "per_token",  # With dash
+                "per-pass": "per_pass",  # With dash
+            }
+            
+            if mode_lower in mode_normalizations:
+                mode_lower = mode_normalizations[mode_lower]
+                logger.warning(f"Normalized mode '{mode}' to '{mode_lower}'")
+            
+            # Validate mode
+            if mode_lower not in valid_modes:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": f"Invalid recording mode: '{mode}'. Valid modes are: {', '.join(sorted(valid_modes))}",
+                        "valid_modes": sorted(valid_modes)
+                    }
+                )
+            
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None or not hasattr(engine_client_obj, 'collective_rpc'):
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available. Server may not be fully initialized."}
+                )
+            
+            # Use normalized mode
+            await engine_client_obj.collective_rpc("configure_expert_distribution_recording", args=(mode_lower, verbose))
+            return JSONResponse(content={
+                "status": "success",
+                "message": f"Expert distribution recording configured with mode={mode_lower}",
+                "mode": mode_lower,
+                "original_mode": mode if mode != mode_lower else None
+            })
+        except Exception as e:
+            import traceback
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+            )
+    
+    @app.post("/start_expert_distribution")
+    async def start_expert_distribution(request: Request):
+        """Start recording expert distributions."""
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None or not hasattr(engine_client_obj, 'collective_rpc'):
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available. Server may not be fully initialized."}
+                )
+            
+            await engine_client_obj.collective_rpc("start_expert_distribution_recording")
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Started recording expert distributions"
+            })
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e)}
+            )
+    
+    @app.post("/stop_expert_distribution")
+    async def stop_expert_distribution(request: Request):
+        """Stop recording expert distributions."""
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None or not hasattr(engine_client_obj, 'collective_rpc'):
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available. Server may not be fully initialized."}
+                )
+            
+            await engine_client_obj.collective_rpc("stop_expert_distribution_recording")
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Stopped recording expert distributions"
+            })
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e)}
+            )
+    
+    @app.post("/dump_expert_distribution")
+    async def dump_expert_distribution(request: Request, summary_only: bool = True):
+        """Dump recorded expert distribution data.
+        
+        Args:
+            summary_only: If True (default), return summary statistics instead of raw arrays.
+                         If False, return full detailed data (can be very large).
+        
+        Returns:
+            Summary statistics similar to sglang.py format, or full data if summary_only=False
+        """
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None or not hasattr(engine_client_obj, 'collective_rpc'):
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available. Server may not be fully initialized."}
+                )
+            
+            all_data = await engine_client_obj.collective_rpc("dump_expert_distribution_record")
+            
+            # Verify data format - should be a list of dicts (one per worker)
+            if not isinstance(all_data, list):
+                all_data = [all_data] if all_data else []
+            
+            if summary_only:
+                # Return clean summary similar to sglang.py
+                summary = {
+                    "status": "success",
+                    "num_workers": len(all_data),
+                    "summary": {}
+                }
+                
+                # Get per-forward-pass records from expert_distribution_recording_state (if available)
+                if expert_distribution_recording_state.enabled:
+                    records = expert_distribution_recording_state.get_records()
+                    # Clean sample records - remove large arrays to keep output compact
+                    sample_records = []
+                    for record in (records[:5] if len(records) > 5 else records):
+                        clean_record = record.copy()
+                        # Remove large arrays that cause formatting issues
+                        clean_record.pop("expert_counts", None)  # per_pass mode: 2D array
+                        clean_record.pop("activated_per_layer", None)  # per_pass mode: 1D array
+                        clean_record.pop("topk_ids", None)  # per_token mode: 3D array [num_layers, num_tokens, topk]
+                        sample_records.append(clean_record)
+                    summary["summary"]["forward_pass_records"] = {
+                        "count": len(records),
+                        "sample": sample_records,
+                        "note": f"Full records written to JSONL file. Showing {min(5, len(records))} of {len(records)} records."
+                    }
+                
+                # Extract summary from worker data
+                worker_summaries = []
+                for worker_data in all_data:
+                    if not isinstance(worker_data, dict):
+                        continue
+                    
+                    worker_summary = {
+                        "rank": worker_data.get("rank", "unknown"),
+                        "recording_mode": worker_data.get("recording_mode", "unknown"),
+                        "num_layers": worker_data.get("num_layers"),
+                        "num_experts": worker_data.get("num_physical_experts") or worker_data.get("num_experts"),
+                    }
+                    
+                    # Add mode-specific summaries
+                    if "aggregated_expert_counts" in worker_data:
+                        counts = worker_data["aggregated_expert_counts"]
+                        if isinstance(counts, list) and len(counts) > 0:
+                            # Calculate summary statistics similar to sglang.py
+                            try:
+                                # Convert to torch tensor for calculations
+                                counts_tensor = torch.tensor(counts, dtype=torch.float32)
+                                
+                                if counts_tensor.ndim == 2:  # [num_layers, num_experts]
+                                    activated_experts = (counts_tensor > 0).float()
+                                    activated_per_layer = activated_experts.sum(dim=1)
+                                    avg_activated = activated_per_layer.mean()
+                                    worker_summary["expert_activation_avg"] = float(avg_activated.item())
+                                    worker_summary["total_expert_selections"] = int(counts_tensor.sum().item())
+                                elif counts_tensor.ndim == 3:  # [num_forwards, num_layers, num_experts]
+                                    latest_counts = counts_tensor[-1] if len(counts_tensor) > 0 else counts_tensor[0]
+                                    activated_experts = (latest_counts > 0).float()
+                                    activated_per_layer = activated_experts.sum(dim=1)
+                                    avg_activated = activated_per_layer.mean()
+                                    worker_summary["expert_activation_avg"] = float(avg_activated.item())
+                                    worker_summary["total_forward_passes"] = len(counts_tensor)
+                            except Exception as e:
+                                # If conversion fails, just note that counts are available
+                                worker_summary["expert_counts_available"] = True
+                                worker_summary["expert_counts_shape"] = str(len(counts)) if isinstance(counts, list) else "unknown"
+                    
+                    if "records" in worker_data:
+                        records = worker_data["records"]
+                        worker_summary["num_records"] = len(records) if isinstance(records, list) else 0
+                        if isinstance(records, list) and len(records) > 0:
+                            # For sample record, only show summary stats, not full arrays
+                            sample_record = records[0].copy()
+                            # Remove large arrays to keep output compact
+                            sample_record.pop("expert_counts", None)  # Remove 2D array (per_pass mode)
+                            sample_record.pop("activated_per_layer", None)  # Remove 1D array (per_pass mode)
+                            sample_record.pop("topk_ids", None)  # Remove 3D array (per_token mode) - shape: [num_layers, num_tokens, topk]
+                            worker_summary["sample_record"] = sample_record
+                    
+                    worker_summaries.append(worker_summary)
+                
+                summary["summary"]["workers"] = worker_summaries
+                
+                # Add file location info if available
+                if expert_distribution_recording_state.enabled and expert_distribution_recording_state.model_path:
+                    output_file = os.path.join(
+                        EXPERT_DISTRIBUTION_OUTPUT_DIR,
+                        f"{expert_distribution_recording_state.model_path}/expert_distribution_record.jsonl"
+                    )
+                    summary["summary"]["jsonl_file"] = output_file
+                    summary["summary"]["note"] = "Detailed per-forward-pass records are written to JSONL file automatically."
+                
+                return JSONResponse(content=summary)
+            else:
+                # Return full data (original behavior)
+                def make_serializable(obj):
+                    """Recursively make an object JSON-serializable."""
+                    import inspect
+                    if inspect.iscoroutine(obj):
+                        raise ValueError("Found coroutine in data - this should not happen")
+                    elif isinstance(obj, (str, int, float, bool, type(None))):
+                        return obj
+                    elif isinstance(obj, dict):
+                        return {k: make_serializable(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [make_serializable(item) for item in obj]
+                    elif hasattr(obj, '__dict__'):
+                        return make_serializable(obj.__dict__)
+                    else:
+                        return str(obj)
+                
+                try:
+                    all_data = make_serializable(all_data)
+                except Exception as e:
+                    logger.warning(f"Could not fully serialize data: {e}, converting to string")
+                    all_data = str(all_data)
+                
+                return JSONResponse(content={
+                    "status": "success",
+                    "data": all_data,
+                    "num_workers": len(all_data),
+                    "note": "Full detailed data returned. Use summary_only=true for cleaner output."
+                })
+        except Exception as e:
+            import traceback
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+            )
+    
+    @app.get("/expert_distribution_status")
+    async def expert_distribution_status(request: Request):
+        """Get expert distribution recording status."""
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None:
+                return JSONResponse(content={
+                    "status": "warning",
+                    "message": "Engine not available. Expert distribution recording may not be initialized yet."
+                })
+            
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Expert distribution recording is available. Use /configure_expert_distribution to configure."
+            })
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e)}
+            )
+    
+    @app.get("/debug_expert_recording")
+    async def debug_expert_recording(request: Request):
+        """Debug endpoint to check expert recording setup."""
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None or not hasattr(engine_client_obj, 'collective_rpc'):
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available. Server may not be fully initialized."}
+                )
+            
+            try:
+                all_data = await engine_client_obj.collective_rpc("dump_expert_distribution_record")
+                return JSONResponse(content={
+                    "status": "success",
+                    "message": "Expert distribution recording is working",
+                    "num_workers": len(all_data) if isinstance(all_data, list) else 1,
+                    "sample_data": all_data[0] if isinstance(all_data, list) and len(all_data) > 0 else {}
+                })
+            except Exception as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": f"Could not get expert distribution data: {str(e)}"}
+                )
+        except Exception as e:
+            import traceback
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+            )
+    
+    @app.get("/debug_expert_recorder_state")
+    async def debug_expert_recorder_state(request: Request):
+        """Debug endpoint to check expert recorder state in workers."""
+        try:
+            engine_client_obj = await get_engine_client_from_request(request)
+            if engine_client_obj is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": "Engine not available"}
+                )
+            
+            # Use dump_expert_distribution_record to get recorder info
+            results = await engine_client_obj.collective_rpc("dump_expert_distribution_record")
+            if isinstance(results, list) and len(results) > 0:
+                sample = results[0]
+                return JSONResponse(content={
+                    "status": "success",
+                    "num_workers": len(results),
+                    "sample_worker_data": {
+                        "rank": sample.get("rank"),
+                        "num_layers": sample.get("num_layers"),
+                        "num_physical_experts": sample.get("num_physical_experts"),
+                        "has_counts": bool(sample.get("aggregated_expert_counts")),
+                        "has_records": bool(sample.get("records"))
+                    }
+                })
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "No worker data available"}
+            )
+        except Exception as e:
+            import traceback
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+            )
 
 
 def main():
@@ -797,12 +1335,33 @@ def main():
     )
     
     parser = make_arg_parser(parser)
+    
+    # Add custom argument for expert distribution auto-recording (similar to sglang.py)
+    parser.add_argument(
+        "--enable-expert-distribution-metrics",
+        action="store_true",
+        help="Automatically start expert distribution recording and write to JSONL file (similar to sglang.py)"
+    )
+    
     args = parser.parse_args()
     
     if hasattr(args, "model_tag") and args.model_tag is not None:
         args.model = args.model_tag
     
     validate_parsed_serve_args(args)
+    
+    # Enable automatic expert distribution recording if flag is set (similar to sglang.py)
+    if hasattr(args, "enable_expert_distribution_metrics") and args.enable_expert_distribution_metrics:
+        expert_distribution_recording_state.enable()
+        # Set model path for output file naming
+        model_path = getattr(args, "model", None) or getattr(args, "model_tag", None) or "unknown_model"
+        expert_distribution_recording_state.set_model_path(model_path)
+        
+        # Create file-based flag for worker processes to auto-start recording
+        # This allows worker processes to check the flag and auto-start when creating the recorder
+        with open(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE, 'w') as f:
+            f.write('1')
+        logger.info("Expert distribution metrics enabled - recording will auto-start in worker processes")
     
     # Monkey-patch build_app to add custom endpoints
     from vllm.entrypoints.openai import api_server
@@ -811,7 +1370,16 @@ def main():
     def patched_build_app(args):
         """Patched build_app that adds custom endpoints."""
         app = original_build_app(args)
+        
+        # vLLM stores the engine in app.state, but we need to access it correctly
+        # The engine is typically set by vLLM's build_app function
+        # We'll access it through the endpoints using dependency injection pattern
+        
         add_custom_endpoints(app)
+        
+        # Note: Auto-start is handled via file-based flag checked in worker processes
+        # The recorder will auto-start when created if EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE exists
+        
         return app
     
     api_server.build_app = patched_build_app

@@ -30,6 +30,105 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+# ============================================================================
+# Helper Functions for Common Patching Logic
+# ============================================================================
+
+def _create_select_experts_patcher(original_func, debug_prefix=""):
+    """Create a patched select_experts function with expert distribution recording.
+    
+    This helper function creates the patching logic that's shared between
+    FusedMoE.select_experts and SharedFusedMoE.select_experts, and between
+    main process and worker process patching.
+    """
+    def patched_select_experts(*args, **kwargs):
+        # Call original function
+        result = original_func(*args, **kwargs)
+        
+        # CRITICAL: Always check recorder at runtime (don't let torch.compile optimize this away)
+        def _get_recorder():
+            from expert_distribution_recorder import get_global_expert_distribution_recorder
+            return get_global_expert_distribution_recorder()
+        
+        # Add recording logic
+        try:
+            recorder = _get_recorder()
+            
+            # Check if recording is active (runtime check to prevent optimization)
+            recorder_recording = False
+            if recorder is not None and hasattr(recorder, '_recording'):
+                recorder_recording = recorder._recording
+            
+            if recorder_recording:
+                # Extract topk_ids from result
+                topk_weights, topk_ids, _ = result
+                
+                # Get layer_idx from context manager (set by decoder layer forward)
+                effective_layer_idx = None
+                if recorder is not None and hasattr(recorder, '_current_layer_idx'):
+                    effective_layer_idx = recorder._current_layer_idx
+                
+                if effective_layer_idx is not None:
+                    # Get recording mode
+                    recording_mode = getattr(recorder, '_recording_mode', 'stat')
+                    
+                    if recording_mode == "stat":
+                        # Use torch.compile-compatible atomic recording for stat mode
+                        from moe_hooks import record_expert_selection_atomic
+                        record_expert_selection_atomic(effective_layer_idx, topk_ids)
+                    else:
+                        # Use traditional callback for other modes (per_token, per_pass)
+                        recorder.on_select_experts(effective_layer_idx, topk_ids)
+        except Exception:
+            # Silently fail - don't crash if recording fails
+            pass
+        
+        return result
+    
+    return patched_select_experts
+
+
+def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_worker=False):
+    """Patch decoder layer __init__ to extract and store layer_idx.
+    
+    Args:
+        layer_class: The decoder layer class to patch
+        extract_layer_idx_fn: Function to extract layer_idx from prefix
+        layer_name: Name of the layer class for logging
+        is_worker: Whether this is being patched in a worker process
+    """
+    if hasattr(layer_class, '_expert_dist_patched_init' + ('_worker' if is_worker else '')):
+        return  # Already patched
+    
+    original_init = layer_class.__init__
+    
+    def patched_init(self, *args, **kwargs):
+        # Extract layer_idx from prefix
+        layer_idx = None
+        if len(args) >= 4:  # Qwen: config, layer_id, quant_config, prefix
+            layer_idx = extract_layer_idx_fn(args[3])
+        elif len(args) >= 2:  # DeepSeek: vllm_config, prefix
+            layer_idx = extract_layer_idx_fn(args[1])
+        elif 'prefix' in kwargs:
+            layer_idx = extract_layer_idx_fn(kwargs['prefix'])
+        
+        # Call original __init__
+        original_init(self, *args, **kwargs)
+        
+        # Store layer_idx as instance attribute
+        if layer_idx is not None:
+            self.layer_idx = layer_idx
+    
+    layer_class.__init__ = patched_init
+    setattr(layer_class, '_expert_dist_patched_init' + ('_worker' if is_worker else ''), True)
+    
+    if is_worker:
+        import os
+        print(f"[ExpertDist-Worker PID {os.getpid()}] Patched {layer_name}.__init__ BEFORE model load", flush=True)
+    else:
+        print(f"[ExpertDist] Patched {layer_name}.__init__ in main process")
+
+
 def apply_vllm_monkey_patching():
     """Apply vLLM monkey patching for expert distribution recording."""
     try:
@@ -39,7 +138,10 @@ def apply_vllm_monkey_patching():
 
         # Import Worker early and store original __init__
         from vllm.v1.worker.gpu_worker import Worker
-        _original_worker_init = Worker.__init__
+        # Store the original __init__ before we patch it (only once)
+        if not hasattr(Worker, '_original_init'):
+            Worker._original_init = Worker.__init__
+        _original_worker_init = Worker._original_init
 
         # Monkey patch vLLM to use our custom expert_distribution_recorder
         import vllm.distributed.eplb as eplb_module
@@ -55,6 +157,27 @@ def apply_vllm_monkey_patching():
         eplb_module.moe_hooks = custom_hooks
 
         print("Successfully monkey-patched vLLM with custom expert_distribution_recorder")
+
+        # CRITICAL: Patch decoder layer __init__ methods BEFORE Worker.__init__ is called
+        # This ensures layer_idx is set when layers are created during model loading
+        try:
+            from vllm.model_executor.models.utils import extract_layer_index
+            
+            # Patch Qwen models if available
+            try:
+                from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
+                _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=False)
+            except ImportError:
+                pass
+            
+            # Patch DeepSeek models if available
+            try:
+                from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
+                _patch_decoder_layer_init(DeepseekV2DecoderLayer, extract_layer_index, "DeepseekV2DecoderLayer", is_worker=False)
+            except ImportError:
+                pass
+        except Exception as e:
+            print(f"[ExpertDist] Warning: Could not patch decoder layer __init__ in main process: {e}")
 
         # Monkey patch Worker to add expert distribution methods
         try:
@@ -125,7 +248,20 @@ def apply_vllm_monkey_patching():
                                 return
 
                             import torch
+                            import os
+                            import tempfile
                             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                            
+                            # Check for auto-start flag (similar to sglang.py's enable_expert_distribution_metrics)
+                            EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
+                            auto_start_enabled = os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE)
+                            
+                            # Auto-configure if flag is set but no mode specified
+                            if auto_start_enabled and recording_mode is None:
+                                recording_mode = "stat"  # Default to stat mode like sglang.py
+                                enable_metrics = True  # Enable metrics like sglang.py
+                                if rank == 0:
+                                    print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-starting expert distribution recording (mode={recording_mode})", flush=True)
 
                             self.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
                                 recording_mode=recording_mode,
@@ -136,6 +272,12 @@ def apply_vllm_monkey_patching():
                                 enable_metrics=enable_metrics,
                             )
                             set_global_expert_distribution_recorder(self.expert_distribution_recorder)
+                            
+                            # Auto-start recording if flag is set (similar to sglang.py)
+                            if auto_start_enabled:
+                                self.expert_distribution_recorder.start_record()
+                                if rank == 0:
+                                    print(f"[ExpertDist-Worker PID {os.getpid()}] Expert distribution recording auto-started", flush=True)
 
                         def start_expert_distribution_recording(self):
                             if self.expert_distribution_recorder:
@@ -170,135 +312,91 @@ def apply_vllm_monkey_patching():
                     except ImportError:
                         pass
 
-                    # Import required modules
-                    import inspect
+                    # Patch decoder layer forward methods for per_token/per_pass mode data collection
                     from vllm.model_executor.models.utils import extract_layer_index
-
-                    # Try to patch Qwen models
+                    
+                    # Patch Qwen models forward method
                     try:
-                        from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer, Qwen2MoeSparseMoeBlock
-                    except ImportError:
-                        Qwen2MoeDecoderLayer = None
-                        Qwen2MoeSparseMoeBlock = None
-
-                    # Try to patch DeepSeek models
-                    try:
-                        from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
-                    except ImportError:
-                        DeepseekV2DecoderLayer = None
-
-                    # Patch Qwen models if available
-                    if Qwen2MoeDecoderLayer is not None:
-                        # Store original __init__
-                        original_init = Qwen2MoeDecoderLayer.__init__
-
-                        def patched_qwen_init(self, *args, **kwargs):
-                            # Extract layer_idx from prefix if prefix is provided
-                            layer_idx = None
-                            if len(args) >= 4:  # config, layer_id, quant_config, prefix
-                                prefix = args[3]
-                                layer_idx = extract_layer_index(prefix)
-                            elif 'prefix' in kwargs:
-                                prefix = kwargs['prefix']
-                                layer_idx = extract_layer_index(prefix)
-
-                            # Don't filter kwargs - let the original __init__ handle what it accepts
-                            # The signature is: (self, config, layer_id, quant_config=None, prefix="", alt_stream=None)
-                            # Just pass everything through and let the method handle unknown parameters
-                            original_init(self, *args, **kwargs)
-
-                            # Set layer_idx as instance attribute if we found it
-                            if layer_idx is not None:
-                                self.layer_idx = layer_idx
-
-                        # Patch the Qwen2MoeDecoderLayer forward method
-                        original_forward = Qwen2MoeDecoderLayer.forward
-
-                        def patched_qwen_forward(self, *args, **kwargs):
-                            # Get layer index
-                            layer_idx = getattr(self, 'layer_idx', None)
-
-                            if layer_idx is not None:
-                                from expert_distribution_recorder import get_global_expert_distribution_recorder
-                                recorder = get_global_expert_distribution_recorder()
-                                if recorder is not None and hasattr(recorder, '_recording') and recorder._recording:
-                                    # For per_pass and per_token modes, we need layer context for data collection
-                                    # For stat mode, select_experts patching handles everything atomically
-                                    if recorder._recording_mode in ["per_pass", "per_token"]:
+                        from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
+                        if not hasattr(Qwen2MoeDecoderLayer, '_expert_dist_patched_forward'):
+                            original_forward = Qwen2MoeDecoderLayer.forward
+                            
+                            def patched_qwen_forward(self, *args, **kwargs):
+                                layer_idx = getattr(self, 'layer_idx', None)
+                                if layer_idx is not None:
+                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    recorder = get_global_expert_distribution_recorder()
+                                    if recorder is not None and getattr(recorder, '_recording', False):
                                         with recorder.with_current_layer(layer_idx):
                                             result = original_forward(self, *args, **kwargs)
-
-                                        # For per_pass and per_token modes, collect data only on the last layer (23)
-                                        # This simulates collecting once per complete forward pass (token through all layers)
-                                        if recorder._recording_mode in ["per_pass", "per_token"] and layer_idx == 23:
+                                        
+                                        # For per_pass and per_token modes, collect data on last layer
+                                        if getattr(recorder, '_recording_mode', None) in ["per_pass", "per_token"] and layer_idx == 23:
                                             try:
                                                 collected_data = recorder._gatherer.collect()
                                                 recorder._gatherer.reset()
-
-                                                # Use a simple incrementing counter for forward pass ID
                                                 if not hasattr(recorder, '_forward_pass_counter'):
                                                     recorder._forward_pass_counter = 0
-                                                forward_pass_id = recorder._forward_pass_counter
+                                                recorder._accumulator.append(recorder._forward_pass_counter, collected_data)
                                                 recorder._forward_pass_counter += 1
-
-                                                recorder._accumulator.append(forward_pass_id, collected_data)
                                             except Exception:
                                                 pass
-
                                         return result
-
-                            return original_forward(self, *args, **kwargs)
-
-                        Qwen2MoeDecoderLayer.__init__ = patched_qwen_init
-                        Qwen2MoeDecoderLayer.forward = patched_qwen_forward
-
-                    # Patch DeepSeek models if available
-                    if DeepseekV2DecoderLayer is not None:
-                        # Patch the DeepseekV2DecoderLayer forward method
-                        original_deepseek_forward = DeepseekV2DecoderLayer.forward
-
-                        def patched_deepseek_forward(self, *args, **kwargs):
-                            # Get layer index from self.mlp if it exists
-                            layer_idx = getattr(self, 'layer_idx', None)
-
-                            if layer_idx is not None:
-                                from expert_distribution_recorder import get_global_expert_distribution_recorder
-                                recorder = get_global_expert_distribution_recorder()
-                                if recorder is not None and hasattr(recorder, '_recording') and recorder._recording:
-                                    # For per_pass and per_token modes, we need layer context for data collection
-                                    # For stat mode, select_experts patching handles everything atomically
-                                    if recorder._recording_mode in ["per_pass", "per_token"]:
+                                return original_forward(self, *args, **kwargs)
+                            
+                            Qwen2MoeDecoderLayer.forward = patched_qwen_forward
+                            Qwen2MoeDecoderLayer._expert_dist_patched_forward = True
+                    except ImportError:
+                        pass
+                    
+                    # Patch DeepSeek models forward method
+                    try:
+                        from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
+                        if not hasattr(DeepseekV2DecoderLayer, '_expert_dist_patched_forward'):
+                            original_forward = DeepseekV2DecoderLayer.forward
+                            
+                            def patched_deepseek_forward(self, *args, **kwargs):
+                                layer_idx = getattr(self, 'layer_idx', None)
+                                if layer_idx is not None:
+                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    recorder = get_global_expert_distribution_recorder()
+                                    if recorder is not None and getattr(recorder, '_recording', False):
                                         with recorder.with_current_layer(layer_idx):
-                                            result = original_deepseek_forward(self, *args, **kwargs)
-
-                                        # For per_pass and per_token modes, collect data only on the last layer
-                                        # Use a reasonable default for DeepSeek (assuming similar layer count)
-                                        last_layer_idx = getattr(recorder, '_expert_location_metadata', None)
-                                        if last_layer_idx:
-                                            last_layer_idx = recorder._expert_location_metadata.num_layers - 1
-                                        else:
-                                            last_layer_idx = 59  # Conservative default for DeepSeek
-
-                                        if recorder._recording_mode in ["per_pass", "per_token"] and layer_idx == last_layer_idx:
+                                            result = original_forward(self, *args, **kwargs)
+                                        
+                                        # For per_pass and per_token modes, collect data on last layer
+                                        metadata = getattr(recorder, '_expert_location_metadata', None)
+                                        last_layer_idx = metadata.num_layers - 1 if metadata else 59
+                                        if getattr(recorder, '_recording_mode', None) in ["per_pass", "per_token"] and layer_idx == last_layer_idx:
                                             try:
                                                 collected_data = recorder._gatherer.collect()
                                                 recorder._gatherer.reset()
-
-                                                # Use a simple incrementing counter for forward pass ID
                                                 if not hasattr(recorder, '_forward_pass_counter'):
                                                     recorder._forward_pass_counter = 0
-                                                forward_pass_id = recorder._forward_pass_counter
+                                                recorder._accumulator.append(recorder._forward_pass_counter, collected_data)
                                                 recorder._forward_pass_counter += 1
-
-                                                recorder._accumulator.append(forward_pass_id, collected_data)
                                             except Exception:
                                                 pass
-
                                         return result
-
-                            return original_deepseek_forward(self, *args, **kwargs)
-
-                        DeepseekV2DecoderLayer.forward = patched_deepseek_forward
+                                return original_forward(self, *args, **kwargs)
+                            
+                            DeepseekV2DecoderLayer.forward = patched_deepseek_forward
+                            DeepseekV2DecoderLayer._expert_dist_patched_forward = True
+                    except ImportError:
+                        pass
+                    
+                    # IMPORTANT: Also patch FusedMoE.select_experts in worker process
+                    # This is needed because worker processes might reload modules
+                    try:
+                        from vllm.model_executor.layers.fused_moe import FusedMoE
+                        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_worker_after_init'):
+                            original_select_experts_worker = FusedMoE.select_experts
+                            patched_func = _create_select_experts_patcher(original_select_experts_worker)
+                            FusedMoE.select_experts = staticmethod(patched_func)
+                            FusedMoE.select_experts._expert_dist_patched_worker_after_init = True
+                            print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts in worker process")
+                    except Exception as e:
+                        print(f"[ExpertDist-Worker] Could not patch FusedMoE.select_experts in worker: {e}")
 
                 except Exception as e:
                     # Don't crash if monkey patching fails in worker
@@ -306,29 +404,38 @@ def apply_vllm_monkey_patching():
 
             # Add the method to the Worker class
             Worker._apply_worker_monkey_patching = _apply_worker_monkey_patching
-
-            def patched_init(self, *args, **kwargs):
-                # Apply monkey patching in the worker process before model loading
-                self._apply_worker_monkey_patching()
-
-                # Only pass Worker.__init__ parameters to avoid passing them to model constructors
-                # Worker.__init__ accepts: vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
-                worker_kwargs = {k: v for k, v in kwargs.items()
-                               if k in ['vllm_config', 'local_rank', 'rank', 'distributed_init_method', 'is_driver_worker']}
-
-                # Call the original Worker.__init__ using super() to bypass our patched method
-                super(Worker, self).__init__(**worker_kwargs)
-
-                # Initialize expert distribution recorder (will be done lazily when needed)
-                self.expert_distribution_recorder = None
-
-            # Add expert distribution recorder methods to Worker
+            
+            # IMPORTANT: Also add the RPC methods to Worker class so they're available for collective_rpc
+            # These need to be added BEFORE patching __init__ so they're available when workers are created
             def configure_expert_distribution_recorder(self, recording_mode: str | None = None, enable_metrics: bool = False, buffer_size: int = -1):
                 """Configure the expert distribution recorder on the worker."""
                 # Ensure model_runner exists (it should be initialized by now)
                 if not hasattr(self, 'model_runner') or self.model_runner is None:
                     # If model_runner not ready yet, return error
                     return {"success": False, "error": "model_runner not initialized"}
+
+                # Validate and normalize recording mode
+                valid_modes = {"stat", "per_token", "per_pass"}
+                if recording_mode is not None:
+                    mode_lower = recording_mode.lower().strip()
+                    # Normalize common typos
+                    mode_normalizations = {
+                        "per_path": "per_pass",
+                        "stats": "stat",
+                        "per-token": "per_token",
+                        "per-pass": "per_pass",
+                    }
+                    if mode_lower in mode_normalizations:
+                        mode_lower = mode_normalizations[mode_lower]
+                    if mode_lower not in valid_modes:
+                        return {
+                            "success": False,
+                            "error": f"Invalid recording mode: '{recording_mode}'. Valid modes are: {', '.join(sorted(valid_modes))}"
+                        }
+                    recording_mode = mode_lower
+                else:
+                    # Default to "stat" if None
+                    recording_mode = "stat"
 
                 # Call the GPUModelRunner method directly to avoid delegation issues
                 from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
@@ -368,18 +475,23 @@ def apply_vllm_monkey_patching():
                 import torch
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-                self.model_runner.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
-                    recording_mode=recording_mode,
-                    expert_location_metadata=expert_location_metadata,
-                    rank=rank,
-                    device=str(self.model_runner.device),
-                    buffer_size=buffer_size,
-                    enable_metrics=enable_metrics,
-                )
-                set_global_expert_distribution_recorder(self.model_runner.expert_distribution_recorder)
+                try:
+                    self.model_runner.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
+                        recording_mode=recording_mode,
+                        expert_location_metadata=expert_location_metadata,
+                        rank=rank,
+                        device=str(self.model_runner.device),
+                        buffer_size=buffer_size,
+                        enable_metrics=enable_metrics,
+                    )
+                    set_global_expert_distribution_recorder(self.model_runner.expert_distribution_recorder)
+                except Exception as e:
+                    # Return error instead of raising to prevent worker crash
+                    return {"success": False, "error": str(e)}
 
                 recorder = self.model_runner.expert_distribution_recorder
                 return {
+                    "success": True,
                     "recording_mode": getattr(recorder, "_recording_mode", None),
                     "recording": recorder.recording,
                 }
@@ -405,13 +517,96 @@ def apply_vllm_monkey_patching():
                 if hasattr(self, 'model_runner') and self.model_runner is not None:
                     self.model_runner.stop_expert_distribution_recording()
 
-            # Monkey patch the methods
-            Worker.__init__ = patched_init
+            # Add methods to Worker class BEFORE patching __init__
             Worker.configure_expert_distribution_recorder = configure_expert_distribution_recorder
             Worker.configure_expert_distribution_recording = configure_expert_distribution_recording
             Worker.start_expert_distribution_recording = start_expert_distribution_recording
             Worker.dump_expert_distribution_record = dump_expert_distribution_record
             Worker.stop_expert_distribution_recording = stop_expert_distribution_recording
+
+            def patched_init(self, *args, **kwargs):
+                # CRITICAL: Apply ALL patching BEFORE Worker.__init__ loads the model
+                # This ensures patching is applied BEFORE torch.compile and CUDA graph capture
+                # This must happen BEFORE model loading, especially for spawned workers
+                # Import os at the top to avoid UnboundLocalError
+                import os
+                try:
+                    # Patch decoder layers BEFORE model is loaded
+                    import inspect
+                    from vllm.model_executor.models.utils import extract_layer_index
+                    
+                    # Patch Qwen models if available
+                    try:
+                        from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
+                        _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=True)
+                    except ImportError:
+                        pass
+                    
+                    # Patch DeepSeek models if available
+                    try:
+                        from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
+                        _patch_decoder_layer_init(DeepseekV2DecoderLayer, extract_layer_index, "DeepseekV2DecoderLayer", is_worker=True)
+                    except ImportError:
+                        pass
+                    
+                    # CRITICAL: Patch FusedMoE.select_experts BEFORE torch.compile
+                    # torch.compile happens during model loading, so we must patch before that
+                    try:
+                        from vllm.model_executor.layers.fused_moe import FusedMoE
+                        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_worker'):
+                            original_select_experts_worker = FusedMoE.select_experts
+                            patched_func = _create_select_experts_patcher(original_select_experts_worker)
+                            FusedMoE.select_experts = staticmethod(patched_func)
+                            FusedMoE.select_experts._expert_dist_patched_worker = True
+                            print(f"[ExpertDist-Worker PID {os.getpid()}] Patched FusedMoE.select_experts BEFORE torch.compile", flush=True)
+                    except Exception as e:
+                        print(f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not patch FusedMoE.select_experts before compile: {e}", flush=True)
+                        
+                except Exception as e:
+                    print(f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not patch decoder layers before model load: {e}")
+                
+                # Only pass Worker.__init__ parameters to avoid passing them to model constructors
+                # Worker.__init__ accepts: vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
+                worker_kwargs = {k: v for k, v in kwargs.items()
+                               if k in ['vllm_config', 'local_rank', 'rank', 'distributed_init_method', 'is_driver_worker']}
+
+                # Call the original Worker.__init__ (this loads the model, which now uses patched decoder layers)
+                # Use Worker._original_init directly (not super()) to avoid calling our patched version recursively
+                Worker._original_init(self, **worker_kwargs)
+
+                # Apply additional monkey patching AFTER initialization (for forward methods, etc.)
+                # This ensures Worker is fully initialized before we patch things
+                try:
+                    self._apply_worker_monkey_patching()
+                except Exception as e:
+                    # Don't crash if patching fails, but log it
+                    print(f"[ExpertDist] Warning: Worker monkey patching failed: {e}")
+
+                # Initialize expert distribution recorder (will be done lazily when needed)
+                self.expert_distribution_recorder = None
+                
+                # Auto-configure and start expert distribution recording if flag is set (similar to sglang.py)
+                try:
+                    import tempfile
+                    EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
+                    auto_start_enabled = os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE)
+                    
+                    if auto_start_enabled and hasattr(self, 'model_runner') and self.model_runner is not None:
+                        # Auto-configure with stat mode (like sglang.py)
+                        self.configure_expert_distribution_recorder(recording_mode="stat", enable_metrics=True, buffer_size=-1)
+                        # Auto-start recording
+                        if hasattr(self.model_runner, 'expert_distribution_recorder') and self.model_runner.expert_distribution_recorder is not None:
+                            self.model_runner.expert_distribution_recorder.start_record()
+                            import torch
+                            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                            if rank == 0:
+                                print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-configured and started expert distribution recording", flush=True)
+                except Exception as e:
+                    # Don't fail if auto-start fails
+                    print(f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not auto-start expert distribution recording: {e}", flush=True)
+
+            # Monkey patch __init__ (methods are already added above)
+            Worker.__init__ = patched_init
 
             print("Successfully monkey-patched Worker with expert distribution methods")
 
@@ -468,6 +663,7 @@ def apply_vllm_monkey_patching():
                     expert_location_metadata = self._get_expert_location_metadata()
                     if expert_location_metadata is None:
                         print("[ExpertRecorder] Could not extract expert location metadata from model")
+                        
                         return
 
                     import torch
@@ -529,116 +725,25 @@ def apply_vllm_monkey_patching():
     except ImportError as e:
         print(f"vLLM not available: {e}")
 
-    # Patch FusedMoE.select_experts and SharedFusedMoE.select_experts to add our recording logic
+    # Patch FusedMoE.select_experts and SharedFusedMoE.select_experts in main process
+    # Note: Worker processes will patch these again during initialization
     try:
         from vllm.model_executor.layers.fused_moe import FusedMoE
-        original_select_experts = FusedMoE.select_experts
-
-        def patched_select_experts(*args, **kwargs):
-            # Call original
-            result = original_select_experts(*args, **kwargs)
-
-            # Add our recording logic
-            try:
-                from expert_distribution_recorder import get_global_expert_distribution_recorder
-                recorder = get_global_expert_distribution_recorder()
-
-                if recorder is not None and hasattr(recorder, '_recording') and recorder._recording:
-                    # Get topk_ids from result (select_experts returns topk_weights, topk_ids, zero_expert_result)
-                    topk_weights, topk_ids, _ = result
-
-                    # For STAT mode, try to get layer_idx from context manager first, then fallback to inspection
-                    effective_layer_idx = getattr(recorder, '_current_layer_idx', None)
-
-                    # If context manager didn't set it, try to inspect the call stack to find layer_idx
-                    if effective_layer_idx is None:
-                        try:
-                            import inspect
-                            frame = inspect.currentframe()
-                            while frame:
-                                frame_locals = frame.f_locals
-                                # Check if we're in a decoder layer forward method
-                                self_obj = frame_locals.get('self', None)
-                                if self_obj and hasattr(self_obj, 'layer_idx'):
-                                    effective_layer_idx = self_obj.layer_idx
-                                    break
-                                frame = frame.f_back
-                        except:
-                            pass
-
-                    if effective_layer_idx is not None:
-                        if recorder._recording_mode == "stat":
-                            # Use torch.compile-compatible atomic recording for stat mode
-                            from moe_hooks import record_expert_selection_atomic
-                            record_expert_selection_atomic(effective_layer_idx, topk_ids)
-                        else:
-                            # Use traditional callback for other modes (per_token, per_pass)
-                            # Layer context is already set by decoder layer forward patching
-                            recorder.on_select_experts(effective_layer_idx, topk_ids)
-            except Exception as e:
-                # Don't crash if recording fails
-                pass
-
-            return result
-
-        FusedMoE.select_experts = staticmethod(patched_select_experts)
-
+        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_main'):
+            original_select_experts = FusedMoE.select_experts
+            patched_func = _create_select_experts_patcher(original_select_experts)
+            FusedMoE.select_experts = staticmethod(patched_func)
+            FusedMoE.select_experts._expert_dist_patched_main = True
     except Exception:
         pass
 
     # Also patch SharedFusedMoE.select_experts
     try:
         from vllm.model_executor.layers.shared_fused_moe.shared_fused_moe import SharedFusedMoE
-        original_shared_select_experts = SharedFusedMoE.select_experts
-
-        def patched_shared_select_experts(*args, **kwargs):
-            # Call original
-            result = original_shared_select_experts(*args, **kwargs)
-
-            # Add our recording logic
-            try:
-                from expert_distribution_recorder import get_global_expert_distribution_recorder
-                recorder = get_global_expert_distribution_recorder()
-
-                if recorder is not None and hasattr(recorder, '_recording') and recorder._recording:
-                    # Get topk_ids from result (select_experts returns topk_weights, topk_ids, zero_expert_result)
-                    topk_weights, topk_ids, _ = result
-
-                    # For STAT mode, try to get layer_idx from context manager first, then fallback to inspection
-                    effective_layer_idx = getattr(recorder, '_current_layer_idx', None)
-
-                    # If context manager didn't set it, try to inspect the call stack to find layer_idx
-                    if effective_layer_idx is None:
-                        try:
-                            import inspect
-                            frame = inspect.currentframe()
-                            while frame:
-                                frame_locals = frame.f_locals
-                                # Check if we're in a decoder layer forward method
-                                self_obj = frame_locals.get('self', None)
-                                if self_obj and hasattr(self_obj, 'layer_idx'):
-                                    effective_layer_idx = self_obj.layer_idx
-                                    break
-                                frame = frame.f_back
-                        except:
-                            pass
-
-                    if effective_layer_idx is not None:
-                        if recorder._recording_mode == "stat":
-                            # Use torch.compile-compatible atomic recording for stat mode
-                            from moe_hooks import record_expert_selection_atomic
-                            record_expert_selection_atomic(effective_layer_idx, topk_ids)
-                        else:
-                            # Use traditional callback for other modes (per_token, per_pass)
-                            # Layer context is already set by decoder layer forward patching
-                            recorder.on_select_experts(effective_layer_idx, topk_ids)
-            except Exception as e:
-                # Don't crash if recording fails
-                pass
-
-            return result
-
-        SharedFusedMoE.select_experts = staticmethod(patched_shared_select_experts)
-
+        if not hasattr(SharedFusedMoE.select_experts, '_expert_dist_patched_main'):
+            original_shared_select_experts = SharedFusedMoE.select_experts
+            patched_func = _create_select_experts_patcher(original_shared_select_experts)
+            SharedFusedMoE.select_experts = staticmethod(patched_func)
+            SharedFusedMoE.select_experts._expert_dist_patched_main = True
     except Exception:
         pass

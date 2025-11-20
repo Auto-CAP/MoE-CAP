@@ -342,6 +342,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._accumulator.append(0, single_pass_data)  # Use dummy forward_pass_id
 
         output = self._accumulator.dump(output_path=output_path)
+        # Add recording_mode to output for easier identification
+        output["recording_mode"] = self._recording_mode
         # Don't reset here - reset happens in stop_record
         return output
 
@@ -692,6 +694,7 @@ class _PerTokenAccumulator(_Accumulator):
 
         output = {
             "records": processed_records,
+            "rank": self._rank,
             "num_layers": self._expert_location_metadata.num_layers,
             "num_physical_experts": self._expert_location_metadata.num_physical_experts,
         }
@@ -755,8 +758,10 @@ class _PerPassAccumulator(_Accumulator):
         logger.info(f"[PerPassAccumulator] Dumping {len(self._pass_records)} records")
         output = {
             "records": self._pass_records,
+            "rank": self._rank,
             "num_layers": self._expert_location_metadata.num_layers,
             "num_experts": self._expert_location_metadata.num_logical_experts,
+            "num_physical_experts": self._expert_location_metadata.num_physical_experts,
             "total_forward_passes": len(self._pass_records),
         }
 
