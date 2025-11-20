@@ -12,7 +12,7 @@ python -m moe_cap.systems.vllm Qwen/Qwen1.5-MoE-A2.7B --tensor-parallel-size 4 -
 
 **Step 1: Configure recording mode**
 ```bash
-curl -X POST "http://localhost:8000/configure_expert_distribution?mode=stat"
+curl -X POST "http://localhost:8000/configure_expert_distribution?mode=per_pass"
 ```
 
 Available modes:
