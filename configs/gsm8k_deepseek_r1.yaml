@@ -1,0 +1,7 @@
+dataset_names: ["gsm8k"]
+
+metrics: ["em", "f1"]
+
+model_id: deepseek-ai/DeepSeek-R1
+
+precision: fp8
