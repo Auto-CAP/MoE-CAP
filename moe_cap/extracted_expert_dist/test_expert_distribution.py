@@ -57,7 +57,6 @@ def create_llm_model(model_name: str, gpu_memory_utilization: float = 0.4):
         gpu_memory_utilization=gpu_memory_utilization,
         disable_log_stats=True,
         tensor_parallel_size=4,
-        enforce_eager=True,
     )
 
 
@@ -535,7 +534,9 @@ def print_results(result: dict):
                                     for layer_idx, layer_experts in enumerate(topk_ids[:4]):  # First 4 layers
                                         # Flatten nested lists and filter out -1 values
                                         if isinstance(layer_experts, list):
-                                            if isinstance(layer_experts[0], list):  # Nested structure
+                                            if not layer_experts:
+                                                valid_experts = []
+                                            elif isinstance(layer_experts[0], list):  # Nested structure
                                                 valid_experts = []
                                                 for sublist in layer_experts:
                                                     if isinstance(sublist, list):

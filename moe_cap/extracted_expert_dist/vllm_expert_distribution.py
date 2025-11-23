@@ -300,7 +300,7 @@ def get_expert_stats(llm) -> Optional[Dict[str, Any]]:
         # Check if recording is active first
         # We can't easily check this without RPC, so just try to dump
         all_data = llm.collective_rpc("dump_expert_distribution_record")
-        
+        print(all_data)
         # Filter out empty dictionaries from workers
         if not all_data:
             return None

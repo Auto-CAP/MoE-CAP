@@ -31,21 +31,33 @@ def record_expert_selections_atomic(
     """
     Record expert selections using atomic operations that are torch.compile compatible.
     This function uses only PyTorch operations and can be traced by torch.compile.
+    CUDA graph compatible: avoids CPU-side conditionals that break graph capture.
     """
     # Flatten and filter valid expert IDs (-1 indicates padding/invalid)
+    # Follow SGLang's approach: use masked_fill instead of conditional to avoid CPU sync
     topk_ids_flat = topk_ids.flatten()
+    
+    # Ensure tensors are on the same device (important for CUDA graph compatibility)
+    if topk_ids_flat.device != expert_counts.device:
+        topk_ids_flat = topk_ids_flat.to(expert_counts.device)
+    
     mask = topk_ids_flat != -1
+    
+    # Use scatter_add unconditionally - masked_fill ensures invalid indices don't affect results
+    # This avoids CPU-side conditionals that break CUDA graph capture
+    index = topk_ids_flat.masked_fill(~mask, 0).long()
+    src = mask.int()
+    
+    # Safety check for layer_idx
+    if layer_idx < 0 or layer_idx >= expert_counts.shape[0]:
+        return
 
-    if mask.any():
-        # Use scatter_add with atomic operations on GPU
-        valid_ids = topk_ids_flat[mask]
-        # Ensure valid_ids is on the same device and is long type
-        valid_ids = valid_ids.to(expert_counts.device).long()
-        # Create a tensor of ones for the count increments
-        ones = torch.ones_like(valid_ids, dtype=expert_counts.dtype)
+    # Atomic add to the expert counts - this is torch.compile and CUDA graph compatible
+    # Clamp index to ensure we don't write out of bounds (which causes hard crash)
+    max_expert_idx = expert_counts.shape[1] - 1
+    index = index.clamp(0, max_expert_idx)
+    expert_counts[layer_idx].scatter_add_(dim=0, index=index, src=src)
 
-        # Atomic add to the expert counts - this is torch.compile compatible
-        expert_counts[layer_idx].scatter_add_(0, valid_ids, ones)
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +234,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._enable_metrics = enable_metrics
 
         self._recording = False
-        self._current_layer_idx = None
+        # Use Tensor for current_layer_idx to be traceable by Dynamo/CUDAGraph
+        self._current_layer_idx = torch.tensor([-1], dtype=torch.long, device=self._device)
         self._current_forward_pass_id = None
 
         self._gatherer = _SinglePassGatherer.init_new(
@@ -237,6 +250,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             enable_metrics,
         )
 
+        # Set up global buffer early so it's available during CUDA graph capture
+        # This ensures the buffer pointer is captured into CUDA graphs
+        if hasattr(self._gatherer, 'get_expert_counts_buffer'):
+            set_global_expert_counts_buffer(self._gatherer.get_expert_counts_buffer())
+
         if enable_metrics:
             logger.info(
                 "ExpertDistributionRecorder auto-starting due to enable_metrics=True"
@@ -245,13 +263,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_current_layer(self, layer_idx: int):
-        """Context manager for tracking current layer."""
-        prev_layer = self._current_layer_idx
-        self._current_layer_idx = layer_idx
+        """Context manager for tracking current layer.
+        Updates the tensor in-place so it's captured by Dynamo/CUDAGraph.
+        """
+        # We don't support nested layers with tensor state restoration efficiently in graph
+        # But for sequential layers, this is fine.
+        self._current_layer_idx.fill_(layer_idx)
         try:
             yield
         finally:
-            self._current_layer_idx = prev_layer
+            self._current_layer_idx.fill_(-1)
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int):
@@ -271,15 +292,30 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
             self._current_forward_pass_id = prev_pass_id
 
-    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor) -> None:
-        """Record expert selection."""
-        if not self._recording:
+    def on_select_experts(self, layer_idx: int | torch.Tensor | None, topk_ids: torch.Tensor) -> None:
+        """Record expert selection.
+        
+        prefers _current_layer_idx from context manager,
+        falls back to layer_idx parameter. Allows operations during CUDA graph capture.
+        """
+        is_capturing = torch.get_device_module().is_current_stream_capturing()
+        
+        if not (self._recording or is_capturing):
             return
-        # Use current layer context if layer_idx is not provided
+        
+        # Prefer _current_layer_idx from context manager (matches SGLang pattern)
+        # If layer_idx is explicitly passed, use it. Otherwise use context.
         if layer_idx is None:
             layer_idx = self._current_layer_idx
-        if layer_idx is None:
-            return
+            
+        # We assume layer_idx is valid (either int or Tensor).
+        # If it's a Tensor, it might be -1 (invalid), but we rely on patched_qwen_forward to set it.
+        
+        # During CUDA graph capture, only allow CUDA graph compatible gatherers
+        if is_capturing and not self._recording:
+            if not hasattr(self._gatherer, '_expert_count'):
+                return
+            
         self._gatherer.on_select_experts(layer_idx, topk_ids)
 
     def get_expert_counts_buffer(self) -> Optional[torch.Tensor]:
@@ -294,9 +330,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_expert: torch.Tensor,
     ) -> None:
         """Record expert dispatch information."""
-        if not self._recording or self._current_layer_idx is None:
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if not (self._recording or is_capturing):
             return
-        self._gatherer.on_expert_dispatch(layer_idx, num_tokens_per_expert)
+        if self._current_layer_idx is None and layer_idx is None:
+            return
+        
+        effective_layer_idx = layer_idx if layer_idx is not None else self._current_layer_idx
+        self._gatherer.on_expert_dispatch(effective_layer_idx, num_tokens_per_expert)
 
     def start_record(self) -> None:
         """Start recording."""
@@ -522,10 +563,33 @@ class _StatGatherer(_SinglePassGatherer):
             device=device_obj,
         )
 
-    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor) -> None:
+    def on_select_experts(self, layer_idx: int | torch.Tensor, topk_ids: torch.Tensor) -> None:
         """Accumulate expert selection counts."""
-        # Use the torch.compile compatible recording function
-        record_expert_selections_atomic(self._expert_count, layer_idx, topk_ids)
+        # Match SGLang's approach: operate directly on self._expert_count
+        # This ensures the buffer is always accessible, even during CUDA graph capture
+        
+        # CRITICAL FIX: When layer_idx is a Tensor (traced by Dynamo), 
+        # self._expert_count[layer_idx] returns a COPY (advanced indexing), not a view.
+        # So scatter_add_ would update the copy and be lost.
+        # Instead, we flatten the buffer and calculate global indices.
+        
+        num_experts = self._expert_count.shape[1]
+        topk_ids_flat = topk_ids.flatten()
+        mask = topk_ids_flat != -1
+        
+        # Calculate flat indices: layer_offset + expert_id
+        # safe_topk ensures we don't have negative indices before addition
+        safe_topk = topk_ids_flat.masked_fill(~mask, 0).long()
+        
+        # layer_idx can be int or Tensor. Broadcasting works for both.
+        flat_indices = layer_idx * num_experts + safe_topk
+        
+        # Mask invalid indices (though they should be masked by src=mask anyway)
+        # We rely on src=0 to ignore invalid entries.
+        
+        self._expert_count.view(-1).scatter_add_(
+            dim=0, index=flat_indices, src=mask.int()
+        )
 
     def get_expert_counts_buffer(self) -> torch.Tensor:
         """Get the GPU buffer for expert counts (for torch.compile compatibility)."""

@@ -106,9 +106,36 @@ def record_expert_selection_atomic(
         record_expert_selections_atomic,
     )
 
-    buffer = get_global_expert_counts_buffer()
-    if buffer is not None:
-        record_expert_selections_atomic(buffer, layer_idx, topk_ids)
+    # Check if recording is active or if we're capturing CUDA graphs
+    recorder = get_global_expert_distribution_recorder()
+    if recorder is None:
+        return
+    
+    # Allow recording during normal recording OR during CUDA graph capture
+    # operations are captured into CUDA graphs
+    # even when recording isn't active yet, ensuring they're available during execution
+    is_capturing = torch.get_device_module().is_current_stream_capturing()
+    if not (recorder._recording or is_capturing):
+        return
+
+    # Get buffer from recorder's gatherer - this ensures we use the same buffer
+    # pointer during capture and execution, which is critical for CUDA graphs
+    buffer = None
+    if hasattr(recorder, '_gatherer') and hasattr(recorder._gatherer, 'get_expert_counts_buffer'):
+        buffer = recorder._gatherer.get_expert_counts_buffer()
+    
+    # Fallback to global buffer if recorder doesn't have gatherer yet
+    if buffer is None:
+        buffer = get_global_expert_counts_buffer()
+    
+    # If buffer is still None, we can't record - this should not happen if
+    # the recorder was initialized correctly, but we check to avoid errors
+    if buffer is None:
+        return
+    
+    # Record expert selections - this operation will be captured into CUDA graphs
+    # if called during capture, and replayed during execution
+    record_expert_selections_atomic(buffer, layer_idx, topk_ids)
 
 
 def report_expert_dispatch(
