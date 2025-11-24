@@ -79,8 +79,7 @@ def _calculate_throughput_metrics(batch_size, prefill_lengths, max_duration):
     return ttft, prefill_tp
 
 
-def _get_hardware_specs(used_dtype):
-    gpu_type = get_gpu_details()
+def _get_hardware_specs(used_dtype, gpu_type=None):
     return {
         "peak_bandwidth_tb": get_peak_bw(gpu_type) / 1e12,
         "peak_flops_tf": get_peak_flops(gpu_type, precision=used_dtype) / 1e12,

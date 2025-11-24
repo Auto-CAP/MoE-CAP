@@ -9,12 +9,12 @@ from moe_cap.utils.basic_utils import (
     _calculate_decoding_metrics
 )
 
-def _calculate_continuous_metrics(n_layers, d_model, 
+def _calculate_continuous_metrics(n_layers, d_model, gpu_raw_type,
                                 n_attn_heads, d_head, n_kv_heads, d_ff, hf_config, num_gpus, model_name, 
                                 used_dtype, precision, output_data):
     """Calculate metrics for a batch of outputs"""
     # Initialize hardware specs and output lists
-    hardware_specs = _get_hardware_specs(used_dtype)
+    hardware_specs = _get_hardware_specs(used_dtype, gpu_raw_type)
     
     # Calculate model-specific sizes
     per_token_kv_size = _calculate_kv_size(model_name, hf_config, n_layers, d_head, n_kv_heads)
@@ -94,5 +94,6 @@ def _calculate_continuous_metrics(n_layers, d_model,
         'decoding_throughput': decoding_tp,
         'prefill_tp': prefill_tp,
         'ttft': ttft,
-        'tpot': tpot
+        'tpot': tpot,
+        'gpu_raw_type': gpu_raw_type
     }

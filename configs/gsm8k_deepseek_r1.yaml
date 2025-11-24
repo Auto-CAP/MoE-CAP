@@ -2,4 +2,6 @@ dataset_names: ["gsm8k"]
 
 metrics: ["em", "f1"]
 
-model_id: Qwen/Qwen3-235B-A22B
+model_id: deepseek-ai/DeepSeek-R1
+
+precision: fp8

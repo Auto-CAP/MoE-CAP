@@ -76,7 +76,7 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
 
         self.model_name = self.config.model_id
 
-    def get_model_precision_bits(self) -> float:
+    def get_model_precision_bytes(self) -> float:
         p = (self.config.precision or "").lower()
         if p in ("float32", "fp32"):
             return 4.0
@@ -95,7 +95,11 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
     def get_attention_info(self) -> Dict[str, Any]:
         heads = _deep_get(self.cfg, "num_attention_heads", "encoder_attention_heads", "num_heads")
         kv_heads = _deep_get(self.cfg, "num_key_value_heads", "num_kv_heads", "num_key_value_groups")
-        head_dim = _deep_get(self.cfg, "head_dim")  
+        head_dim = _deep_get(self.cfg, "head_dim")
+        if not head_dim:
+            hidden_size = _deep_get(self.cfg, "hidden_size", "d_model")
+            if heads and hidden_size:
+                head_dim = hidden_size // heads
         max_pos = _deep_get(self.cfg, "max_position_embeddings", "max_seq_len", "seq_length")
 
         if self.cfg.get("model_type") == "dbrx" or str(self.model_name).startswith("databricks/dbrx"):

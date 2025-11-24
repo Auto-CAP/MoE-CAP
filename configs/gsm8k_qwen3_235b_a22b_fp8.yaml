@@ -2,6 +2,6 @@ dataset_names: ["gsm8k"]
 
 metrics: ["em", "f1"]
 
-model_id: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8
+model_id: Qwen/Qwen3-235B-A22B-FP8
 
 precision: fp8

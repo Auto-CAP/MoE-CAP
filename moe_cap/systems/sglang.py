@@ -26,8 +26,9 @@ import os
 import sys
 from contextlib import contextmanager
 import torch
-from pathlib import Path
 import json
+
+from moe_cap.utils.hardware_utils import get_gpu_details
 
 
 _OutputMode = Literal["file", "object"]
@@ -53,6 +54,7 @@ def _dump_to_file(name, data):
     torch.save(data, str(path_output))
 
 sglang_eplb_expert_distribution._dump_to_file = _dump_to_file
+GLOBAL_GPU_TYPE = get_gpu_details()
 
 
 class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
@@ -210,7 +212,10 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         return self._recording
 
 
-os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.getcwd(), "outputs")
+# Set default expert distribution recorder directory to expert_records
+# Can be overridden by setting SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR environment variable before import
+if "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR" not in os.environ:
+    os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.getcwd(), "expert_records")
 
 _original_forward = ModelRunner.forward
 def forward_expert_record(
@@ -222,6 +227,8 @@ def forward_expert_record(
     split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
+        gpu_num = self.tp_size * self.pp_size
+        gpu_raw_type = GLOBAL_GPU_TYPE
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
@@ -284,6 +291,8 @@ def forward_expert_record(
                 "seq_lens_sum": sum_seq_len,
                 "forward_mode": forward_mode,
                 "expert_activation": non_zero_value,
+                "gpu_num": gpu_num,
+                "gpu_raw_type": gpu_raw_type
             }
             get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
             logger.info(f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}")

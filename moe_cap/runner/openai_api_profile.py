@@ -6,6 +6,7 @@ import aiohttp
 import sys
 import time
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 from tqdm.asyncio import tqdm as async_tqdm
@@ -15,8 +16,10 @@ from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metric
 from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
+
 import json
 from transformers import AutoTokenizer
+import re
 
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
@@ -171,7 +174,7 @@ class OpenAIAPIMoEProfiler:
         attn_info = self.model_info.get_attention_info()
 
         # precision and dtype
-        self.precision = self.model_info.get_model_precision_bits()
+        self.precision = self.model_info.get_model_precision_bytes()
         self.used_dtype = config.precision or "bfloat16"
 
         # architecture info
@@ -210,7 +213,7 @@ class OpenAIAPIMoEProfiler:
             chat_prompts, 
             add_generation_prompt=True,
             tokenize=False
-        )[:10]
+        )
         
         # Calculate prompt lengths
         prompt_lengths = [len(self.tokenizer.encode(p)) for p in chat_prompts]
@@ -266,9 +269,6 @@ class OpenAIAPIMoEProfiler:
         except Exception as e:
             print(f"Warning: Could not dump batch recording: {e}")
             return []
-            records = data.get("records", [])
-            print(f"Retrieved {len(records)} batch records from server")
-            return records
         except Exception as e:
             print(f"Warning: Could not dump batch recording: {e}")
             return []
@@ -305,7 +305,8 @@ class OpenAIAPIMoEProfiler:
                     'latency': r.ttft,
                     'seq_lens_sum': prompt_lengths[i] if i < len(prompt_lengths) else 0,
                     'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                    'forward_mode': 'prefill'
+                    'forward_mode': 'prefill',
+                    'gpu_num': "N/A"
                 })
                 
                 # Add decoding record (assuming no batching - batch_size=1)
@@ -318,21 +319,24 @@ class OpenAIAPIMoEProfiler:
                         'latency': tpot,
                         'seq_lens_sum': r.output_len,
                         'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                        'forward_mode': 'decoding'
+                        'forward_mode': 'decoding',
+                        'gpu_num': "N/A"
                     })
 
         
         # Use continuous batching metrics calculation
         try:
+            gpu_raw_type = output_data[0].get("gpu_raw_type", None)
             res_dict = _calculate_continuous_metrics(
                 n_layers=self.n_layers,
                 d_model=self.d_model,
+                gpu_raw_type=gpu_raw_type,
                 n_attn_heads=self.n_attn_heads,
                 d_head=self.d_head,
                 n_kv_heads=self.n_kv_heads,
                 d_ff=self.d_ff,
                 hf_config=getattr(self.model_info, "hf_config", None),
-                num_gpus=4,
+                num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
                 model_name=self.hf_model_name,
                 used_dtype=self.used_dtype,
                 precision=self.precision,
@@ -354,6 +358,8 @@ class OpenAIAPIMoEProfiler:
             "successful_requests": len(successful_results),
             "failed_requests": len(results) - len(successful_results),
         })
+
+
         
         return res_dict
 
@@ -506,6 +512,12 @@ class OpenAIAPIMoEProfiler:
             self._stop_batch_recording()
             server_records = self._dump_batch_recording()
 
+            num_gpus = 1
+            if server_records and len(server_records) > 0:
+                first_record = server_records[0]
+                num_gpus = first_record.get("gpu_num", 1)
+                print(f"Detected num_gpus from records: {num_gpus}")
+
             # Calculate metrics
             res_dict = self.get_metrics(results, prompt_lengths, batch_size=batch_size or 1, server_records=server_records)
 
@@ -530,13 +542,41 @@ class OpenAIAPIMoEProfiler:
                 except Exception as e:
                     print(f"Warning: Could not compute accuracy metrics: {e}")
             
+            # Auto-detect GPU type and number from hardware_utils
+            gpu_raw_type = res_dict.get("gpu_raw_type", None)
+            if gpu_raw_type:
+                gpu_name_pattern = re.compile(r'NVIDIA[\s-]+(RTX[\s-]+)?([A-Z0-9]+)')
+                match = gpu_name_pattern.search(gpu_raw_type)  
+                if match:
+                    gpu_type = ''.join(filter(None, match.groups())).strip()
+                else:
+                    gpu_type = "Unknown"
+            else:
+                gpu_type = "Unknown"
+            
+            # Remove gpu_raw_type from metrics if present
+            if "gpu_raw_type" in res_dict:
+                del res_dict["gpu_raw_type"]
+
+            # Add metadata fields to the output
+            res_dict["model_name"] = self.hf_model_name
+            res_dict["method"] = "vllm" ## Current hardcoded to vllm
+            res_dict["precision"] = self.used_dtype
+            res_dict["e2e_s"] = round(total_time, 2)
+            res_dict["batch_size"] = batch_size if batch_size else None  # None indicates all inputs sent at once
+            res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
+            res_dict["dataset"] = dataset_name
+            # Determine model type based on model name (heuristic)
+            res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
+            
             print(f"Metrics for {dataset_name}: {res_dict}")
 
             # Save results
             dest_dir = os.path.join(self.output_dir, self.get_model_simple_name())
             os.makedirs(dest_dir, exist_ok=True)
             
-            output_path = os.path.join(dest_dir, f"cap_metrics_{dataset_name}.json")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(dest_dir, f"cap_metrics_{dataset_name}_{timestamp}.json")
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(res_dict, f, indent=4)
             print(f"Metrics written to {output_path}")
@@ -570,7 +610,6 @@ def main():
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
     parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--precision", type=str, default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=None, help="Number of requests per batch. If not set, all requests are sent at once.")
     args = parser.parse_args()
 
@@ -595,7 +634,6 @@ def main():
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
     merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['precision'] = args.precision or merged.get('precision')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
 
     # Validate required fields

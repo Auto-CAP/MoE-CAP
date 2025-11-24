@@ -112,7 +112,7 @@ def _patch_execute_model(runner_class):
 
     runner_class.execute_model = patched_execute_model
     runner_class._expert_dist_patched_execute_model = True
-    print(f"[ExpertDist-Worker] Patched {runner_class.__name__}.execute_model")
+    # print(f"[ExpertDist-Worker] Patched {runner_class.__name__}.execute_model")
 
 def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_worker=False):
     """Patch decoder layer __init__ to extract and store layer_idx.
@@ -153,7 +153,8 @@ def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_
         # print(f"[ExpertDist-Worker PID {os.getpid()}] Patched {layer_name}.__init__ BEFORE model load", flush=True)
         pass
     else:
-        print(f"[ExpertDist] Patched {layer_name}.__init__ in main process")
+        # print(f"[ExpertDist] Patched {layer_name}.__init__ in main process")
+        pass
 
 
 def apply_vllm_monkey_patching():
@@ -161,7 +162,7 @@ def apply_vllm_monkey_patching():
     try:
         # Try to import vLLM and apply monkey patching
         import vllm
-        print("Using real vLLM")
+        # print("Using real vLLM")
 
         # Import Worker early and store original __init__
         from vllm.v1.worker.gpu_worker import Worker
@@ -183,7 +184,7 @@ def apply_vllm_monkey_patching():
         sys.modules['vllm.distributed.eplb.moe_hooks'] = custom_hooks
         eplb_module.moe_hooks = custom_hooks
 
-        print("Successfully monkey-patched vLLM with custom expert_distribution_recorder")
+        # print("Successfully monkey-patched vLLM with custom expert_distribution_recorder")
 
         # CRITICAL: Patch decoder layer __init__ methods BEFORE Worker.__init__ is called
         # This ensures layer_idx is set when layers are created during model loading
@@ -293,7 +294,8 @@ def apply_vllm_monkey_patching():
                                 recording_mode = "per_pass"  # Default to per_pass mode (CUDA graph compatible)
                                 enable_metrics = True
                                 if rank == 0:
-                                    print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-starting expert distribution recording (mode={recording_mode})", flush=True)
+                                    # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-starting expert distribution recording (mode={recording_mode})", flush=True)
+                                    pass
 
                             self.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
                                 recording_mode=recording_mode,
@@ -309,7 +311,8 @@ def apply_vllm_monkey_patching():
                             if auto_start_enabled:
                                 self.expert_distribution_recorder.start_record()
                                 if rank == 0:
-                                    print(f"[ExpertDist-Worker PID {os.getpid()}] Expert distribution recording auto-started", flush=True)
+                                    # print(f"[ExpertDist-Worker PID {os.getpid()}] Expert distribution recording auto-started", flush=True)
+                                    pass
 
                         def start_expert_distribution_recording(self):
                             if self.expert_distribution_recorder:
@@ -371,9 +374,9 @@ def apply_vllm_monkey_patching():
                             
                             Qwen2MoeDecoderLayer.forward = patched_qwen_forward
                             Qwen2MoeDecoderLayer._expert_dist_patched_forward = True
-                            print(f"[ExpertDist-Worker] Patched Qwen2MoeDecoderLayer.forward successfully", flush=True)
+                            # print(f"[ExpertDist-Worker] Patched Qwen2MoeDecoderLayer.forward successfully", flush=True)
                     except ImportError:
-                        print(f"[ExpertDist-Worker] Failed to import Qwen2MoeDecoderLayer for forward patching", flush=True)
+                        # print(f"[ExpertDist-Worker] Failed to import Qwen2MoeDecoderLayer for forward patching", flush=True)
                         pass
                     
                     # Patch DeepSeek models forward method
@@ -398,7 +401,7 @@ def apply_vllm_monkey_patching():
                             
                             DeepseekV2DecoderLayer.forward = patched_deepseek_forward
                             DeepseekV2DecoderLayer._expert_dist_patched_forward = True
-                            print(f"[ExpertDist-Worker] Patched DeepseekV2DecoderLayer.forward successfully", flush=True)
+                            # print(f"[ExpertDist-Worker] Patched DeepseekV2DecoderLayer.forward successfully", flush=True)
                     except ImportError:
                         pass
                     
@@ -411,7 +414,7 @@ def apply_vllm_monkey_patching():
                             patched_func = _create_select_experts_patcher(original_select_experts_worker)
                             FusedMoE.select_experts = staticmethod(patched_func)
                             FusedMoE.select_experts._expert_dist_patched_worker_after_init = True
-                            print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts in worker process")
+                            # print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts in worker process")
                     except Exception as e:
                         print(f"[ExpertDist-Worker] Could not patch FusedMoE.select_experts in worker: {e}")
 
@@ -581,7 +584,7 @@ def apply_vllm_monkey_patching():
                             patched_func = _create_select_experts_patcher(original_select_experts_worker)
                             FusedMoE.select_experts = staticmethod(patched_func)
                             FusedMoE.select_experts._expert_dist_patched_worker = True
-                            print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts BEFORE torch.compile", flush=True)
+                            # print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts BEFORE torch.compile", flush=True)
                     except Exception as e:
                         print(f"[ExpertDist-Worker] Warning: Could not patch FusedMoE.select_experts before compile: {e}", flush=True)
                         
@@ -623,7 +626,8 @@ def apply_vllm_monkey_patching():
                             import torch
                             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                             if rank == 0:
-                                print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-configured and started expert distribution recording", flush=True)
+                                # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-configured and started expert distribution recording", flush=True)
+                                pass
                 except Exception as e:
                     # Don't fail if auto-start fails
                     print(f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not auto-start expert distribution recording: {e}", flush=True)
@@ -631,7 +635,7 @@ def apply_vllm_monkey_patching():
             # Monkey patch __init__ (methods are already added above)
             Worker.__init__ = patched_init
 
-            print("Successfully monkey-patched Worker with expert distribution methods")
+            # print("Successfully monkey-patched Worker with expert distribution methods")
 
             # Now monkey patch GPUModelRunner with expert distribution methods
             try:
@@ -755,17 +759,18 @@ def apply_vllm_monkey_patching():
                     # Auto-initialize recorder immediately after load
                     try:
                          import os
-                         print(f"[ExpertDist-Worker PID {os.getpid()}] patched_load_model: Model loaded. Attempting auto-init...", flush=True)
+                         # print(f"[ExpertDist-Worker PID {os.getpid()}] patched_load_model: Model loaded. Attempting auto-init...", flush=True)
                          
                          # Verify if forward patch is effective on the loaded model
                          try:
                              model = self.get_model()
                              if hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0:
                                  layer0 = model.model.layers[0]
-                                 print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 type: {type(layer0)}", flush=True)
-                                 print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward: {layer0.forward}", flush=True)
+                                 # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 type: {type(layer0)}", flush=True)
+                                 # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward: {layer0.forward}", flush=True)
                                  if hasattr(layer0.forward, '__name__'):
-                                     print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward name: {layer0.forward.__name__}", flush=True)
+                                     # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward name: {layer0.forward.__name__}", flush=True)
+                                     pass
                          except Exception as e:
                              print(f"[ExpertDist-Worker PID {os.getpid()}] Failed to inspect model layers: {e}", flush=True)
                          
@@ -778,7 +783,7 @@ def apply_vllm_monkey_patching():
                              rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                              
                              # Default to per_pass mode (most common and graph-compatible)
-                             print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default PER_PASS recorder for CUDAGraph capture", flush=True)
+                             # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default PER_PASS recorder for CUDAGraph capture", flush=True)
                              recorder = ExpertDistributionRecorder.init_new(
                                  recording_mode="per_pass",
                                  expert_location_metadata=metadata,
@@ -792,7 +797,7 @@ def apply_vllm_monkey_patching():
                              # CRITICAL: Start recording immediately so it's active during CUDAGraph capture
                              recorder.start_record()
                              
-                             print(f"[ExpertDist-Worker PID {os.getpid()}] Recorder initialized, started, and set globally.", flush=True)
+                             # print(f"[ExpertDist-Worker PID {os.getpid()}] Recorder initialized, started, and set globally.", flush=True)
                          else:
                              print(f"[ExpertDist-Worker PID {os.getpid()}] Metadata is None", flush=True)
                     except Exception as e:
@@ -817,7 +822,7 @@ def apply_vllm_monkey_patching():
                 # Patch execute_model for Cuda Graph support
                 _patch_execute_model(GPUModelRunner)
 
-                print("Successfully monkey-patched GPUModelRunner with expert distribution methods")
+                # print("Successfully monkey-patched GPUModelRunner with expert distribution methods")
 
             except ImportError as e:
                 print(f"Could not monkey-patch GPUModelRunner: {e}")
@@ -858,7 +863,7 @@ def apply_vllm_monkey_patching():
 def _patch_api_server():
     """Patch vLLM API server to add expert distribution endpoints."""
     try:
-        print(f"[ExpertDist] Patching API server endpoints...", flush=True)
+        # print(f"[ExpertDist] Patching API server endpoints...", flush=True)
         from vllm.entrypoints.openai import api_server
         from fastapi import Response
         from vllm.engine.async_llm_engine import AsyncLLMEngine

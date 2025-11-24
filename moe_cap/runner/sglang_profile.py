@@ -2,6 +2,7 @@ import torch
 import argparse
 import os
 from collections import defaultdict, Counter
+from datetime import datetime
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
 from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
@@ -14,6 +15,7 @@ from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 import sglang as sgl
 import json
 from transformers import AutoTokenizer
+import re
 
 class SGLangMoEActivationAnalyzer:
     def __init__(self, config: CAPConfig, output_dir: str = None):
@@ -21,7 +23,7 @@ class SGLangMoEActivationAnalyzer:
 
         Args:
             config: CAPConfig instance containing model and dataset info.
-            output_dir: optional output directory. If not provided, will use './output'.
+            output_dir: optional output directory for metrics. If not provided, will use './output'.
         """
         # store config
         self.config = config
@@ -29,7 +31,7 @@ class SGLangMoEActivationAnalyzer:
         # dataset names (can be multiple)
         self.dataset_names = config.dataset_names or ["gsm8k"]
 
-        # output dir
+        # output dir for metrics
         self.output_dir = output_dir or "./output"
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -40,7 +42,7 @@ class SGLangMoEActivationAnalyzer:
         attn_info = self.model_info.get_attention_info()
 
         # precision and dtype
-        self.precision = self.model_info.get_model_precision_bits()
+        self.precision = self.model_info.get_model_precision_bytes()
         self.used_dtype = config.precision or "bfloat16"
 
         # architecture info
@@ -102,16 +104,18 @@ class SGLangMoEActivationAnalyzer:
         arguments = [{"question": q, "max_new_tokens": max_new_tokens} for q in chat_prompts]
         return arguments  # Single batch for auto mod
     
-    def get_metrics(self, records):
+    def get_metrics(self, records, num_gpus=1):
+        gpu_raw_types = records[0].get("gpu_raw_type", None)
         res_dict = _calculate_continuous_metrics(
             n_layers=self.n_layers,
             d_model=self.d_model,
+            gpu_raw_type=gpu_raw_types,
             n_attn_heads=self.n_kv_heads,
             d_head=self.d_head,
             n_kv_heads=self.n_kv_heads,
             d_ff=self.d_ff,
             hf_config=getattr(self.model_info, "hf_config", None),
-            num_gpus=4,
+            num_gpus=num_gpus,
             model_name=self.hf_model_name,
             used_dtype=self.used_dtype,
             precision=self.precision,
@@ -142,11 +146,13 @@ class SGLangMoEActivationAnalyzer:
         # iterate over all datasets in the CAPConfig
         for dataset_name in self.dataset_names:
             print(f"Running analysis for dataset: {dataset_name}")
+            
+            import time
+            start_time = time.time()
 
             # Load and prepare inputs
             all_input_raw, max_new_tokens = self._load_data_for_task(dataset_name)
             batched_inputs = self._prepare_inputs(all_input_raw, max_new_tokens)
-            batched_inputs = batched_inputs
 
             # Get ground truth targets for evaluation
             try:
@@ -168,6 +174,8 @@ class SGLangMoEActivationAnalyzer:
                 num_threads=128,
                 progress_bar=True)
 
+            end_time = time.time()
+            e2e_time = end_time - start_time
             # Stop recording
             response = requests.post(f"http://localhost:{port}/stop_expert_distribution_record")
             response.raise_for_status()
@@ -177,11 +185,17 @@ class SGLangMoEActivationAnalyzer:
             response = requests.post(f"http://localhost:{port}/dump_expert_distribution_record")
             response.raise_for_status()
 
-            # The server dumps a generic file into self.output_dir; move/rename it per-dataset
-            tmp_record = os.path.join(self.output_dir, "expert_distribution_record.jsonl")
-            dest_dir = os.path.join(self.output_dir, self.get_model_simple_name())
-            os.makedirs(dest_dir, exist_ok=True)
-            dest_record = os.path.join(dest_dir, f"expert_distribution_record.jsonl")
+            # The server dumps the file to: {SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR}/{model_path}/expert_distribution_record.jsonl
+            # By default, SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR is set to {server_cwd}/expert_records
+            # We need to look for the file where the server actually saved it
+            server_output_base = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", 
+                                                os.path.join(os.getcwd(), "expert_records"))
+            tmp_record = os.path.join(server_output_base, self.hf_model_name, "expert_distribution_record.jsonl")
+            
+            # Expert records stay in the server location, just rename per dataset
+            expert_dest_dir = os.path.join(server_output_base, self.hf_model_name)
+            os.makedirs(expert_dest_dir, exist_ok=True)
+            dest_record = os.path.join(expert_dest_dir, f"expert_distribution_record_{dataset_name}.jsonl")
             if os.path.exists(tmp_record):
                 # atomic replace if possible
                 try:
@@ -197,8 +211,16 @@ class SGLangMoEActivationAnalyzer:
             # Read the dataset-specific record and compute metrics
             with open(dest_record, 'r', encoding='utf-8') as f:
                 all_experts_record = [json.loads(line.strip()) for line in f]
-            res_dict = self.get_metrics(all_experts_record)
-
+            
+            # Determine num_gpus from the record if possible
+            num_gpus = 1
+            if all_experts_record and len(all_experts_record) > 0:
+                first_record = all_experts_record[0]
+                num_gpus = first_record.get("gpu_num", 1)
+                print(f"Detected num_gpus from records: {num_gpus}")
+            
+            # Pass tensor_parallel_size to get_metrics
+            res_dict = self.get_metrics(all_experts_record, num_gpus=num_gpus)
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
                 try:
@@ -222,12 +244,44 @@ class SGLangMoEActivationAnalyzer:
                 except Exception as e:
                     print(f"Warning: Could not compute accuracy metrics: {e}")
             
+            
+            # Auto-detect GPU type from hardware_utils
+            gpu_raw_type = res_dict.get("gpu_raw_type", None)
+            if gpu_raw_type:
+                gpu_name_pattern = re.compile(r'NVIDIA[\s-]+(RTX[\s-]+)?([A-Z0-9]+)')
+                match = gpu_name_pattern.search(gpu_raw_type)  
+                if match:
+                    gpu_type = ''.join(filter(None, match.groups())).strip()
+                else:
+                    gpu_type = "Unknown"
+            else:
+                gpu_type = "Unknown"
+            
+            # Filter out gpu_raw_type from metrics
+            if "gpu_raw_type" in res_dict:
+                del res_dict["gpu_raw_type"]
+            # Add metadata fields to the output
+            res_dict["model_name"] = self.hf_model_name
+            res_dict["method"] = "sglang"
+            res_dict["precision"] = self.used_dtype
+            res_dict["e2e_s"] = round(e2e_time, 2)
+            res_dict["batch_size"] = None  # None indicates all inputs sent at once
+            res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
+            res_dict["dataset"] = dataset_name
+            # Determine model type based on model name (heuristic)
+            res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
+            
             print(f"Metrics for {dataset_name}: {res_dict}")
 
-            output_path = os.path.join(dest_dir, f"cap_metrics_{dataset_name}.json")
+            # Metrics go to output_dir
+            metrics_dest_dir = os.path.join(self.output_dir, self.get_model_simple_name())
+            os.makedirs(metrics_dest_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(metrics_dest_dir, f"cap_metrics_{dataset_name}_{timestamp}.json")
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(res_dict, f, indent=4)
             print(f"Metrics written to {output_path}")
+            print(f"Expert records saved to {dest_record}")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -235,8 +289,7 @@ def main():
     parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
-    parser.add_argument("--output_dir", type=str)
-    parser.add_argument("--precision", type=str, default="bfloat16")
+    parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
     args = parser.parse_args()
 
     # Load config file if provided (JSON or YAML). CLI args override file values.
@@ -260,7 +313,6 @@ def main():
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
     merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['precision'] = args.precision or merged.get('precision')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
 
     # Validate required fields

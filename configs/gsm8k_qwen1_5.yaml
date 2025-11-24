@@ -2,4 +2,4 @@ dataset_names: ["gsm8k"]
 
 metrics: ["em", "f1"]
 
-model_id: Qwen/Qwen3-235B-A22B
+model_id: Qwen/Qwen1.5-MoE-A2.7B-Chat

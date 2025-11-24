@@ -30,7 +30,7 @@ class BaseModelInfoRetriever(ABC):
         # TODO do some precision type checking. If not in the valid list, raise error.
 
     @abstractmethod
-    def get_model_precision_bits(self) -> float:
+    def get_model_precision_bytes(self) -> float:
         """Returns the effective number of bytes per parameter for the given precision."""
         pass
 
