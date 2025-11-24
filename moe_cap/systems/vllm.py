@@ -65,9 +65,9 @@ try:
         sys.path.insert(0, _expert_dist_path)
     
     from vllm_integration import apply_vllm_monkey_patching
-    print(f"[PID {os.getpid()}] Applying expert distribution monkey patching...", flush=True)
+    # print(f"[PID {os.getpid()}] Applying expert distribution monkey patching...", flush=True)
     apply_vllm_monkey_patching()
-    print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
+    # print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
 except ImportError as e:
     print(f"[PID {os.getpid()}] Warning: Could not import expert distribution patching: {e}", flush=True)
     print(f"[PID {os.getpid()}] Expert distribution recording will not be available.", flush=True)
@@ -545,7 +545,7 @@ def execute_model_custom(
                     "expert_utilization": round(expert_utilization, 4)
                 }
                 expert_distribution_recording_state.add_record(record_dict)
-                logger.info(f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}")
+                logger.debug(f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}")
         except Exception as e:
             logger.debug(f"Could not record expert distribution automatically: {e}")
     
@@ -562,9 +562,9 @@ def execute_model_custom(
 # ============================================================================
 # Apply the patch immediately
 # ============================================================================
-print(f"[PID {os.getpid()}] Applying custom execute_model patch...", flush=True)
+# print(f"[PID {os.getpid()}] Applying custom execute_model patch...", flush=True)
 GPUModelRunner.execute_model = execute_model_custom
-print(f"[PID {os.getpid()}] Patch applied! Method name: {GPUModelRunner.execute_model.__name__}", flush=True)
+# print(f"[PID {os.getpid()}] Patch applied! Method name: {GPUModelRunner.execute_model.__name__}", flush=True)
 
 # Verify the patch
 assert GPUModelRunner.execute_model.__name__ == "execute_model_custom", \

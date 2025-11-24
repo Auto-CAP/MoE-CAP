@@ -256,7 +256,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             set_global_expert_counts_buffer(self._gatherer.get_expert_counts_buffer())
 
         if enable_metrics:
-            logger.info(
+            logger.debug(
                 "ExpertDistributionRecorder auto-starting due to enable_metrics=True"
             )
             self.start_record()
@@ -352,7 +352,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if hasattr(self._gatherer, 'get_expert_counts_buffer'):
             set_global_expert_counts_buffer(self._gatherer.get_expert_counts_buffer())
 
-        logger.info(f"Expert distribution recording started (mode={self._recording_mode})")
+        logger.debug(f"Expert distribution recording started (mode={self._recording_mode})")
 
     def stop_record(self) -> None:
         """Stop recording."""
@@ -368,7 +368,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         # Clear global buffer
         set_global_expert_counts_buffer(None)
 
-        logger.info("Expert distribution recording stopped")
+        logger.debug("Expert distribution recording stopped")
 
     def dump_record(self, output_path: Optional[str] = None) -> Dict[str, Any]:
         """Dump recorded data to file or return as dict."""
@@ -825,7 +825,7 @@ class _PerPassAccumulator(_Accumulator):
 
     def dump(self, output_path: Optional[str] = None) -> Dict[str, Any]:
         """Dump per-pass records."""
-        logger.info(f"[PerPassAccumulator] Dumping {len(self._pass_records)} records")
+        # logger.info(f"[PerPassAccumulator] Dumping {len(self._pass_records)} records")
         output = {
             "records": self._pass_records,
             "rank": self._rank,
@@ -899,7 +899,7 @@ class _StatAccumulator(_Accumulator):
 
             if self._rank == 0:
                 history_means = self._history.mean()
-                logger.info(
+                logger.debug(
                     f"[Expert Balancedness] forward_pass={forward_pass_id} "
                     f"current={avg_balancedness:.3f} "
                     f"history={history_means}"
