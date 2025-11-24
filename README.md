@@ -49,6 +49,7 @@ python -m moe_cap.systems.vllm \
         --host 0.0.0.0 \
         --tensor-parallel-size 8 \
         --reasoning-parser deepseek_r1 \
+        --enable-expert-distribution-metrics \
         --max-num-batched-tokens 131072 # Set max-num-batched-tokens large referring to vLLM tuning guide.
                                         # V1's mixed prefill-decode batching makes separate profiling difficult.
 ```
