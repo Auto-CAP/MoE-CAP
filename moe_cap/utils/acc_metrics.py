@@ -18,33 +18,67 @@ def extract_answer(text: str, dataset_name: str) -> str:
         dataset_name: Name of the dataset to determine extraction strategy
         
     Returns:
-        Extracted answer string
+        Extracted answer string, or empty string if no valid answer found
         
     Examples:
         >>> extract_answer("Step 1... #### 42", "gsm8k")
         '42'
         >>> extract_answer("The answer is: 123", "math")
         '123'
-        >>> extract_answer("Result is 3.14 but final answer is 42", "gsm8k")
+        >>> extract_answer("\\boxed{42}", "math")
         '42'
     """
+    if not text or not text.strip():
+        return ""
+    
     if dataset_name.lower() in ["gsm8k", "math", "numinamath"]:
-        # Try to extract integer from the last line or after common answer indicators
-        # Pattern matches integers only (no decimals)
-        patterns = [
-            r'####\s*(-?\d[\d,]*)',  # GSM8K style (integer only)
-            r'answer is:?\s*(-?\d[\d,]*)',  # Common pattern (integer only)
-            r'(-?\d[\d,]*)\s*$',  # Last integer at the end of text
+        # Priority 1: Look for explicit answer markers (high confidence patterns)
+        # These are the primary patterns that indicate a deliberate final answer
+        high_confidence_patterns = [
+            r'####\s*(-?\d[\d,]*)',  # GSM8K style: #### 42
+            r'\\boxed\{(-?\d[\d,]*)\}',  # LaTeX boxed: \boxed{42}
+            r'\*\*Final Answer:\*\*\s*(-?\d[\d,]*)',  # **Final Answer:** 42
+            r'(?:final\s+)?answer\s*(?:is|:)\s*\$?(-?\d[\d,]*)\$?(?:\s*\.)?$',  # "answer is 42" at end
+            r'(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)\s*\$?(-?\d[\d,]*)\$?',  # "the final answer is 42"
+            r'=\s*(-?\d[\d,]*)\s*$',  # "= 42" at the very end
         ]
-        for pattern in patterns:
+        
+        for pattern in high_confidence_patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
                 return match.group(1).replace(',', '').strip()
         
-        # Fallback: extract last integer in text (no decimals)
-        numbers = re.findall(r'-?\d[\d,]*', text)
-        if numbers:
-            return numbers[-1].replace(',', '').strip()
+        # Priority 2: Look for boxed content (common in math)
+        boxed_match = re.search(r'\\boxed\{([^}]+)\}', text)
+        if boxed_match:
+            content = boxed_match.group(1).strip()
+            # Extract number from boxed content
+            num_match = re.search(r'(-?\d[\d,]*)', content)
+            if num_match:
+                return num_match.group(1).replace(',', '').strip()
+        
+        # Priority 3: Check last line for a standalone number or answer pattern
+        lines = text.strip().split('\n')
+        for line in reversed(lines[-3:]):  # Check last 3 lines
+            line = line.strip()
+            # Skip empty lines
+            if not line:
+                continue
+            # Look for "So the answer is X" or similar concluding statements
+            conclude_match = re.search(
+                r'(?:so|thus|therefore|hence)[\s,]+(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*(-?\d[\d,]*)',
+                line, re.IGNORECASE
+            )
+            if conclude_match:
+                return conclude_match.group(1).replace(',', '').strip()
+            # Check if the line is just a number (possibly with $ signs for formatting)
+            standalone_match = re.match(r'^\$?(-?\d[\d,]*)\$?\.?$', line)
+            if standalone_match:
+                return standalone_match.group(1).replace(',', '').strip()
+        
+        # NOTE: We do NOT use fallback "last number in text" as it's too unreliable
+        # and leads to false positives when the model hasn't actually answered
+        return ""
     
     # For other datasets, return the full text stripped
     return text.strip()
@@ -63,13 +97,14 @@ def compute_exact_match(predictions: List[str], targets: List[str]) -> Dict[str,
             - exact_match: EM score (0.0 to 1.0)
             - correct: Number of correct predictions
             - total: Total number of predictions
+            - no_answer: Number of empty/missing predictions
             
     Raises:
         ValueError: If predictions and targets have different lengths
         
     Examples:
         >>> compute_exact_match(['42', '100'], ['42', '99'])
-        {'exact_match': 0.5, 'correct': 1, 'total': 2}
+        {'exact_match': 0.5, 'correct': 1, 'total': 2, 'no_answer': 0}
     """
     if len(predictions) != len(targets):
         raise ValueError(
@@ -78,11 +113,17 @@ def compute_exact_match(predictions: List[str], targets: List[str]) -> Dict[str,
         )
     
     correct = 0
+    no_answer = 0
     for pred, target in zip(predictions, targets):
         # Normalize both strings for comparison
-        pred_norm = str(pred).strip().lower()
+        pred_norm = str(pred).strip().lower() if pred else ""
         target_norm = str(target).strip().lower()
         
+        # Count empty/no predictions separately
+        if not pred_norm:
+            no_answer += 1
+            continue
+            
         if pred_norm == target_norm:
             correct += 1
     
@@ -91,7 +132,8 @@ def compute_exact_match(predictions: List[str], targets: List[str]) -> Dict[str,
     return {
         "exact_match": em_score,
         "correct": correct,
-        "total": len(predictions)
+        "total": len(predictions),
+        "no_answer": no_answer
     }
 
 
@@ -152,5 +194,8 @@ def format_accuracy_summary(metrics: Dict[str, Any]) -> str:
     em = metrics.get('exact_match', 0.0)
     correct = metrics.get('correct', 0)
     total = metrics.get('total', 0)
+    no_answer = metrics.get('no_answer', 0)
     
+    if no_answer > 0:
+        return f"EM = {em:.4f} ({correct}/{total}, {no_answer} no answer)"
     return f"EM = {em:.4f} ({correct}/{total})"

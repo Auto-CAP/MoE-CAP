@@ -543,6 +543,8 @@ def execute_model_custom(
                     "forward_mode": forward_mode,
                     "expert_activation": expert_activation,
                     # "expert_utilization": round(expert_utilization, 4)
+                    "gpu_num": world_size,
+                    "gpu_raw_type": gpu_raw_type
                 }
                 expert_distribution_recording_state.add_record(record_dict)
                 logger.debug(f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}")
