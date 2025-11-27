@@ -37,10 +37,12 @@ def extract_answer(text: str, dataset_name: str) -> str:
         high_confidence_patterns = [
             r'####\s*(-?\d[\d,]*)',  # GSM8K style: #### 42
             r'\\boxed\{(-?\d[\d,]*)\}',  # LaTeX boxed: \boxed{42}
-            r'\*\*Final Answer:\*\*\s*(-?\d[\d,]*)',  # **Final Answer:** 42
+            r'\*\*Final Answer:\*\*\s*\$?(-?\d[\d,]*)',  # **Final Answer:** 42 or **Final Answer:** $42
+            r'\*\*Answer:\*\*\s*\$?(-?\d[\d,]*)',  # **Answer:** 42 or **Answer:** $42
+            r'\*\*\$?(-?\d[\d,]*)\$?\*\*\s*\.?\s*$',  # **42** or **$42** at end of text
             r'(?:final\s+)?answer\s*(?:is|:)\s*\$?(-?\d[\d,]*)\$?(?:\s*\.)?$',  # "answer is 42" at end
             r'(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)\s*\$?(-?\d[\d,]*)\$?',  # "the final answer is 42"
-            r'=\s*(-?\d[\d,]*)\s*$',  # "= 42" at the very end
+            r'=\s*\*?\*?\$?(-?\d[\d,]*)\$?\*?\*?\s*\.?\s*$',  # "= 42" or "= **42**" at the very end
         ]
         
         for pattern in high_confidence_patterns:
@@ -57,7 +59,17 @@ def extract_answer(text: str, dataset_name: str) -> str:
             if num_match:
                 return num_match.group(1).replace(',', '').strip()
         
-        # Priority 3: Check last line for a standalone number or answer pattern
+        # Priority 3: Look for bold numbers anywhere (** **) - common in markdown output
+        bold_patterns = [
+            r'\*\*\$?(-?\d[\d,]*)\$?\*\*',  # **42** or **$42**
+        ]
+        for pattern in bold_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                # Return the last bold number (most likely the final answer)
+                return matches[-1].replace(',', '').strip()
+        
+        # Priority 4: Check last line for a standalone number or answer pattern
         lines = text.strip().split('\n')
         for line in reversed(lines[-3:]):  # Check last 3 lines
             line = line.strip()
@@ -66,7 +78,7 @@ def extract_answer(text: str, dataset_name: str) -> str:
                 continue
             # Look for "So the answer is X" or similar concluding statements
             conclude_match = re.search(
-                r'(?:so|thus|therefore|hence)[\s,]+(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*(-?\d[\d,]*)',
+                r'(?:so|thus|therefore|hence)[\s,]+(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*\$?(-?\d[\d,]*)',
                 line, re.IGNORECASE
             )
             if conclude_match:

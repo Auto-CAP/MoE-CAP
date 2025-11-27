@@ -191,10 +191,17 @@ def apply_vllm_monkey_patching():
         try:
             from vllm.model_executor.models.utils import extract_layer_index
             
-            # Patch Qwen models if available
+            # Patch Qwen2 models if available
             try:
                 from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
                 _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=False)
+            except ImportError:
+                pass
+            
+            # Patch Qwen3 MoE models if available (for Qwen3-30B-A3B and similar)
+            try:
+                from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
+                _patch_decoder_layer_init(Qwen3MoeDecoderLayer, extract_layer_index, "Qwen3MoeDecoderLayer", is_worker=False)
             except ImportError:
                 pass
             
@@ -379,6 +386,34 @@ def apply_vllm_monkey_patching():
                         # print(f"[ExpertDist-Worker] Failed to import Qwen2MoeDecoderLayer for forward patching", flush=True)
                         pass
                     
+                    # Patch Qwen3MoE models forward method (for Qwen3-30B-A3B and similar)
+                    try:
+                        from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
+                        if not hasattr(Qwen3MoeDecoderLayer, '_expert_dist_patched_forward'):
+                            original_qwen3_forward = Qwen3MoeDecoderLayer.forward
+                            
+                            def patched_qwen3_forward(self, *args, **kwargs):
+                                layer_idx = getattr(self, 'layer_idx', None)
+                                
+                                if layer_idx is not None:
+                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    recorder = get_global_expert_distribution_recorder()
+                                    
+                                    if recorder is not None and getattr(recorder, '_recording', False):
+                                        with recorder.with_current_layer(layer_idx):
+                                            result = original_qwen3_forward(self, *args, **kwargs)
+                                        
+                                        # For per_pass and per_token modes, collection is now done in execute_model
+                                        # to support Cuda Graph (where forward is skipped during replay)
+                                        return result
+                                return original_qwen3_forward(self, *args, **kwargs)
+                            
+                            Qwen3MoeDecoderLayer.forward = patched_qwen3_forward
+                            Qwen3MoeDecoderLayer._expert_dist_patched_forward = True
+                            print(f"[ExpertDist-Worker] Patched Qwen3MoeDecoderLayer.forward successfully", flush=True)
+                    except ImportError:
+                        pass
+                    
                     # Patch DeepSeek models forward method
                     try:
                         from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
@@ -561,10 +596,17 @@ def apply_vllm_monkey_patching():
                     import inspect
                     from vllm.model_executor.models.utils import extract_layer_index
                     
-                    # Patch Qwen models if available
+                    # Patch Qwen2 models if available
                     try:
                         from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
                         _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=True)
+                    except ImportError:
+                        pass
+                    
+                    # Patch Qwen3 MoE models if available (for Qwen3-30B-A3B and similar)
+                    try:
+                        from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
+                        _patch_decoder_layer_init(Qwen3MoeDecoderLayer, extract_layer_index, "Qwen3MoeDecoderLayer", is_worker=True)
                     except ImportError:
                         pass
                     
