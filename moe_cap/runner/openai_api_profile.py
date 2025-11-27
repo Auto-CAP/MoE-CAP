@@ -14,6 +14,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
 from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
+from moe_cap.utils.cost_utils import calculate_cost
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
 
@@ -544,6 +545,7 @@ class OpenAIAPIMoEProfiler:
             
             # Auto-detect GPU type and number from hardware_utils
             gpu_raw_type = res_dict.get("gpu_raw_type", None)
+            res_dict['cost'] = calculate_cost(round(total_time, 2), gpu_raw_type, num_gpus)
             if gpu_raw_type:
                 gpu_name_pattern = re.compile(r'NVIDIA[\s-]+(RTX[\s-]+)?([A-Z0-9]+)')
                 match = gpu_name_pattern.search(gpu_raw_type)  
