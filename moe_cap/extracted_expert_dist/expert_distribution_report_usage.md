@@ -11,7 +11,10 @@ python -m moe_cap.systems.vllm Qwen/Qwen1.5-MoE-A2.7B \
   --port 8000 \
   --enable-expert-distribution-metrics
 ```
-
+Supported models: 
+- Qwen/Qwen1.5-MoE-A2.7B
+- deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+- Qwen/Qwen3-30B-A3B
 ## 2. Check the Logs
 
 Send some inference requests to the server, and the expert distribution metrics will be recorded.

@@ -144,6 +144,48 @@ def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_
         # Store layer_idx as instance attribute
         if layer_idx is not None:
             self.layer_idx = layer_idx
+
+        # ============================================================================
+        # NEW: Qwen3 Compatibility Fix for QK-Norm
+        # ============================================================================
+        # If we are running Qwen3 (via Qwen2 implementation), we might encounter missing keys for q_norm/k_norm.
+        # This happens if the checkpoint doesn't have them but Qwen2MoeAttention expects them.
+        # We replace them with Identity to avoid load_weights failure and runtime errors.
+        try:
+            # Check if this is a Qwen3 model (based on config)
+            # args[0] is usually config
+            config = args[0] if len(args) > 0 else kwargs.get('config')
+            if config and getattr(config, 'model_type', '') == 'qwen3_moe':
+                import torch.nn as nn
+                if hasattr(self, 'self_attn'):
+                    # Check if q_norm exists and replace it
+                    if hasattr(self.self_attn, 'q_norm'):
+                        # print(f"[ExpertDist] Replacing q_norm with Identity for Qwen3 compatibility in layer {layer_idx}")
+                        self.self_attn.q_norm = nn.Identity()
+                    if hasattr(self.self_attn, 'k_norm'):
+                        # print(f"[ExpertDist] Replacing k_norm with Identity for Qwen3 compatibility in layer {layer_idx}")
+                        self.self_attn.k_norm = nn.Identity()
+                
+                # Check for qkv_proj bias compatibility
+                # Qwen2MoeAttention creates qkv_proj with bias=True by default
+                # But Qwen3 might not use bias. If so, we need to remove it to avoid "initialized from checkpoint" error.
+                if hasattr(self, 'self_attn') and hasattr(self.self_attn, 'qkv_proj'):
+                    # Check if config says no bias (or if we should assume no bias for Qwen3)
+                    # Note: Qwen2MoeAttention doesn't seem to look at config.attention_bias
+                    
+                    # For Qwen3, default to False if not specified
+                    if getattr(config, 'model_type', '') == 'qwen3_moe':
+                        should_have_bias = getattr(config, 'attention_bias', False)
+                    else:
+                        should_have_bias = getattr(config, 'attention_bias', True)
+                    
+                    # If config says no bias, but layer has bias, remove it
+                    if not should_have_bias and getattr(self.self_attn.qkv_proj, 'bias', None) is not None:
+                        # print(f"[ExpertDist] Removing qkv_proj.bias for Qwen3 compatibility in layer {layer_idx}")
+                        self.self_attn.qkv_proj.bias = None
+                        
+        except Exception as e:
+            print(f"[ExpertDist] Warning: Failed to apply Qwen3 QK-Norm/Bias fix: {e}")
     
     layer_class.__init__ = patched_init
     setattr(layer_class, '_expert_dist_patched_init' + ('_worker' if is_worker else ''), True)
@@ -164,6 +206,29 @@ def apply_vllm_monkey_patching():
         import vllm
         # print("Using real vLLM")
 
+        # ============================================================================
+        # NEW: Register Qwen3 to use Qwen2 implementation
+        # ============================================================================
+        try:
+            from vllm.model_executor.models import ModelRegistry
+            try:
+                # Try to import Qwen2MoE implementation
+                from vllm.model_executor.models.qwen2_moe import Qwen2MoeForCausalLM
+                
+                # Register Qwen3 to use Qwen2 implementation
+                # This allows loading "Qwen/Qwen3-30B-A3B" using the native vLLM Qwen2MoE class
+                # instead of falling back to HuggingFace implementation (which vLLM doesn't support well for MoE)
+                ModelRegistry.register_model("Qwen3MoeForCausalLM", Qwen2MoeForCausalLM)
+                ModelRegistry.register_model("qwen3_moe", Qwen2MoeForCausalLM)
+                # print("Registered Qwen3MoeForCausalLM to use Qwen2MoeForCausalLM implementation")
+            except ImportError:
+                print("[ExpertDist] Warning: Could not import Qwen2MoeForCausalLM. Qwen3 support may not work.")
+            except Exception as e:
+                print(f"[ExpertDist] Warning: Failed to register Qwen3 model: {e}")
+        except ImportError:
+            pass
+
+
         # Import Worker early and store original __init__
         from vllm.v1.worker.gpu_worker import Worker
         # Store the original __init__ before we patch it (only once)
@@ -183,6 +248,78 @@ def apply_vllm_monkey_patching():
         import moe_hooks as custom_hooks
         sys.modules['vllm.distributed.eplb.moe_hooks'] = custom_hooks
         eplb_module.moe_hooks = custom_hooks
+
+        # ============================================================================
+        # NEW: Patch Qwen2MoeSparseMoeBlock to handle Qwen3 config compatibility
+        # Qwen3 config is missing 'shared_expert_intermediate_size' which Qwen2 expects
+        # ============================================================================
+        try:
+            from vllm.model_executor.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+            
+            if not hasattr(Qwen2MoeSparseMoeBlock, '_expert_dist_patched_init_compat'):
+                original_block_init = Qwen2MoeSparseMoeBlock.__init__
+                
+                def patched_block_init(self, config, *args, **kwargs):
+                    # Inject missing attribute if needed (for Qwen3 compatibility)
+                    if not hasattr(config, 'shared_expert_intermediate_size'):
+                        # Qwen3 doesn't seem to have shared experts in the same way, or defaults to 0
+                        setattr(config, 'shared_expert_intermediate_size', 0)
+                    
+                    original_block_init(self, config, *args, **kwargs)
+                    
+                    # Fix for Qwen3: Qwen2MoeSparseMoeBlock creates shared_expert_gate unconditionally
+                    # even if shared_expert_intermediate_size is 0.
+                    # But Qwen3 checkpoint doesn't have this weight if it doesn't use shared experts.
+                    # So we remove it if shared_expert is None.
+                    if getattr(self, 'shared_expert', None) is None:
+                        self.shared_expert_gate = None
+                
+                Qwen2MoeSparseMoeBlock.__init__ = patched_block_init
+                Qwen2MoeSparseMoeBlock._expert_dist_patched_init_compat = True
+                # print("Patched Qwen2MoeSparseMoeBlock for Qwen3 config compatibility")
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}")
+        except Exception as e:
+            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}")
+
+        # ============================================================================
+        # NEW: Patch Qwen2MoeModel.load_weights to skip QK-Norm if replaced by Identity
+        # ============================================================================
+        try:
+            from vllm.model_executor.models.qwen2_moe import Qwen2MoeModel
+            
+            if not hasattr(Qwen2MoeModel, '_expert_dist_patched_load_weights'):
+                original_load_weights = Qwen2MoeModel.load_weights
+                
+                def patched_load_weights(self, weights):
+                    # Filter out q_norm/k_norm weights if they are not in the model parameters
+                    # This happens when we replace them with Identity for Qwen3 compatibility
+                    # but the checkpoint still contains them (or vLLM thinks they should be there)
+                    
+                    # Actually, the error happens because vLLM iterates over weights from the loader
+                    # and tries to find them in params_dict.
+                    # We need to wrap the iterator to skip these keys if they are not in params_dict
+                    
+                    params_dict = dict(self.named_parameters())
+                    
+                    def filtered_weights(weights_iterable):
+                        for name, tensor in weights_iterable:
+                            # Check if this is a q_norm/k_norm weight that we removed
+                            if ("q_norm" in name or "k_norm" in name) and name not in params_dict:
+                                # print(f"[ExpertDist] Skipping weight {name} as it is not in the model (likely replaced by Identity)")
+                                continue
+                            yield name, tensor
+                            
+                    return original_load_weights(self, filtered_weights(weights))
+                
+                Qwen2MoeModel.load_weights = patched_load_weights
+                Qwen2MoeModel._expert_dist_patched_load_weights = True
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeModel.load_weights: {e}")
 
         # print("Successfully monkey-patched vLLM with custom expert_distribution_recorder")
 
