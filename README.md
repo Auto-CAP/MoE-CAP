@@ -17,7 +17,7 @@ Python: >= 3.9
 
 ## Installation
 ```bash
-git clone https://github.com/sparse-generative-ai/MoE-CAP.git
+git clone https://github.com/Auto-CAP/MoE-CAP.git
 cd MoE-CAP
 pip install -e .
 ```
