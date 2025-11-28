@@ -9,7 +9,9 @@ python -m moe_cap.systems.vllm Qwen/Qwen1.5-MoE-A2.7B \
   --tensor-parallel-size 4 \
   --trust-remote-code \
   --port 8000 \
-  --enable-expert-distribution-metrics
+  --enable-expert-distribution-metrics \
+  --reasoning-parser deepseek_r1 \
+  --gpu_memory_utilization 0.8
 ```
 Supported models: 
 - Qwen/Qwen1.5-MoE-A2.7B

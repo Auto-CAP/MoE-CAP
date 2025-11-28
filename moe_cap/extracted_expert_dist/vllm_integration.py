@@ -114,6 +114,40 @@ def _patch_execute_model(runner_class):
     runner_class._expert_dist_patched_execute_model = True
     # print(f"[ExpertDist-Worker] Patched {runner_class.__name__}.execute_model")
 
+def _patch_qwen2_attention(attention_class):
+    """Patch Qwen2MoeAttention to support QK-Norm for Qwen3."""
+    if hasattr(attention_class, '_expert_dist_patched_qknorm'):
+        return
+
+    # We need to reimplement forward to apply norms if they exist
+    def patched_forward(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        # Apply QK-Norm if present (injected by _patch_decoder_layer_init for Qwen3)
+        if hasattr(self, 'q_norm'):
+            # Reshape to (batch, seq, num_heads, head_dim) to apply norm on head_dim
+            q_shape = q.shape
+            q = q.view(*q_shape[:-1], self.num_heads, self.head_dim)
+            q = self.q_norm(q)
+            q = q.view(*q_shape)
+            
+        if hasattr(self, 'k_norm'):
+            k_shape = k.shape
+            k = k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
+            k = self.k_norm(k)
+            k = k.view(*k_shape)
+            
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    attention_class.forward = patched_forward
+    attention_class._expert_dist_patched_qknorm = True
+    # print(f"[ExpertDist] Patched {attention_class.__name__}.forward for QK-Norm support")
+
+
 def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_worker=False):
     """Patch decoder layer __init__ to extract and store layer_idx.
     
@@ -148,23 +182,26 @@ def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_
         # ============================================================================
         # NEW: Qwen3 Compatibility Fix for QK-Norm
         # ============================================================================
-        # If we are running Qwen3 (via Qwen2 implementation), we might encounter missing keys for q_norm/k_norm.
-        # This happens if the checkpoint doesn't have them but Qwen2MoeAttention expects them.
-        # We replace them with Identity to avoid load_weights failure and runtime errors.
         try:
             # Check if this is a Qwen3 model (based on config)
             # args[0] is usually config
             config = args[0] if len(args) > 0 else kwargs.get('config')
             if config and getattr(config, 'model_type', '') == 'qwen3_moe':
-                import torch.nn as nn
+                # Inject RMSNorm layers for Qwen3
                 if hasattr(self, 'self_attn'):
-                    # Check if q_norm exists and replace it
-                    if hasattr(self.self_attn, 'q_norm'):
-                        # print(f"[ExpertDist] Replacing q_norm with Identity for Qwen3 compatibility in layer {layer_idx}")
-                        self.self_attn.q_norm = nn.Identity()
-                    if hasattr(self.self_attn, 'k_norm'):
-                        # print(f"[ExpertDist] Replacing k_norm with Identity for Qwen3 compatibility in layer {layer_idx}")
-                        self.self_attn.k_norm = nn.Identity()
+                    from vllm.model_executor.layers.layernorm import RMSNorm
+                    
+                    # Qwen3 uses RMSNorm on head_dim
+                    head_dim = self.self_attn.head_dim
+                    eps = getattr(config, 'rms_norm_eps', 1e-6)
+                    
+                    if not hasattr(self.self_attn, 'q_norm'):
+                        # print(f"[ExpertDist] Injecting q_norm (RMSNorm) for Qwen3 in layer {layer_idx}")
+                        self.self_attn.q_norm = RMSNorm(head_dim, eps=eps)
+                        
+                    if not hasattr(self.self_attn, 'k_norm'):
+                        # print(f"[ExpertDist] Injecting k_norm (RMSNorm) for Qwen3 in layer {layer_idx}")
+                        self.self_attn.k_norm = RMSNorm(head_dim, eps=eps)
                 
                 # Check for qkv_proj bias compatibility
                 # Qwen2MoeAttention creates qkv_proj with bias=True by default
@@ -332,6 +369,10 @@ def apply_vllm_monkey_patching():
             try:
                 from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
                 _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=False)
+                
+                # Patch Qwen2MoeAttention for Qwen3 QK-Norm support
+                from vllm.model_executor.models.qwen2_moe import Qwen2MoeAttention
+                _patch_qwen2_attention(Qwen2MoeAttention)
             except ImportError:
                 pass
             
