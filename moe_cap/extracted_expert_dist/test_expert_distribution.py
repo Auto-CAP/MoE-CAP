@@ -38,9 +38,9 @@ except Exception as e:
 # Default model configuration
 DEFAULT_MODEL_CONFIG = {
     # "model_path": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-    "model_path": "Qwen/Qwen1.5-MoE-A2.7B",
-    "tp_size": 4,
-    "gpu_memory_utilization": 0.4,
+    "model_path": "Qwen/Qwen3-30B-A3B",
+    "tp_size": 8,
+    "gpu_memory_utilization": 0.8,
 }
 
 

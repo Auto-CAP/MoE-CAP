@@ -5,23 +5,23 @@
 Simply add the `--enable-expert-distribution-metrics` flag when starting the server. This automatically enables recording in `per_pass` mode and writes logs to a file.
 
 ```bash
-python -m moe_cap.systems.vllm Qwen/Qwen1.5-MoE-A2.7B \
-  --tensor-parallel-size 4 \
-  --trust-remote-code \
-  --port 8000 \
-  --enable-expert-distribution-metrics
+python -m moe_cap.systems.vllm Qwen/Qwen3-30B-A3B   --tensor-parallel-size 8   --trust-remote-code   --port 8000   --enable-expert-distribution-metrics  --reasoning-parser deepseek_r1 --gpu_memory_utilization 0.8
 ```
-
+Supported models: 
+- Qwen/Qwen1.5-MoE-A2.7B
+- deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+- Qwen/Qwen3-30B-A3B
 ## 2. Check the Logs
 
 Send some inference requests to the server, and the expert distribution metrics will be recorded.
 ```bash
-curl http://localhost:8000/v1/completions   -H "Content-Type: application/json"   -d '{
-  "model": "Qwen/Qwen1.5-MoE-A2.7B",
-  "prompt": "Write a Python program of a tik tak toe.",
-  "max_tokens": 3000,
-  "temperature": 0
-}'
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B",
+    "messages": [{"role": "user", "content": "Explain what is machine learning"}],
+    "temperature": 0
+  }'
 ```
 
 The server automatically writes expert distribution metrics to a JSONL file in the `logs/expert_distribution` directory. The filename includes the model name and a timestamp.
