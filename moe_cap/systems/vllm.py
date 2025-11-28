@@ -241,6 +241,18 @@ def execute_model_custom(
     intermediate_tensors: Optional[IntermediateTensors] = None,
 ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
     """Custom execute_model with latency tracking."""
+    
+    # Lazy initialization of recording state on workers
+    if not expert_distribution_recording_state.checked_auto_start:
+        if os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE):
+            expert_distribution_recording_state.enable()
+        expert_distribution_recording_state.checked_auto_start = True
+    
+    # Ensure model path is set if recording is enabled
+    if expert_distribution_recording_state.enabled and not expert_distribution_recording_state.model_path:
+        if hasattr(self, 'model_config') and hasattr(self.model_config, 'model'):
+            expert_distribution_recording_state.set_model_path(self.model_config.model)
+
     world_size = self.vllm_config.parallel_config.world_size
     gpu_raw_type = GLOBAL_GPU_TYPE
     
