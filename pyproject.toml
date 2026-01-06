@@ -31,7 +31,7 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-Repository = "https://github.com/SecretSettler/MoE-CAP"
+Repository = "https://github.com/Auto-CAP/MoE-CAP"
 
 [tool.setuptools]
 packages = ["moe_cap"]

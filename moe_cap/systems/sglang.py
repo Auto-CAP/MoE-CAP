@@ -20,7 +20,7 @@ import sglang.srt.managers.io_struct as iostruct
 from sglang.srt.managers.io_struct import BaseReq, ExpertDistributionReqType
 import dataclasses
 
-from typing import Optional, Tuple, Union, List, Literal
+from typing import Optional, Tuple, Union, List, Literal, Dict, Any
 import time
 import os
 import sys
@@ -95,12 +95,13 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:
-                yield
+                yield outputs
             finally:
-                self._on_forward_pass_end(forward_pass_id)
+                self._on_forward_pass_end(forward_pass_id, outputs)
 
     @contextmanager
     def disable_this_region(self):
@@ -119,12 +120,12 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
-    def _on_forward_pass_end(self, forward_pass_id: int):
+    def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
+            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data, outputs)
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -196,7 +197,8 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         if output_mode == "file":
-            save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp")
+            # Use ~/expert_records as the base directory
+            save_dir = os.path.join(os.path.expanduser("~"), "expert_records")
             path_output = os.path.join(save_dir, f"{self._server_args.model_path}/expert_distribution_record.jsonl")
             out_dirs = os.path.dirname(path_output)
             if not os.path.exists(out_dirs):
@@ -212,10 +214,8 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         return self._recording
 
 
-# Set default expert distribution recorder directory to expert_records
-# Can be overridden by setting SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR environment variable before import
-if "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR" not in os.environ:
-    os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.getcwd(), "expert_records")
+# Set expert distribution recorder directory to ~/expert_records
+os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.path.expanduser("~"), "expert_records")
 
 _original_forward = ModelRunner.forward
 def forward_expert_record(
