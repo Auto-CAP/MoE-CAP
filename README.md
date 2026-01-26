@@ -89,6 +89,10 @@ Documentation is currently of lower priority, but if you have thoughts or sugges
 
 Your contributions are crucial to the success and improvement of the MoE-CAP project. We look forward to collaborating with you.
 
+## Acknowledgement
+This project is supported by the Advanced Research and Invention
+Agency (ARIA)’s grant “Scaling Compute: AI at 1/1000th the cost. Technical Area 4 Benchmarking”.
+
 ## Cite our paper
 ```
 @misc{jiang2025moecapbenchmarkingcostaccuracy,
