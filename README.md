@@ -66,6 +66,51 @@ python -m moe_cap.runner.openai_api_profile \
 
 The results will be stored under `outputs/vllm/`.
 
+## Fixed-Length Benchmarking Mode
+
+For pure performance benchmarking (TPOT, throughput) without accuracy evaluation, you can enable **fixed-length mode**. This mode pads or truncates inputs to a fixed token length, useful for measuring hardware performance under controlled conditions.
+
+### Configuration
+
+Add these fields to your config YAML:
+
+```yaml
+dataset_names: ["gsm8k"]  # Any registered dataset as text source
+
+# Enable fixed-length mode
+fixed_length_mode: true
+target_input_tokens: 4096   # e.g., 4K input tokens
+target_output_tokens: 1024  # e.g., 1K output tokens
+num_samples: 100            # Number of benchmark samples
+
+# No accuracy metrics needed
+metrics: []
+```
+
+### Preset Configurations
+
+We provide preset configs for common scenarios:
+
+| Config File | Input | Output | Model |
+|-------------|-------|--------|-------|
+| `fixed_4k_1k_qwen3_30b.yaml` | 4K | 1K | Qwen3-30B-A3B |
+| `fixed_13k_1k_qwen3_30b.yaml` | 13K | 1K | Qwen3-30B-A3B |
+| `fixed_4k_1k_qwen3_235b.yaml` | 4K | 1K | Qwen3-235B-A22B |
+| `fixed_13k_1k_qwen3_235b.yaml` | 13K | 1K | Qwen3-235B-A22B |
+
+### Usage
+
+```bash
+python -m moe_cap.runner.sglang_profile \
+        --config-file configs/fixed_4k_1k_qwen3_30b.yaml \
+        --output_dir outputs/fixed_length/
+```
+
+**How it works:**
+- If input text is shorter than `target_input_tokens`: text is repeated/padded
+- If input text is longer: text is truncated
+- Accuracy metrics are skipped; only performance metrics (latency, TPOT, throughput) are collected
+
 ## Benchmark Pipeline
 ![Benchmark Pipeline](assets/cap_design.png)
 
