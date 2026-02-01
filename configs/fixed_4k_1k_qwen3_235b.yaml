@@ -1,5 +1,7 @@
 # Fixed-length benchmarking: 4K input tokens, 1K output tokens
 # For Qwen3-235B-A22B model
+# Note: ignore_eos is auto-enabled when fixed_length_mode is true
+# to ensure the model generates exactly target_output_tokens tokens
 
 dataset_names: ["gsm8k"]
 

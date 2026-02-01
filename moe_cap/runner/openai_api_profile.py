@@ -7,8 +7,9 @@ import sys
 import time
 import traceback
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Literal
 from dataclasses import dataclass, field
+from enum import Enum
 from tqdm.asyncio import tqdm as async_tqdm
 
 from moe_cap.model_loader import HFModelInfoRetriever
@@ -26,6 +27,13 @@ import re
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
 
 
+class BackendType(Enum):
+    """Backend server type for API calls."""
+    VLLM = "vllm"
+    SGLANG = "sglang"
+    AUTO = "auto"  # Auto-detect
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -33,6 +41,7 @@ class RequestFuncInput:
     output_len: int
     model: str
     extra_request_body: Dict[str, Any]
+    ignore_eos: bool = False  # Whether to ignore EOS token for fixed-length generation
 
 
 @dataclass
@@ -77,7 +86,7 @@ async def async_request_openai_completions(
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": False,
-            "ignore_eos": False,
+            "ignore_eos": request_func_input.ignore_eos,  # Use the ignore_eos setting
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -143,13 +152,17 @@ async def async_request_openai_completions(
 
 
 class OpenAIAPIMoEProfiler:
-    def __init__(self, config: CAPConfig, output_dir: str = None, api_url: str = None):
+    def __init__(self, config: CAPConfig, output_dir: str = None, api_url: str = None, 
+                 backend: str = "auto", ignore_eos: bool = None):
         """Initialize profiler from a CAPConfig object.
 
         Args:
             config: CAPConfig instance containing model and dataset info.
             output_dir: optional output directory. If not provided, will use './output'.
             api_url: OpenAI-compatible API endpoint URL.
+            backend: Backend type - "vllm", "sglang", or "auto" (auto-detect).
+            ignore_eos: Whether to ignore EOS token for fixed-length generation.
+                       If None, auto-set based on fixed_length_mode in config.
         """
         # store config
         self.config = config
@@ -160,6 +173,18 @@ class OpenAIAPIMoEProfiler:
         from urllib.parse import urlparse
         parsed = urlparse(api_url)
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Backend detection and configuration
+        self.backend_type = self._detect_or_set_backend(backend)
+        print(f"Using backend: {self.backend_type.value}")
+        
+        # Auto-set ignore_eos based on fixed_length_mode if not explicitly set
+        if ignore_eos is None:
+            self.ignore_eos = config.fixed_length_mode
+            if self.ignore_eos:
+                print("Fixed-length mode detected: enabling ignore_eos for accurate output length")
+        else:
+            self.ignore_eos = ignore_eos
 
         # dataset names (can be multiple)
         self.dataset_names = config.dataset_names or ["gsm8k"]
@@ -195,6 +220,55 @@ class OpenAIAPIMoEProfiler:
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model_name, trust_remote_code=True)
 
+    def _detect_or_set_backend(self, backend: str) -> BackendType:
+        """Detect or set the backend type.
+        
+        Args:
+            backend: "vllm", "sglang", or "auto"
+            
+        Returns:
+            BackendType enum value
+        """
+        if backend.lower() == "vllm":
+            return BackendType.VLLM
+        elif backend.lower() == "sglang":
+            return BackendType.SGLANG
+        elif backend.lower() == "auto":
+            # Try to auto-detect by checking available endpoints
+            return self._auto_detect_backend()
+        else:
+            print(f"Warning: Unknown backend '{backend}', defaulting to auto-detect")
+            return self._auto_detect_backend()
+    
+    def _auto_detect_backend(self) -> BackendType:
+        """Auto-detect backend by probing available endpoints."""
+        import requests
+        
+        # Try SGLang endpoint first (more specific)
+        try:
+            response = requests.get(f"{self.base_url}/get_model_info", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                # SGLang typically returns model_path in get_model_info
+                if "model_path" in data:
+                    print("Auto-detected SGLang backend")
+                    return BackendType.SGLANG
+        except Exception:
+            pass
+        
+        # Try vLLM endpoint
+        try:
+            response = requests.get(f"{self.base_url}/v1/models", timeout=5)
+            if response.status_code == 200:
+                print("Auto-detected vLLM backend")
+                return BackendType.VLLM
+        except Exception:
+            pass
+        
+        # Default to vLLM if detection fails
+        print("Warning: Could not auto-detect backend, defaulting to vLLM")
+        return BackendType.VLLM
+
     def _load_data_for_task(self, task_name: str):
         """Load data for a single task name using the modern data loader APIs."""
         try:
@@ -225,53 +299,91 @@ class OpenAIAPIMoEProfiler:
         """Check if batch recording endpoints are available."""
         import requests
         try:
-            response = requests.get(f"{self.base_url}/batch_recording_status", timeout=5)
-            response.raise_for_status()
-            return response.json()
+            if self.backend_type == BackendType.SGLANG:
+                # SGLang doesn't have a status endpoint, just return True
+                return {"available": True, "backend": "sglang"}
+            else:
+                response = requests.get(f"{self.base_url}/batch_recording_status", timeout=5)
+                response.raise_for_status()
+                return response.json()
         except Exception as e:
             print(f"Warning: Batch recording endpoints not available: {e}")
-            print("Make sure you're using the custom vllm server (moe_cap.systems.vllm)")
+            if self.backend_type == BackendType.VLLM:
+                print("Make sure you're using the custom vllm server (moe_cap.systems.vllm)")
             return None
     
     def _start_batch_recording(self):
         """Start batch statistics recording on the server."""
         import requests
         try:
-            response = requests.post(f"{self.base_url}/start_batch_recording", timeout=10)
+            if self.backend_type == BackendType.SGLANG:
+                response = requests.post(f"{self.base_url}/start_expert_distribution_record", timeout=10)
+            else:
+                response = requests.post(f"{self.base_url}/start_batch_recording", timeout=10)
             response.raise_for_status()
-            print("Started batch recording on server")
+            print(f"Started {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server")
             return True
         except Exception as e:
-            print(f"Warning: Could not start batch recording: {e}")
+            print(f"Warning: Could not start recording: {e}")
             return False
     
     def _stop_batch_recording(self):
         """Stop batch statistics recording on the server."""
         import requests
         try:
-            response = requests.post(f"{self.base_url}/stop_batch_recording", timeout=10)
+            if self.backend_type == BackendType.SGLANG:
+                response = requests.post(f"{self.base_url}/stop_expert_distribution_record", timeout=10)
+            else:
+                response = requests.post(f"{self.base_url}/stop_batch_recording", timeout=10)
             response.raise_for_status()
-            print("Stopped batch recording on server")
+            print(f"Stopped {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server")
             return True
         except Exception as e:
-            print(f"Warning: Could not stop batch recording: {e}")
+            print(f"Warning: Could not stop recording: {e}")
             return False
     
     def _dump_batch_recording(self):
         """Dump and retrieve batch statistics from the server."""
         import requests
         try:
-            response = requests.post(f"{self.base_url}/dump_batch_recording", timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            records = data.get("records", [])
-            print(f"Retrieved {len(records)} batch records from server")
-            return records
+            if self.backend_type == BackendType.SGLANG:
+                # SGLang dumps to file, need to trigger dump and then read from file
+                response = requests.post(f"{self.base_url}/dump_expert_distribution_record", timeout=10)
+                response.raise_for_status()
+                print("Expert distribution record dumped to file")
+                
+                # Read the dumped records from the file location
+                server_output_base = os.environ.get(
+                    "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", 
+                    os.path.join(os.getcwd(), "expert_records")
+                )
+                record_file = os.path.join(
+                    server_output_base, 
+                    self.hf_model_name, 
+                    "expert_distribution_record.jsonl"
+                )
+                
+                if os.path.exists(record_file):
+                    records = []
+                    with open(record_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                records.append(json.loads(line))
+                    print(f"Retrieved {len(records)} expert distribution records from file")
+                    return records
+                else:
+                    print(f"Warning: Expected record file not found at {record_file}")
+                    return []
+            else:
+                response = requests.post(f"{self.base_url}/dump_batch_recording", timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                records = data.get("records", [])
+                print(f"Retrieved {len(records)} batch records from server")
+                return records
         except Exception as e:
-            print(f"Warning: Could not dump batch recording: {e}")
-            return []
-        except Exception as e:
-            print(f"Warning: Could not dump batch recording: {e}")
+            print(f"Warning: Could not dump recording: {e}")
             return []
     
     def get_metrics(self, results: List[RequestFuncOutput], prompt_lengths: List[int], batch_size: int = 1, server_records: List[dict] = None):
@@ -402,6 +514,7 @@ class OpenAIAPIMoEProfiler:
                     output_len=max_output_len,
                     model=self.hf_model_name,
                     extra_request_body={},
+                    ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                 )
                 tasks.append(async_request_openai_completions(request_input, pbar))
 
@@ -436,6 +549,7 @@ class OpenAIAPIMoEProfiler:
                         output_len=max_output_len,
                         model=self.hf_model_name,
                         extra_request_body={},
+                        ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                     )
                     task = asyncio.create_task(
                         async_request_openai_completions(request_input, pbar)
@@ -562,12 +676,13 @@ class OpenAIAPIMoEProfiler:
 
             # Add metadata fields to the output
             res_dict["model_name"] = self.hf_model_name
-            res_dict["method"] = "vllm" ## Current hardcoded to vllm
+            res_dict["method"] = self.backend_type.value  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             res_dict["e2e_s"] = round(total_time, 2)
             res_dict["batch_size"] = batch_size if batch_size else None  # None indicates all inputs sent at once
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
+            res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
             # Determine model type based on model name (heuristic)
             res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
@@ -613,7 +728,20 @@ def main():
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--batch-size", type=int, default=None, help="Number of requests per batch. If not set, all requests are sent at once.")
+    parser.add_argument("--backend", type=str, default="auto", choices=["vllm", "sglang", "auto"],
+                       help="Backend server type. 'auto' will attempt to detect automatically.")
+    parser.add_argument("--ignore-eos", action="store_true", default=None,
+                       help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
+    parser.add_argument("--no-ignore-eos", action="store_true",
+                       help="Explicitly disable ignore_eos even in fixed_length_mode.")
     args = parser.parse_args()
+    
+    # Handle ignore_eos logic
+    ignore_eos = None  # Let profiler auto-detect based on config
+    if args.ignore_eos:
+        ignore_eos = True
+    elif args.no_ignore_eos:
+        ignore_eos = False
 
     # Load config file if provided (JSON or YAML). CLI args override file values.
     file_cfg = {}
@@ -661,13 +789,19 @@ def main():
         model_id=merged.get('model_id'),
         precision=merged.get('precision', 'bfloat16'),
         dataset_subset=merged.get('dataset_subset'),
-        dataset_split=merged.get('dataset_split', 'test')
+        dataset_split=merged.get('dataset_split', 'test'),
+        fixed_length_mode=merged.get('fixed_length_mode', False),
+        target_input_tokens=merged.get('target_input_tokens'),
+        target_output_tokens=merged.get('target_output_tokens'),
+        num_samples=merged.get('num_samples'),
     )
 
     profiler = OpenAIAPIMoEProfiler(
         config=cap_cfg,
         output_dir=args.output_dir,
         api_url=args.api_url,
+        backend=args.backend,
+        ignore_eos=ignore_eos,
     )
 
     profiler.run(batch_size=args.batch_size)

@@ -19,15 +19,25 @@ from transformers import AutoTokenizer
 import re
 
 class SGLangMoEActivationAnalyzer:
-    def __init__(self, config: CAPConfig, output_dir: str = None):
+    def __init__(self, config: CAPConfig, output_dir: str = None, ignore_eos: bool = None):
         """Initialize analyzer from a CAPConfig object.
 
         Args:
             config: CAPConfig instance containing model and dataset info.
             output_dir: optional output directory for metrics. If not provided, will use './output'.
+            ignore_eos: Whether to ignore EOS token for fixed-length generation.
+                       If None, auto-set based on fixed_length_mode in config.
         """
         # store config
         self.config = config
+        
+        # Auto-set ignore_eos based on fixed_length_mode if not explicitly set
+        if ignore_eos is None:
+            self.ignore_eos = config.fixed_length_mode
+            if self.ignore_eos:
+                print("Fixed-length mode detected: enabling ignore_eos for accurate output length")
+        else:
+            self.ignore_eos = ignore_eos
 
         # dataset names (can be multiple)
         self.dataset_names = config.dataset_names or ["gsm8k"]
@@ -132,17 +142,35 @@ class SGLangMoEActivationAnalyzer:
         else:
             return self.hf_model_name
 
+    @staticmethod
     @sgl.function
-    def run_sgl(s, question, max_new_tokens):
+    def run_sgl_with_eos(s, question, max_new_tokens):
+        """Run SGLang with normal EOS handling."""
         s += question
         s += sgl.gen(
             "answer",
             max_tokens=max_new_tokens,
             stop=["Question", "Assistant:", "<|separator|>"],
-        ) 
+        )
+
+    @staticmethod
+    @sgl.function
+    def run_sgl_ignore_eos(s, question, max_new_tokens):
+        """Run SGLang ignoring EOS token for fixed-length output."""
+        s += question
+        s += sgl.gen(
+            "answer",
+            max_tokens=max_new_tokens,
+            ignore_eos=True,  # Force exact token count
+        )
 
     def run(self, port=30000):
         set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
+        
+        # Select the appropriate run function based on ignore_eos setting
+        run_fn = self.run_sgl_ignore_eos if self.ignore_eos else self.run_sgl_with_eos
+        if self.ignore_eos:
+            print("Using ignore_eos mode for fixed-length generation")
 
         # iterate over all datasets in the CAPConfig
         for dataset_name in self.dataset_names:
@@ -169,7 +197,7 @@ class SGLangMoEActivationAnalyzer:
             print("Started expert distribution recording.")
 
             # Run inference (auto mode: single batch request)
-            states = self.run_sgl.run_batch(
+            states = run_fn.run_batch(
                 batched_inputs,
                 temperature=0,
                 num_threads=128,
@@ -275,6 +303,7 @@ class SGLangMoEActivationAnalyzer:
             res_dict["batch_size"] = None  # None indicates all inputs sent at once
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
+            res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
             # Determine model type based on model name (heuristic)
             res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
@@ -297,7 +326,18 @@ def main():
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
     parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
+    parser.add_argument("--ignore-eos", action="store_true", default=None,
+                       help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
+    parser.add_argument("--no-ignore-eos", action="store_true",
+                       help="Explicitly disable ignore_eos even in fixed_length_mode.")
     args = parser.parse_args()
+    
+    # Handle ignore_eos logic
+    ignore_eos = None  # Let analyzer auto-detect based on config
+    if args.ignore_eos:
+        ignore_eos = True
+    elif args.no_ignore_eos:
+        ignore_eos = False
 
     # Load config file if provided (JSON or YAML). CLI args override file values.
     file_cfg = {}
@@ -345,12 +385,17 @@ def main():
         model_id=merged.get('model_id'),
         precision=merged.get('precision', 'bfloat16'),
         dataset_subset=merged.get('dataset_subset'),
-        dataset_split=merged.get('dataset_split', 'test')
+        dataset_split=merged.get('dataset_split', 'test'),
+        fixed_length_mode=merged.get('fixed_length_mode', False),
+        target_input_tokens=merged.get('target_input_tokens'),
+        target_output_tokens=merged.get('target_output_tokens'),
+        num_samples=merged.get('num_samples'),
     )
 
     analyzer = SGLangMoEActivationAnalyzer(
         config=cap_cfg,
         output_dir=args.output_dir,
+        ignore_eos=ignore_eos,
     )
 
     analyzer.run(args.port)
