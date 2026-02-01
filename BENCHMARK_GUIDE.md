@@ -154,6 +154,8 @@ python -m moe_cap.runner.openai_api_profile \
 | 8xH200 | 13K-1K | 1, 32, 64, 128 |
 
 #### DeepSeek-R1 
+| Hardware | Task | Batch Sizes |
+|----------|------|-------------|
 | 8xH200 | 4K-1K | 1, 32, 64, 128 |
 | 8xH200 | 13K-1K | 1, 32, 64, 128 |
 
