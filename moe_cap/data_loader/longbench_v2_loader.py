@@ -13,14 +13,21 @@ class LongBenchV2Loader(DataLoader):
     
     It formats the multiple-choice prompt from
     'choice_A', 'choice_B', 'choice_C', and 'choice_D'.
+    
+    Note: LongBench v2 only has a 'train' split, not 'test'.
     """
 
     def __init__(self, config: CAPConfig) -> None:
         super().__init__(config)
+        # LongBench v2 only has 'train' split, override config if 'test' was specified
+        split = config.dataset_split
+        if split == "test":
+            print("Warning: LongBench v2 does not have a 'test' split. Using 'train' split instead.")
+            split = "train"
         try:
             dataset = load_dataset(
                 "THUDM/LongBench-v2", 
-                split=config.dataset_split
+                split=split
             )
         except Exception as e:
             print(f"Failed to load 'THUDM/LongBench-v2'.")
