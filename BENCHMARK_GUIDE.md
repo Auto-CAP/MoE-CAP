@@ -84,9 +84,33 @@ num_samples: 100            # Number of benchmark samples
 
 ## Running Benchmarks
 
-### Step 1: Launch the Server
+We support two inference backends: **SGLang** and **vLLM**. Both use the same benchmark configuration and runner.
+
+### Environment Setup
+
+> ⚠️ **Important**: SGLang and vLLM require **separate conda environments** due to dependency conflicts.
 
 ```bash
+# Create SGLang environment
+conda create -n sglang python=3.10 -y
+conda activate sglang
+pip install sglang[all]  # Or install from source
+
+# Create vLLM environment (separate!)
+conda create -n vllm python=3.10 -y
+conda activate vllm
+pip install vllm==0.11.0  # Use version 0.11.0
+```
+
+---
+
+### Option A: Using SGLang
+
+#### Step 1: Launch the SGLang Server
+
+```bash
+conda activate sglang
+
 export MODEL="<MODEL_HF_ID>"
 export PORT=30000
 export TP=<TENSOR_PARALLELISM>  # 1 for single GPU, 8 for 8 GPUs
@@ -101,7 +125,7 @@ python -m moe_cap.systems.sglang \
   --max-running-requests $BATCH_SIZE
 ```
 
-### Step 2: Run the Benchmark
+#### Step 2: Run the Benchmark (SGLang)
 
 ```bash
 python -m moe_cap.runner.openai_api_profile \
@@ -109,7 +133,45 @@ python -m moe_cap.runner.openai_api_profile \
   --api-url http://localhost:30000/v1/completions \
   --backend sglang \
   --ignore-eos \
-  --server-batch-size $BATCH_SIZE  # Records the server's max-running-requests in output
+  --server-batch-size $BATCH_SIZE
+```
+
+---
+
+### Option B: Using vLLM
+
+> ⚠️ **Note**: Use a separate conda environment with `vllm==0.11.0`
+
+#### Step 1: Launch the vLLM Server
+
+```bash
+conda activate vllm
+
+export MODEL="<MODEL_HF_ID>"
+export PORT=8000
+export TP=<TENSOR_PARALLELISM>  # 1 for single GPU, 8 for 8 GPUs
+export BATCH_SIZE=<BATCH_SIZE>  # 1, 32, 64, or 128
+
+# Launch vLLM server
+python -m moe_cap.systems.vllm \
+  --model $MODEL \
+  --port $PORT \
+  --host 0.0.0.0 \
+  --tensor-parallel-size $TP \
+  --enable-expert-distribution-metrics \
+  --max-num-batched-tokens 131072 \
+  --max-num-seqs $BATCH_SIZE
+```
+
+#### Step 2: Run the Benchmark (vLLM)
+
+```bash
+python -m moe_cap.runner.openai_api_profile \
+  --config-file configs/fixed_4k_1k_<model>.yaml \
+  --api-url http://0.0.0.0:8000/v1/completions \
+  --backend vllm \
+  --ignore-eos \
+  --server-batch-size $BATCH_SIZE
 ```
 
 ---
@@ -163,10 +225,13 @@ python -m moe_cap.runner.openai_api_profile \
 
 ## Quick Reference Scripts
 
-### Qwen1.5-MoE on 1xA100 (4K-1K, BS=1)
+### SGLang Examples
+
+#### Qwen1.5-MoE on 1xA100 (4K-1K, BS=1) - SGLang
 
 ```bash
 # Terminal 1: Launch server
+conda activate sglang
 export MODEL="Qwen/Qwen1.5-MoE-A2.7B-Chat"
 python -m moe_cap.systems.sglang \
   --model-path $MODEL \
@@ -184,10 +249,11 @@ python -m moe_cap.runner.openai_api_profile \
   --server-batch-size 1
 ```
 
-### DeepSeek-V2-Lite on 8xH100 (13K-1K, BS=64)
+#### DeepSeek-V2-Lite on 8xH100 (13K-1K, BS=64) - SGLang
 
 ```bash
 # Terminal 1: Launch server
+conda activate sglang
 export MODEL="deepseek-ai/DeepSeek-V2-Lite-Chat"
 python -m moe_cap.systems.sglang \
   --model-path $MODEL \
@@ -205,10 +271,93 @@ python -m moe_cap.runner.openai_api_profile \
   --server-batch-size 64
 ```
 
-### Mixtral-8x22B on 8xH200 (4K-1K, BS=128)
+---
+
+### vLLM Examples
+
+> ⚠️ **Note**: Use separate conda environment with `vllm==0.11.0`
+
+#### Qwen1.5-MoE on 1xH100 (4K-1K, BS=1) - vLLM
 
 ```bash
 # Terminal 1: Launch server
+conda activate vllm
+export MODEL="Qwen/Qwen1.5-MoE-A2.7B-Chat"
+python -m moe_cap.systems.vllm \
+  --model $MODEL \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --tensor-parallel-size 1 \
+  --enable-expert-distribution-metrics \
+  --max-num-batched-tokens 131072 \
+  --max-num-seqs 1
+
+# Terminal 2: Run benchmark
+python -m moe_cap.runner.openai_api_profile \
+  --config-file configs/fixed_4k_1k_qwen1_5.yaml \
+  --api-url http://0.0.0.0:8000/v1/completions \
+  --backend vllm \
+  --ignore-eos \
+  --server-batch-size 1
+```
+
+#### DeepSeek-V2-Lite on 1xH100 (4K-1K, BS=32) - vLLM
+
+```bash
+# Terminal 1: Launch server
+conda activate vllm
+export MODEL="deepseek-ai/DeepSeek-V2-Lite-Chat"
+python -m moe_cap.systems.vllm \
+  --model $MODEL \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --tensor-parallel-size 1 \
+  --enable-expert-distribution-metrics \
+  --max-num-batched-tokens 131072 \
+  --max-num-seqs 32
+
+# Terminal 2: Run benchmark
+python -m moe_cap.runner.openai_api_profile \
+  --config-file configs/fixed_4k_1k_dsv2_lite.yaml \
+  --api-url http://0.0.0.0:8000/v1/completions \
+  --backend vllm \
+  --ignore-eos \
+  --server-batch-size 32
+```
+
+#### Qwen1.5-MoE on 1xH100 (13K-1K, BS=1) - vLLM
+
+```bash
+# Terminal 1: Launch server
+conda activate vllm
+export MODEL="Qwen/Qwen1.5-MoE-A2.7B-Chat"
+python -m moe_cap.systems.vllm \
+  --model $MODEL \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --tensor-parallel-size 1 \
+  --enable-expert-distribution-metrics \
+  --max-num-batched-tokens 131072 \
+  --max-num-seqs 1
+
+# Terminal 2: Run benchmark
+python -m moe_cap.runner.openai_api_profile \
+  --config-file configs/fixed_13k_1k_qwen1_5.yaml \
+  --api-url http://0.0.0.0:8000/v1/completions \
+  --backend vllm \
+  --ignore-eos \
+  --server-batch-size 1
+```
+
+---
+
+### Large Model Examples (8 GPUs)
+
+#### Mixtral-8x22B on 8xH200 (4K-1K, BS=128) - SGLang
+
+```bash
+# Terminal 1: Launch server
+conda activate sglang
 export MODEL="mistralai/Mixtral-8x22B-Instruct-v0.1"
 python -m moe_cap.systems.sglang \
   --model-path $MODEL \
@@ -226,10 +375,11 @@ python -m moe_cap.runner.openai_api_profile \
   --server-batch-size 128
 ```
 
-### DeepSeek-R1 on 8xH200 (4K-1K, BS=32)
+#### DeepSeek-R1 on 8xH200 (4K-1K, BS=32) - SGLang
 
 ```bash
 # Terminal 1: Launch server
+conda activate sglang
 export MODEL="deepseek-ai/DeepSeek-R1"
 python -m moe_cap.systems.sglang \
   --model-path $MODEL \
@@ -262,20 +412,32 @@ The benchmark will output:
 
 ## Notes
 
-1. **Memory Requirements**:
+1. **Environment Setup**:
+   - SGLang and vLLM require **separate conda environments**
+   - vLLM: Use `pip install vllm==0.11.0` (specific version required)
+   - SGLang: Use `pip install sglang[all]` or install from source
+
+2. **Memory Requirements**:
    - Qwen1.5-MoE, DeepSeek-V2-Lite: Can run on single GPU
    - Mixtral-8x7B: Requires 8 GPUs for full precision
    - Mixtral-8x22B: Requires 8 GPUs with high memory
    - DeepSeek-R1: Requires 8 GPUs with maximum memory
 
-2. **Tensor Parallelism**:
-   - Use `--tp-size 1` for single GPU
-   - Use `--tp-size 8` for 8 GPU configurations
+3. **Tensor Parallelism**:
+   - SGLang: Use `--tp-size 1` for single GPU, `--tp-size 8` for 8 GPUs
+   - vLLM: Use `--tensor-parallel-size 1` for single GPU, `--tensor-parallel-size 8` for 8 GPUs
 
-3. **Batch Size Adjustment**:
+4. **Batch Size Control**:
+   - SGLang: `--max-running-requests $BATCH_SIZE`
+   - vLLM: `--max-num-seqs $BATCH_SIZE`
    - Start with smaller batch sizes if OOM occurs
    - Larger batch sizes improve throughput but increase latency
 
-4. **13K-1K Context**:
+5. **Port Configuration**:
+   - SGLang default: `30000`
+   - vLLM default: `8000`
+   - Make sure the `--api-url` in runner matches the server port
+
+6. **13K-1K Context**:
    - Requires more GPU memory than 4K-1K
    - Some batch sizes may not be achievable on certain hardware
