@@ -94,7 +94,7 @@ We support two inference backends: **SGLang** and **vLLM**. Both use the same be
 # Create SGLang environment
 conda create -n sglang python=3.10 -y
 conda activate sglang
-pip install sglang[all]  # Or install from source
+pip install sglang==0.5.8  # Or install from source
 
 # Create vLLM environment (separate!)
 conda create -n vllm python=3.10 -y
