@@ -55,26 +55,32 @@ logger = init_logger(__name__)
 # ============================================================================
 # CRITICAL: Apply expert distribution monkey patching BEFORE any other vLLM imports
 # This must be done early so it applies to all worker processes
+# Can be disabled via environment variable for incompatible models (e.g., Mixtral)
 # ============================================================================
-try:
-    # Add path to extracted_expert_dist for imports
-    _current_file_dir = os.path.dirname(os.path.abspath(__file__))
-    _expert_dist_path = os.path.join(_current_file_dir, "..", "extracted_expert_dist")
-    _expert_dist_path = os.path.abspath(_expert_dist_path)
-    if _expert_dist_path not in sys.path:
-        sys.path.insert(0, _expert_dist_path)
-    
-    from vllm_integration import apply_vllm_monkey_patching
-    # print(f"[PID {os.getpid()}] Applying expert distribution monkey patching...", flush=True)
-    apply_vllm_monkey_patching()
-    # print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
-except ImportError as e:
-    print(f"[PID {os.getpid()}] Warning: Could not import expert distribution patching: {e}", flush=True)
-    print(f"[PID {os.getpid()}] Expert distribution recording will not be available.", flush=True)
-except Exception as e:
-    print(f"[PID {os.getpid()}] Warning: Failed to apply expert distribution patching: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
+_SKIP_EXPERT_PATCHING = os.environ.get("MOE_CAP_SKIP_EXPERT_PATCHING", "0") == "1"
+
+if _SKIP_EXPERT_PATCHING:
+    print(f"[PID {os.getpid()}] Skipping expert distribution monkey patching (MOE_CAP_SKIP_EXPERT_PATCHING=1)", flush=True)
+else:
+    try:
+        # Add path to extracted_expert_dist for imports
+        _current_file_dir = os.path.dirname(os.path.abspath(__file__))
+        _expert_dist_path = os.path.join(_current_file_dir, "..", "extracted_expert_dist")
+        _expert_dist_path = os.path.abspath(_expert_dist_path)
+        if _expert_dist_path not in sys.path:
+            sys.path.insert(0, _expert_dist_path)
+        
+        from vllm_integration import apply_vllm_monkey_patching
+        # print(f"[PID {os.getpid()}] Applying expert distribution monkey patching...", flush=True)
+        apply_vllm_monkey_patching()
+        # print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
+    except ImportError as e:
+        print(f"[PID {os.getpid()}] Warning: Could not import expert distribution patching: {e}", flush=True)
+        print(f"[PID {os.getpid()}] Expert distribution recording will not be available.", flush=True)
+    except Exception as e:
+        print(f"[PID {os.getpid()}] Warning: Failed to apply expert distribution patching: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 # ============================================================================
 # Global recording state - using file-based flags for multiprocessing safety
