@@ -320,12 +320,56 @@ class SGLangMoEActivationAnalyzer:
             print(f"Expert records saved to {dest_record}")
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="MoE-CAP SGLang Profiler - Run benchmarks using SGLang server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Using config file:
+  python -m moe_cap.runner.sglang_profile --config-file configs/gsm8k_qwen3_235b.yaml
+
+  # Using command-line arguments:
+  python -m moe_cap.runner.sglang_profile --model_name Qwen/Qwen3-235B-A22B --datasets gsm8k --metrics em f1
+
+  # Fixed-length benchmarking via CLI:
+  python -m moe_cap.runner.sglang_profile --model_name deepseek-ai/DeepSeek-V2-Lite-Chat \
+    --datasets longbench_v2 --fixed-length-mode --target-input-tokens 13000 --target-output-tokens 1000 --num-samples 100
+
+  # Mix config file and CLI (CLI overrides config):
+  python -m moe_cap.runner.sglang_profile --config-file configs/base.yaml --model_name my/custom-model
+"""
+    )
+    # Config file option
+    parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields. CLI args override config file values.")
+    
+    # Required fields (can come from config file)
     parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
-    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
-    parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
-    parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
-    parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
+    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k nq), required unless specified in config file")
+    
+    # CAPConfig optional fields
+    parser.add_argument("--metrics", nargs='*', default=None, help="Metrics to compute (e.g. em f1). Default: [] (no metrics)")
+    parser.add_argument("--precision", type=str, default=None, choices=["bfloat16", "float16", "float32", "int8", "int4"],
+                       help="Model precision. Default: bfloat16")
+    parser.add_argument("--dataset-subset", type=str, default=None,
+                       help="Dataset subset to use (e.g. 'main' for gsm8k, or a specific LongBench task)")
+    parser.add_argument("--dataset-split", type=str, default=None,
+                       help="Dataset split to use (e.g. test, validation). Default: test")
+    
+    # Fixed-length benchmarking options
+    parser.add_argument("--fixed-length-mode", action="store_true", default=None,
+                       help="Enable fixed-length benchmarking mode (no accuracy eval, pure performance)")
+    parser.add_argument("--target-input-tokens", type=int, default=None,
+                       help="Target input token length for fixed-length benchmarking")
+    parser.add_argument("--target-output-tokens", type=int, default=None,
+                       help="Target output token length for fixed-length benchmarking")
+    parser.add_argument("--num-samples", type=int, default=None,
+                       help="Number of samples for fixed-length benchmarking")
+    
+    # Server and output options
+    parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server. Default: 30000")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for metrics. Default: ./output")
+    
+    # EOS handling
     parser.add_argument("--ignore-eos", action="store_true", default=None,
                        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
     parser.add_argument("--no-ignore-eos", action="store_true",
@@ -359,8 +403,28 @@ def main():
 
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
-    merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['dataset_names'] = args.datasets or merged.get('dataset_names')
+    
+    # Override with CLI args if provided (None means not specified)
+    if args.model_name is not None:
+        merged['model_id'] = args.model_name
+    if args.datasets is not None:
+        merged['dataset_names'] = args.datasets
+    if args.metrics is not None:
+        merged['metrics'] = args.metrics
+    if args.precision is not None:
+        merged['precision'] = args.precision
+    if args.dataset_subset is not None:
+        merged['dataset_subset'] = args.dataset_subset
+    if args.dataset_split is not None:
+        merged['dataset_split'] = args.dataset_split
+    if args.fixed_length_mode is not None:
+        merged['fixed_length_mode'] = args.fixed_length_mode
+    if args.target_input_tokens is not None:
+        merged['target_input_tokens'] = args.target_input_tokens
+    if args.target_output_tokens is not None:
+        merged['target_output_tokens'] = args.target_output_tokens
+    if args.num_samples is not None:
+        merged['num_samples'] = args.num_samples
 
     # Validate required fields
     if not merged.get('model_id'):

@@ -163,7 +163,7 @@ class OpenAIAPIMoEProfiler:
             backend: Backend type - "vllm", "sglang", or "auto" (auto-detect).
             ignore_eos: Whether to ignore EOS token for fixed-length generation.
                        If None, auto-set based on fixed_length_mode in config.
-            server_batch_size: The server's max-running-requests setting (for recording purposes).
+            server_batch_size: Number of concurrent requests to send. If None, send all at once.
         """
         self.server_batch_size = server_batch_size
         # store config
@@ -596,7 +596,7 @@ class OpenAIAPIMoEProfiler:
 
         return all_results, total_time
 
-    async def run_async(self, batch_size: Optional[int] = None):
+    async def run_async(self):
         """Run profiling for all configured datasets."""
         # iterate over all datasets in the CAPConfig
         for dataset_name in self.dataset_names:
@@ -622,7 +622,7 @@ class OpenAIAPIMoEProfiler:
             results, total_time = await self.run_benchmark(
                 prompts=prompts,
                 max_output_len=max_output_len,
-                batch_size=batch_size,
+                batch_size=self.server_batch_size,
             )
 
             # Stop batch recording and retrieve records
@@ -636,7 +636,7 @@ class OpenAIAPIMoEProfiler:
                 print(f"Detected num_gpus from records: {num_gpus}")
 
             # Calculate metrics
-            res_dict = self.get_metrics(results, prompt_lengths, batch_size=batch_size or 1, server_records=server_records)
+            res_dict = self.get_metrics(results, prompt_lengths, batch_size=self.server_batch_size or 1, server_records=server_records)
 
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
@@ -681,11 +681,10 @@ class OpenAIAPIMoEProfiler:
             res_dict["method"] = self.backend_type.value  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             res_dict["e2e_s"] = round(total_time, 2)
-            res_dict["batch_size"] = batch_size if batch_size else None  # None indicates all inputs sent at once
+            res_dict["server_batch_size"] = self.server_batch_size  # None indicates all inputs sent at once
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
             res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
-            res_dict["server_batch_size"] = self.server_batch_size  # Server's max-running-requests setting
             # Determine model type based on model name (heuristic)
             res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
@@ -718,27 +717,73 @@ class OpenAIAPIMoEProfiler:
                     f.write(json.dumps(record) + '\n')
             print(f"Detailed results written to {detailed_output_path}")
 
-    def run(self, batch_size: Optional[int] = None):
+    def run(self):
         """Synchronous wrapper for run_async."""
-        asyncio.run(self.run_async(batch_size=batch_size))
+        asyncio.run(self.run_async())
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="MoE-CAP OpenAI API Profiler - Run benchmarks via OpenAI-compatible API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Using config file:
+  python -m moe_cap.runner.openai_api_profile --config-file configs/gsm8k_qwen3_235b.yaml --api-url http://localhost:8000/v1/completions
+
+  # Using command-line arguments:
+  python -m moe_cap.runner.openai_api_profile --model_name Qwen/Qwen3-235B-A22B --datasets gsm8k --metrics em f1 \
+    --api-url http://localhost:8000/v1/completions
+
+  # Fixed-length benchmarking via CLI:
+  python -m moe_cap.runner.openai_api_profile --model_name deepseek-ai/DeepSeek-V2-Lite-Chat \
+    --datasets longbench_v2 --fixed-length-mode --target-input-tokens 13000 --target-output-tokens 1000 --num-samples 100 \
+    --api-url http://localhost:8000/v1/completions
+
+  # Mix config file and CLI (CLI overrides config):
+  python -m moe_cap.runner.openai_api_profile --config-file configs/base.yaml --model_name my/custom-model \
+    --api-url http://localhost:8000/v1/completions
+"""
+    )
+    # Config file option
+    parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields. CLI args override config file values.")
+    
+    # Required fields (can come from config file, except api-url which is always required)
     parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
-    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
-    parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
+    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k nq), required unless specified in config file")
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
-    parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--batch-size", type=int, default=None, help="Number of requests per batch. If not set, all requests are sent at once.")
+    
+    # CAPConfig optional fields
+    parser.add_argument("--metrics", nargs='*', default=None, help="Metrics to compute (e.g. em f1). Default: [] (no metrics)")
+    parser.add_argument("--precision", type=str, default=None, choices=["bfloat16", "float16", "float32", "int8", "int4"],
+                       help="Model precision. Default: bfloat16")
+    parser.add_argument("--dataset-subset", type=str, default=None,
+                       help="Dataset subset to use (e.g. 'main' for gsm8k, or a specific LongBench task)")
+    parser.add_argument("--dataset-split", type=str, default=None,
+                       help="Dataset split to use (e.g. test, validation). Default: test")
+    
+    # Fixed-length benchmarking options
+    parser.add_argument("--fixed-length-mode", action="store_true", default=None,
+                       help="Enable fixed-length benchmarking mode (no accuracy eval, pure performance)")
+    parser.add_argument("--target-input-tokens", type=int, default=None,
+                       help="Target input token length for fixed-length benchmarking")
+    parser.add_argument("--target-output-tokens", type=int, default=None,
+                       help="Target output token length for fixed-length benchmarking")
+    parser.add_argument("--num-samples", type=int, default=None,
+                       help="Number of samples for fixed-length benchmarking")
+    
+    # Server and output options
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for metrics. Default: ./output")
+    parser.add_argument("--server-batch-size", type=int, default=None, 
+                       help="Number of concurrent requests to send. If not set, all requests are sent at once.")
     parser.add_argument("--backend", type=str, default="auto", choices=["vllm", "sglang", "auto"],
                        help="Backend server type. 'auto' will attempt to detect automatically.")
+    
+    # EOS handling
     parser.add_argument("--ignore-eos", action="store_true", default=None,
                        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
     parser.add_argument("--no-ignore-eos", action="store_true",
                        help="Explicitly disable ignore_eos even in fixed_length_mode.")
-    parser.add_argument("--server-batch-size", type=int, default=None,
-                       help="The server's max-running-requests setting. Recorded in output for reference.")
     args = parser.parse_args()
     
     # Handle ignore_eos logic
@@ -768,8 +813,28 @@ def main():
 
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
-    merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['dataset_names'] = args.datasets or merged.get('dataset_names')
+    
+    # Override with CLI args if provided (None means not specified)
+    if args.model_name is not None:
+        merged['model_id'] = args.model_name
+    if args.datasets is not None:
+        merged['dataset_names'] = args.datasets
+    if args.metrics is not None:
+        merged['metrics'] = args.metrics
+    if args.precision is not None:
+        merged['precision'] = args.precision
+    if args.dataset_subset is not None:
+        merged['dataset_subset'] = args.dataset_subset
+    if args.dataset_split is not None:
+        merged['dataset_split'] = args.dataset_split
+    if args.fixed_length_mode is not None:
+        merged['fixed_length_mode'] = args.fixed_length_mode
+    if args.target_input_tokens is not None:
+        merged['target_input_tokens'] = args.target_input_tokens
+    if args.target_output_tokens is not None:
+        merged['target_output_tokens'] = args.target_output_tokens
+    if args.num_samples is not None:
+        merged['num_samples'] = args.num_samples
 
     # Validate required fields
     if not merged.get('model_id'):
@@ -810,7 +875,7 @@ def main():
         server_batch_size=args.server_batch_size,
     )
 
-    profiler.run(batch_size=args.batch_size)
+    profiler.run()
 
 
 if __name__ == "__main__":
