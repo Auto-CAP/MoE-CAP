@@ -1,0 +1,15 @@
+# Fixed-length benchmarking: 4K input tokens, 1K output tokens
+# This mode is for pure performance benchmarking (TPOT, throughput) without accuracy evaluation
+
+dataset_names: ["gsm8k"]
+
+# No accuracy metrics for fixed-length benchmarking
+metrics: []
+
+model_id: mistralai/Mixtral-8x7B-Instruct-v0.1
+
+# Enable fixed-length mode
+fixed_length_mode: true
+target_input_tokens: 4000   # 4K input tokens
+target_output_tokens: 1000  # 1K output tokens
+num_samples: 100            # Number of benchmark samples
