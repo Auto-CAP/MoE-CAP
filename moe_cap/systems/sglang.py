@@ -286,10 +286,24 @@ def forward_expert_record(
             # logger.info(avg_activated_per_step)
             non_zero_values = avg_activated_per_step[avg_activated_per_step != 0]
             non_zero_value = non_zero_values.item() if non_zero_values.numel() > 0 else 0
+            
+            # Adjust prefill latency for chunked prefill:
+            # When --max-running-requests is set on the server, the actual prefill forward
+            # may only process a subset of requests due to chunked prefill. Scale latency
+            # to reflect the true TTFT as if all max_running_requests were prefilled together.
+            adjusted_latency = latency
+            max_running = getattr(self.server_args, 'max_running_requests', None)
+            if forward_mode == "prefill" and max_running is not None:
+                prefill_bs = forward_batch.batch_size
+                if prefill_bs > 0 and prefill_bs < max_running:
+                    adjusted_latency = (max_running / prefill_bs) * latency
+                    logger.info(f"TTFT adjusted: {latency:.4f}s -> {adjusted_latency:.4f}s "
+                               f"(max_running_requests={max_running}, prefill_bs={prefill_bs})")
+            
             record_dict = {
                 "forward_pass_id": self.forward_pass_id,
                 "batch_size": forward_batch.batch_size,
-                "latency": latency,
+                "latency": adjusted_latency,
                 "seq_lens_sum": sum_seq_len,
                 "forward_mode": forward_mode,
                 "expert_activation": non_zero_value,

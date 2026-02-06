@@ -98,6 +98,7 @@ EXPERT_DISTRIBUTION_RECORDING_FLAG_FILE = os.path.join(tempfile.gettempdir(), "v
 EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
 EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(os.getcwd(), "logs/expert_distribution")
 _expert_record_lock = threading.Lock()
+
 _forward_pass_id_counter = 0
 _forward_pass_id_lock = threading.Lock()
 
@@ -524,9 +525,20 @@ def execute_model_custom(
              elif isinstance(attn_metadata.seq_lens, list):
                   sum_seq_len = sum(attn_metadata.seq_lens)
         
+        # Adjust prefill latency for chunked prefill:
+        # self.max_num_reqs comes from --max-num-seqs server arg. When set,
+        # the actual prefill forward may only process a subset due to chunked prefill.
+        adjusted_latency = latency
+        max_num_reqs = getattr(self, 'max_num_reqs', None)
+        if forward_mode == "prefill" and max_num_reqs is not None:
+            if batch_size > 0 and batch_size < max_num_reqs:
+                adjusted_latency = (max_num_reqs / batch_size) * latency
+                logger.info(f"TTFT adjusted: {latency:.4f}s -> {adjusted_latency:.4f}s "
+                           f"(max_num_reqs={max_num_reqs}, prefill_bs={batch_size})")
+        
         rec_dict = {
             "batch_size": batch_size,
-            "latency": latency,
+            "latency": adjusted_latency,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
             "expert_activation": expert_activation,
@@ -552,10 +564,17 @@ def execute_model_custom(
                      elif isinstance(attn_metadata.seq_lens, list):
                           sum_seq_len = sum(attn_metadata.seq_lens)
                 
+                # Adjust prefill latency for chunked prefill
+                adjusted_latency_expert = latency
+                max_num_reqs = getattr(self, 'max_num_reqs', None)
+                if forward_mode == "prefill" and max_num_reqs is not None:
+                    if batch_size > 0 and batch_size < max_num_reqs:
+                        adjusted_latency_expert = (max_num_reqs / batch_size) * latency
+                
                 record_dict = {
                     "forward_pass_id": forward_pass_id,
                     "batch_size": batch_size,
-                    "latency": latency,
+                    "latency": adjusted_latency_expert,
                     "seq_lens_sum": sum_seq_len,
                     "forward_mode": forward_mode,
                     "expert_activation": expert_activation,
