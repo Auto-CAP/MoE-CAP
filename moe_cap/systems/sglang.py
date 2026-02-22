@@ -3,7 +3,8 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
     ExpertDistributionRecorder,
     _Accumulator,
-    _SinglePassGatherer
+    _SinglePassGatherer,
+    _SelectExpertsSinglePassGatherer,
 )
 
 import sglang.srt.eplb.expert_distribution as sglang_eplb_expert_distribution
@@ -18,6 +19,7 @@ from sglang.srt.utils import Withable
 from sglang.srt.environ import envs
 import sglang.srt.managers.io_struct as iostruct
 from sglang.srt.managers.io_struct import BaseReq, ExpertDistributionReqType
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, TopKOutput
 import dataclasses
 
 from typing import Optional, Tuple, Union, List, Literal, Dict, Any
@@ -129,6 +131,12 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
+
+    def on_expert_hist(self, expt_hist: torch.Tensor):
+        """Record expert distribution from triton_kernels routing histogram.
+        expt_hist is a 1D tensor of shape (num_experts,) with token counts per expert.
+        """
+        self._on_hook("on_expert_hist", expt_hist=expt_hist)
 
     def on_deepep_dispatch_normal(
         self,
@@ -319,6 +327,34 @@ def forward_expert_record(
 
 ModelRunner.forward = forward_expert_record
 sglang_eplb_expert_distribution._ExpertDistributionRecorderReal = _ExpertDistributionRecorderReal2
+
+
+# --- Monkey-patch _SelectExpertsSinglePassGatherer to support on_expert_hist ---
+def _on_expert_hist(self, layer_idx: int, expt_hist: torch.Tensor):
+    """Record expert distribution from a pre-computed histogram (triton_kernels path).
+    expt_hist: 1D tensor of shape (num_experts,) with token counts per expert.
+    """
+    num_experts = self._data.shape[1]
+    hist = expt_hist[:num_experts].to(device=self._data.device, dtype=self._data.dtype)
+    self._data[layer_idx, :] += hist
+
+_SelectExpertsSinglePassGatherer.on_expert_hist = _on_expert_hist
+
+
+# --- Monkey-patch TopK.forward_cuda to call expert distribution recorder for TRITON_KERNEL path ---
+_original_topk_forward_cuda = TopK.forward_cuda
+
+def _patched_topk_forward_cuda(self, hidden_states, router_logits, **kwargs) -> TopKOutput:
+    result = _original_topk_forward_cuda(self, hidden_states, router_logits, **kwargs)
+    # If the result is a TritonKernelTopKOutput, the original code skips on_select_experts.
+    # We use the expt_hist from routing_data to record expert distribution.
+    if hasattr(result, 'routing_data') and hasattr(result.routing_data, 'expt_hist'):
+        recorder = get_global_expert_distribution_recorder()
+        if hasattr(recorder, 'on_expert_hist'):
+            recorder.on_expert_hist(expt_hist=result.routing_data.expt_hist)
+    return result
+
+TopK.forward_cuda = _patched_topk_forward_cuda
 
 if __name__ == "__main__":
     from sglang.srt.entrypoints.http_server import launch_server
