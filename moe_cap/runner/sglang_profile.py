@@ -374,6 +374,10 @@ Examples:
                        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
     parser.add_argument("--no-ignore-eos", action="store_true",
                        help="Explicitly disable ignore_eos even in fixed_length_mode.")
+    # Profiling-only mode
+    parser.add_argument("--profiling-only", action="store_true", default=None,
+                       help="Profiling-only mode: skip expert distribution recording, only collect "
+                            "TTFT/TPOT/throughput. Server must be started with MOE_CAP_PROFILING_ONLY=1.")
     args = parser.parse_args()
     
     # Handle ignore_eos logic
@@ -425,6 +429,8 @@ Examples:
         merged['target_output_tokens'] = args.target_output_tokens
     if args.num_samples is not None:
         merged['num_samples'] = args.num_samples
+    if args.profiling_only is not None:
+        merged['profiling_only'] = args.profiling_only
 
     # Validate required fields
     if not merged.get('model_id'):
@@ -454,6 +460,7 @@ Examples:
         target_input_tokens=merged.get('target_input_tokens'),
         target_output_tokens=merged.get('target_output_tokens'),
         num_samples=merged.get('num_samples'),
+        profiling_only=merged.get('profiling_only', False),
     )
 
     analyzer = SGLangMoEActivationAnalyzer(

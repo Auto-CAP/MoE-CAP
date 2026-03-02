@@ -30,6 +30,9 @@ import json
 
 from moe_cap.utils.hardware_utils import get_gpu_details
 
+_PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
+if _PROFILING_ONLY:
+    print(f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled", flush=True)
 
 _OutputMode = Literal["file", "object"]
 
@@ -317,7 +320,83 @@ def forward_expert_record(
 
         return output
 
-ModelRunner.forward = forward_expert_record
+# ---------------------------------------------------------------------------
+# Profiling-only forward: skip expert distribution hooks, only measure timing
+# ---------------------------------------------------------------------------
+def forward_profiling_only(
+    self,
+    forward_batch: ForwardBatch,
+    skip_attn_backend_init: bool = False,
+    pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    reinit_attn_backend: bool = False,
+    split_forward_count: int = 1,
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        self.forward_pass_id += 1
+        gpu_num = self.tp_size * self.pp_size
+        gpu_raw_type = GLOBAL_GPU_TYPE
+
+        recorder = get_global_expert_distribution_recorder()
+        # Disable expert hooks during the forward pass so they become no-ops
+        with recorder.disable_this_region():
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            output = self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            latency = end_time - start_time
+
+        sum_seq_len = forward_batch.seq_lens_sum
+        if forward_batch.forward_mode.is_extend():
+            forward_mode = "prefill"
+        elif forward_batch.forward_mode.is_decode():
+            forward_mode = "decode"
+        else:
+            raise ValueError(
+                f"Invalid forward mode: {forward_batch.forward_mode.name}"
+            )
+
+        if self.tp_rank == 0:
+            # Adjust prefill latency for chunked prefill
+            adjusted_latency = latency
+            max_running = getattr(self.server_args, 'max_running_requests', None)
+            if forward_mode == "prefill" and max_running is not None:
+                prefill_bs = forward_batch.batch_size
+                if prefill_bs > 0 and prefill_bs < max_running:
+                    adjusted_latency = (max_running / prefill_bs) * latency
+                    logger.info(f"TTFT adjusted: {latency:.4f}s -> {adjusted_latency:.4f}s "
+                               f"(max_running_requests={max_running}, prefill_bs={prefill_bs})")
+
+            record_dict = {
+                "forward_pass_id": self.forward_pass_id,
+                "batch_size": forward_batch.batch_size,
+                "latency": adjusted_latency,
+                "seq_lens_sum": sum_seq_len,
+                "forward_mode": forward_mode,
+                "expert_activation": 0,
+                "gpu_num": gpu_num,
+                "gpu_raw_type": gpu_raw_type
+            }
+            recorder.expert_record_list.append(record_dict)
+            logger.info(f"[profiling-only] Forward pass {self.forward_pass_id} latency {latency:.4f}s")
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end()
+
+        return output
+
+
+if _PROFILING_ONLY:
+    ModelRunner.forward = forward_profiling_only
+    print(f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)", flush=True)
+else:
+    ModelRunner.forward = forward_expert_record
+
 sglang_eplb_expert_distribution._ExpertDistributionRecorderReal = _ExpertDistributionRecorderReal2
 
 if __name__ == "__main__":

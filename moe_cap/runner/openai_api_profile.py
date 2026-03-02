@@ -153,7 +153,8 @@ async def async_request_openai_completions(
 
 class OpenAIAPIMoEProfiler:
     def __init__(self, config: CAPConfig, output_dir: str = None, api_url: str = None, 
-                 backend: str = "auto", ignore_eos: bool = None, server_batch_size: int = None):
+                 backend: str = "auto", ignore_eos: bool = None, server_batch_size: int = None,
+                 profiling_only: bool = False):
         """Initialize profiler from a CAPConfig object.
 
         Args:
@@ -164,8 +165,10 @@ class OpenAIAPIMoEProfiler:
             ignore_eos: Whether to ignore EOS token for fixed-length generation.
                        If None, auto-set based on fixed_length_mode in config.
             server_batch_size: Number of concurrent requests to send. If None, send all at once.
+            profiling_only: Skip expert distribution recording, only collect TTFT/TPOT/throughput.
         """
         self.server_batch_size = server_batch_size
+        self.profiling_only = profiling_only or config.profiling_only
         # store config
         self.config = config
         self.api_url = api_url
@@ -179,6 +182,9 @@ class OpenAIAPIMoEProfiler:
         # Backend detection and configuration
         self.backend_type = self._detect_or_set_backend(backend)
         print(f"Using backend: {self.backend_type.value}")
+        if self.profiling_only:
+            print("Profiling-only mode: expert distribution recording disabled. "
+                  "Make sure the server was started with MOE_CAP_PROFILING_ONLY=1")
         
         # Auto-set ignore_eos based on fixed_length_mode if not explicitly set
         if ignore_eos is None:
@@ -685,6 +691,7 @@ class OpenAIAPIMoEProfiler:
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
             res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
+            res_dict["profiling_only"] = self.profiling_only
             # Determine model type based on model name (heuristic)
             res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
@@ -784,6 +791,10 @@ Examples:
                        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
     parser.add_argument("--no-ignore-eos", action="store_true",
                        help="Explicitly disable ignore_eos even in fixed_length_mode.")
+    # Profiling-only mode
+    parser.add_argument("--profiling-only", action="store_true", default=None,
+                       help="Profiling-only mode: skip expert distribution recording, only collect "
+                            "TTFT/TPOT/throughput. Server must be started with MOE_CAP_PROFILING_ONLY=1.")
     args = parser.parse_args()
     
     # Handle ignore_eos logic
@@ -835,6 +846,8 @@ Examples:
         merged['target_output_tokens'] = args.target_output_tokens
     if args.num_samples is not None:
         merged['num_samples'] = args.num_samples
+    if args.profiling_only is not None:
+        merged['profiling_only'] = args.profiling_only
 
     # Validate required fields
     if not merged.get('model_id'):
@@ -864,6 +877,7 @@ Examples:
         target_input_tokens=merged.get('target_input_tokens'),
         target_output_tokens=merged.get('target_output_tokens'),
         num_samples=merged.get('num_samples'),
+        profiling_only=merged.get('profiling_only', False),
     )
 
     profiler = OpenAIAPIMoEProfiler(
@@ -873,6 +887,7 @@ Examples:
         backend=args.backend,
         ignore_eos=ignore_eos,
         server_batch_size=args.server_batch_size,
+        profiling_only=cap_cfg.profiling_only,
     )
 
     profiler.run()

@@ -58,6 +58,12 @@ logger = init_logger(__name__)
 # Can be disabled via environment variable for incompatible models (e.g., Mixtral)
 # ============================================================================
 _SKIP_EXPERT_PATCHING = os.environ.get("MOE_CAP_SKIP_EXPERT_PATCHING", "0") == "1"
+_PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
+
+# In profiling-only mode, automatically skip expert patching as well
+if _PROFILING_ONLY:
+    _SKIP_EXPERT_PATCHING = True
+    print(f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled", flush=True)
 
 if _SKIP_EXPERT_PATCHING:
     print(f"[PID {os.getpid()}] Skipping expert distribution monkey patching (MOE_CAP_SKIP_EXPERT_PATCHING=1)", flush=True)
@@ -467,54 +473,55 @@ def execute_model_custom(
         _forward_pass_id_counter += 1
         forward_pass_id = _forward_pass_id_counter
     
-    # Collect expert distribution data (per_pass mode)
+    # Collect expert distribution data (per_pass mode) — skipped in profiling-only mode
     expert_activation = 0
     expert_utilization = 0
-    try:
-        # Try to get expert distribution data from the model runner
-        if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder is not None:
-            recorder = self.expert_distribution_recorder
-            # Check if recording is active
-            if hasattr(recorder, '_recording') and recorder._recording:
-                # CRITICAL: Use per_pass collection logic (collect -> reset -> append)
-                # This is what allows it to work with CUDAGraph (where forward hooks don't run CPU code)
-                
-                # 1. Collect data from gatherer (syncs if needed)
-                if hasattr(recorder, '_gatherer'):
-                    collected_data = recorder._gatherer.collect()
-                    # Inject forward_mode into collected data so it's available for dump/accumulation
-                    collected_data['forward_mode'] = forward_mode
-                    recorder._gatherer.reset()
+    if not _PROFILING_ONLY:
+        try:
+            # Try to get expert distribution data from the model runner
+            if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder is not None:
+                recorder = self.expert_distribution_recorder
+                # Check if recording is active
+                if hasattr(recorder, '_recording') and recorder._recording:
+                    # CRITICAL: Use per_pass collection logic (collect -> reset -> append)
+                    # This is what allows it to work with CUDAGraph (where forward hooks don't run CPU code)
                     
-                    # 2. Append to accumulator with current pass ID
-                    if hasattr(recorder, '_accumulator'):
-                        recorder._accumulator.append(forward_pass_id, collected_data)
-                    
-                    # 3. Calculate metric for logging from the collected data
-                    # collected_data['expert_count'] is [num_layers, num_experts]
-                    # Note: The key is 'expert_count' (singular) in the recorder implementation
-                    if 'expert_count' in collected_data:
-                        counts = collected_data['expert_count']
-                        if counts is not None:
-                            # Average activated experts per layer
-                            # (counts > 0).float() -> [num_layers, num_experts]
-                            # .sum(dim=1) -> [num_layers]
-                            # .mean() -> scalar
-                            active = (counts > 0).float().sum(dim=1).mean().item()
-                            expert_activation = active
-                    
-                    # Calculate utilization
-                    if expert_activation > 0 and hasattr(recorder, '_expert_location_metadata'):
-                         num_experts = recorder._expert_location_metadata.num_logical_experts
-                         if num_experts > 0:
-                              expert_utilization = expert_activation / num_experts
+                    # 1. Collect data from gatherer (syncs if needed)
+                    if hasattr(recorder, '_gatherer'):
+                        collected_data = recorder._gatherer.collect()
+                        # Inject forward_mode into collected data so it's available for dump/accumulation
+                        collected_data['forward_mode'] = forward_mode
+                        recorder._gatherer.reset()
+                        
+                        # 2. Append to accumulator with current pass ID
+                        if hasattr(recorder, '_accumulator'):
+                            recorder._accumulator.append(forward_pass_id, collected_data)
+                        
+                        # 3. Calculate metric for logging from the collected data
+                        # collected_data['expert_count'] is [num_layers, num_experts]
+                        # Note: The key is 'expert_count' (singular) in the recorder implementation
+                        if 'expert_count' in collected_data:
+                            counts = collected_data['expert_count']
+                            if counts is not None:
+                                # Average activated experts per layer
+                                # (counts > 0).float() -> [num_layers, num_experts]
+                                # .sum(dim=1) -> [num_layers]
+                                # .mean() -> scalar
+                                active = (counts > 0).float().sum(dim=1).mean().item()
+                                expert_activation = active
+                        
+                        # Calculate utilization
+                        if expert_activation > 0 and hasattr(recorder, '_expert_location_metadata'):
+                             num_experts = recorder._expert_location_metadata.num_logical_experts
+                             if num_experts > 0:
+                                  expert_utilization = expert_activation / num_experts
 
-    except Exception as e:
-        # Don't fail if expert recording is not available or fails
-        print(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        logger.debug(f"Could not collect expert distribution data: {e}")
+        except Exception as e:
+            # Don't fail if expert recording is not available or fails
+            print(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            logger.debug(f"Could not collect expert distribution data: {e}")
     
     # Record batch statistics if recording is enabled (file-based check for multiprocessing)
     if recording_state.is_recording():

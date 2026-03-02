@@ -29,3 +29,6 @@ class CAPConfig:
     target_input_tokens: Optional[int] = None
     target_output_tokens: Optional[int] = None
     num_samples: Optional[int] = None
+    # Profiling-only mode: skip expert distribution recording, only collect
+    # TTFT / TPOT / throughput metrics from forward-pass timing.
+    profiling_only: bool = False
