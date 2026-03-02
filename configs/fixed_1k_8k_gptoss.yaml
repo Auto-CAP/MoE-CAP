@@ -1,0 +1,12 @@
+dataset_names: ["arena-hard"]
+
+# No accuracy metrics for fixed-length benchmarking
+metrics: []
+
+model_id: unsloth/gpt-oss-120b
+
+# Enable fixed-length mode
+fixed_length_mode: true
+target_input_tokens: 1000   # 1K input tokens
+target_output_tokens: 8000  # 8K output tokens
+num_samples: 256           # Number of benchmark samples

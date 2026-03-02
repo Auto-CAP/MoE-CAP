@@ -7,7 +7,7 @@ When fixed_length_mode is enabled in config, the loader will wrap the base
 dataset and pad/truncate inputs to fixed token lengths for benchmarking.
 """
 from typing import Tuple
-from . import GSM8KLoader, LongBenchV2Loader, NuminaMathLoader, MMLUProLoader, RulerLoader, FixedLengthLoader
+from . import GSM8KLoader, LongBenchV2Loader, NuminaMathLoader, MMLUProLoader, RulerLoader, FixedLengthLoader, ArenaHardLoader
 
 
 _REGISTRY = {
@@ -16,6 +16,7 @@ _REGISTRY = {
     "numinamath": (NuminaMathLoader, 16384),
     "mmlu-pro": (MMLUProLoader, 16384),
     "ruler": (RulerLoader, 16384),
+    "arena-hard": (ArenaHardLoader, 16384),
 }
 
 
