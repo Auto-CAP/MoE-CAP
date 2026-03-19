@@ -5,16 +5,16 @@ import re
 import os
 import GPUtil
 
-GPU_TEMP = 'Temp(C)'
-GPU_Power = 'Power(W)'
-GPU_Mem = 'Mem(G)'
+GPU_TEMP = "Temp(C)"
+GPU_Power = "Power(W)"
+GPU_Mem = "Mem(G)"
 GPU_Name = "GPU"
-GPU_Util = 'Util(%)'
-DSMFU = 'Decoding S-MFU(%)'
-DSMBU = 'Decoding S-MBU(%)'
-PSMFU = 'Prefill S-MFU(%)'
-PSMBU = 'Prefill S-MBU(%)'
-BATCH_SIZE = 'bs'
+GPU_Util = "Util(%)"
+DSMFU = "Decoding S-MFU(%)"
+DSMBU = "Decoding S-MBU(%)"
+PSMFU = "Prefill S-MFU(%)"
+PSMBU = "Prefill S-MBU(%)"
+BATCH_SIZE = "bs"
 PRECISION = "Precision"
 
 gpu_metrics_to_name_map = {
@@ -24,10 +24,10 @@ gpu_metrics_to_name_map = {
     GPU_Mem: GPU_Mem,
     "batch_size": BATCH_SIZE,
     "precision": PRECISION,
-    GPU_Name: GPU_Name
+    GPU_Name: GPU_Name,
 }
-    
-MEM_BW_DICT ={
+
+MEM_BW_DICT = {
     "NVIDIA-A100-PCIe-80GB": 1935e9,
     "NVIDIA-A100-PCIe-40GB": 1555e9,
     "NVIDIA-A100-SXM4-80GB": 2039e9,
@@ -38,11 +38,12 @@ MEM_BW_DICT ={
     "NVIDIA-H100-HBM3-80GB": 3350e9,
     "NVIDIA-H200-141GB": 4800e9,
     "NVIDIA-H200-140GB": 4800e9,
-    "NVIDIA-GH200-96GB": 4096e9
+    "NVIDIA-GH200-96GB": 4096e9,
+    "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1597e9,
 }
 
 PEAK_FLOPS_DICT = {
-    "float32":{
+    "float32": {
         "NVIDIA-A100-PCIe-80GB": 312e12,
         "NVIDIA-A100-PCIe-40GB": 312e12,
         "NVIDIA-A100-SXM4-80GB": 312e12,
@@ -53,9 +54,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 989e12,
         "NVIDIA-H200-141GB": 989e12,
         "NVIDIA-H200-140GB": 989e12,
-        "NVIDIA-GH200-96GB": 989e12
+        "NVIDIA-GH200-96GB": 989e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 500e12,
     },
-    "float16":{
+    "float16": {
         "NVIDIA-A100-PCIe-80GB": 624e12,
         "NVIDIA-A100-PCIe-40GB": 624e12,
         "NVIDIA-A100-SXM4-80GB": 624e12,
@@ -66,9 +68,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 1979e12,
         "NVIDIA-H200-141GB": 1979e12,
         "NVIDIA-H200-140GB": 1979e12,
-        "NVIDIA-GH200-96GB": 1979e12
+        "NVIDIA-GH200-96GB": 1979e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
     },
-    "bfloat16":{
+    "bfloat16": {
         "NVIDIA-A100-PCIe-80GB": 624e12,
         "NVIDIA-A100-PCIe-40GB": 624e12,
         "NVIDIA-A100-SXM4-80GB": 624e12,
@@ -79,9 +82,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 1979e12,
         "NVIDIA-H200-141GB": 1979e12,
         "NVIDIA-H200-140GB": 1979e12,
-        "NVIDIA-GH200-96GB": 1979e12
+        "NVIDIA-GH200-96GB": 1979e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
     },
-    "int8":{
+    "int8": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
         "NVIDIA-A100-PCIe-40GB": 1248e12,
         "NVIDIA-A100-SXM4-80GB": 1248e12,
@@ -92,9 +96,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 3958e12,
         "NVIDIA-H200-141GB": 3958e12,
         "NVIDIA-H200-140GB": 3958e12,
-        "NVIDIA-GH200-96GB": 3958e12
+        "NVIDIA-GH200-96GB": 3958e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
     },
-    "fp8":{
+    "fp8": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
         "NVIDIA-A100-PCIe-40GB": 1248e12,
         "NVIDIA-A100-SXM4-80GB": 1248e12,
@@ -105,7 +110,8 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 3958e12,
         "NVIDIA-H200-141GB": 3958e12,
         "NVIDIA-H200-140GB": 3958e12,
-        "NVIDIA-GH200-96GB": 3958e12
+        "NVIDIA-GH200-96GB": 3958e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
     },
     "fp4": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
@@ -117,7 +123,8 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 3958e12,
         "NVIDIA-H200-141GB": 3958e12,
         "NVIDIA-H200-140GB": 3958e12,
-        "NVIDIA-GH200-96GB": 3958e12
+        "NVIDIA-GH200-96GB": 3958e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
     },
     "int4": {
         "NVIDIA-A100-PCIe-80GB": 2496e12,
@@ -130,8 +137,9 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H100-HBM3-80GB": 3958e12,
         "NVIDIA-H200-141GB": 3958e12,
         "NVIDIA-H200-140GB": 3958e12,
-        "NVIDIA-GH200-96GB": 3958e12
-    }
+        "NVIDIA-GH200-96GB": 3958e12,
+        "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
+    },
 }
 
 
@@ -139,16 +147,21 @@ def my_snapshot_download(repo_id, revision, local_dir, repo_type, max_workers):
     for i in range(10):
         try:
             snapshot_download(
-                repo_id=repo_id, revision=revision, local_dir=local_dir, repo_type=repo_type, max_workers=max_workers
+                repo_id=repo_id,
+                revision=revision,
+                local_dir=local_dir,
+                repo_type=repo_type,
+                max_workers=max_workers,
             )
             return
         except Exception as e:
-            print(f"Failed to download {repo_id} at {revision} with error: {e}. Retrying...")
+            print(
+                f"Failed to download {repo_id} at {revision} with error: {e}. Retrying..."
+            )
             import time
 
             time.sleep(60)
     return
-
 
 
 def get_dataset_url(row):
@@ -169,26 +182,34 @@ def get_dataset_summary_table(file_path):
 
 
 def parse_nvidia_smi():
-    visible_devices = os.getenv('CUDA_VISIBLE_DEVICES', None)
+    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", None)
     if visible_devices is not None:
-        gpu_indices = visible_devices.split(',')
+        gpu_indices = visible_devices.split(",")
     else:
         # Query all GPU indices if CUDA_VISIBLE_DEVICES is not set
-        result = subprocess.run(['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'], capture_output=True, text=True)
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+        )
         if result.returncode != 0:
             print("Failed to query GPU indices.")
             return []
-        gpu_indices = result.stdout.strip().split('\n')
+        gpu_indices = result.stdout.strip().split("\n")
     # print(f"gpu_indices: {gpu_indices}")
     gpu_stats = []
 
-    gpu_info_pattern = re.compile(r'(\d+)C\s+P\d+\s+(\d+)W\s*/\s*\d+W\s*\|\s*(\d+)MiB\s*/\s*\d+MiB\s*\|\s*(\d+)%')
+    gpu_info_pattern = re.compile(
+        r"(\d+)C\s+P\d+\s+(\d+)W\s*/\s*\d+W\s*\|\s*(\d+)MiB\s*/\s*\d+MiB\s*\|\s*(\d+)%"
+    )
     # gpu_name_pattern = re.compile(r'NVIDIA\s+([\w\s]+\d+(?:\s*GB)?)')
-    gpu_name_pattern = re.compile(r'NVIDIA\s+(RTX\s+)?([A-Z0-9]+)')
+    gpu_name_pattern = re.compile(r"NVIDIA\s+(RTX\s+)?([A-Z0-9]+)")
 
     gpu_name = ""
     for index in gpu_indices:
-        result = subprocess.run(['nvidia-smi', '-i', index], capture_output=True, text=True)
+        result = subprocess.run(
+            ["nvidia-smi", "-i", index], capture_output=True, text=True
+        )
         output = result.stdout.strip()
         lines = output.split("\n")
         for line in lines:
@@ -196,33 +217,35 @@ def parse_nvidia_smi():
             name_match = gpu_name_pattern.search(line)
             gpu_info = {}
             if name_match:
-                gpu_name = ''.join(filter(None, name_match.groups())).strip()
+                gpu_name = "".join(filter(None, name_match.groups())).strip()
             if match:
                 temp, power_usage, mem_usage, gpu_util = map(int, match.groups())
-                gpu_info.update({
-                    GPU_TEMP: temp,
-                    GPU_Power: power_usage,
-                    GPU_Mem: round(mem_usage / 1024, 2),
-                    GPU_Util: gpu_util
-                })
+                gpu_info.update(
+                    {
+                        GPU_TEMP: temp,
+                        GPU_Power: power_usage,
+                        GPU_Mem: round(mem_usage / 1024, 2),
+                        GPU_Util: gpu_util,
+                    }
+                )
 
             if len(gpu_info) >= 4:
                 gpu_stats.append(gpu_info)
     # print(f"gpu_stats: {gpu_stats}")
     gpu_name = f"{gpu_name}"
     gpu_stats_total = {
-                        GPU_TEMP: 0,
-                        GPU_Power: 0,
-                        GPU_Mem: 0,
-                        GPU_Util: 0,
-                        GPU_Name: gpu_name
-                    }
+        GPU_TEMP: 0,
+        GPU_Power: 0,
+        GPU_Mem: 0,
+        GPU_Util: 0,
+        GPU_Name: gpu_name,
+    }
     for gpu_stat in gpu_stats:
         gpu_stats_total[GPU_TEMP] += gpu_stat[GPU_TEMP]
         gpu_stats_total[GPU_Power] += gpu_stat[GPU_Power]
         gpu_stats_total[GPU_Mem] += gpu_stat[GPU_Mem]
         gpu_stats_total[GPU_Util] += gpu_stat[GPU_Util]
-    gpu_stats_total[GPU_Mem] = gpu_stats_total[GPU_Mem] # G
+    gpu_stats_total[GPU_Mem] = gpu_stats_total[GPU_Mem]  # G
     gpu_stats_total[GPU_TEMP] /= len(gpu_stats)
     gpu_stats_total[GPU_Power] /= len(gpu_stats)
     gpu_stats_total[GPU_Util] /= len(gpu_stats)
@@ -269,12 +292,12 @@ def get_gpu_details():
     memory_gb = round(gpu.memoryTotal / 1024)
     memory = f"{memory_gb}GB"
 
-    for part in name.split('-'):
+    for part in name.split("-"):
         if part.endswith("GB") and part[:-2].isdigit():
             name = name.replace(f"-{part}", "").replace(part, "")
 
     formatted_name = f"{name}-{memory}"
-    
+
     return formatted_name
 
 

@@ -1,5 +1,6 @@
 import torch
 import argparse
+import math
 import os
 import asyncio
 import aiohttp
@@ -29,6 +30,7 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
 
 class BackendType(Enum):
     """Backend server type for API calls."""
+
     VLLM = "vllm"
     SGLANG = "sglang"
     AUTO = "auto"  # Auto-detect
@@ -67,7 +69,7 @@ def get_auth_headers() -> Dict[str, str]:
 
 def remove_prefix(text: str, prefix: str) -> str:
     """Remove prefix from text if it exists."""
-    return text[len(prefix):] if text.startswith(prefix) else text
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 async def async_request_openai_completions(
@@ -97,7 +99,7 @@ async def async_request_openai_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
-        
+
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -111,10 +113,10 @@ async def async_request_openai_completions(
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         if chunk == "[DONE]":
                             break
-                        
+
                         try:
                             data = json.loads(chunk)
-                            
+
                             # Check if token was generated
                             if data["choices"][0].get("text"):
                                 timestamp = time.perf_counter()
@@ -129,7 +131,7 @@ async def async_request_openai_completions(
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
                                 output_len += 1
-                                
+
                         except json.JSONDecodeError:
                             continue
 
@@ -152,9 +154,16 @@ async def async_request_openai_completions(
 
 
 class OpenAIAPIMoEProfiler:
-    def __init__(self, config: CAPConfig, output_dir: str = None, api_url: str = None, 
-                 backend: str = "auto", ignore_eos: bool = None, server_batch_size: int = None,
-                 profiling_only: bool = False):
+    def __init__(
+        self,
+        config: CAPConfig,
+        output_dir: str = None,
+        api_url: str = None,
+        backend: str = "auto",
+        ignore_eos: bool = None,
+        server_batch_size: int = None,
+        profiling_only: bool = False,
+    ):
         """Initialize profiler from a CAPConfig object.
 
         Args:
@@ -172,25 +181,30 @@ class OpenAIAPIMoEProfiler:
         # store config
         self.config = config
         self.api_url = api_url
-        
+
         # Extract base URL for control endpoints
         # e.g., http://localhost:8000/v1/completions -> http://localhost:8000
         from urllib.parse import urlparse
+
         parsed = urlparse(api_url)
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
-        
+
         # Backend detection and configuration
         self.backend_type = self._detect_or_set_backend(backend)
         print(f"Using backend: {self.backend_type.value}")
         if self.profiling_only:
-            print("Profiling-only mode: expert distribution recording disabled. "
-                  "Make sure the server was started with MOE_CAP_PROFILING_ONLY=1")
-        
+            print(
+                "Profiling-only mode: expert distribution recording disabled. "
+                "Make sure the server was started with MOE_CAP_PROFILING_ONLY=1"
+            )
+
         # Auto-set ignore_eos based on fixed_length_mode if not explicitly set
         if ignore_eos is None:
             self.ignore_eos = config.fixed_length_mode
             if self.ignore_eos:
-                print("Fixed-length mode detected: enabling ignore_eos for accurate output length")
+                print(
+                    "Fixed-length mode detected: enabling ignore_eos for accurate output length"
+                )
         else:
             self.ignore_eos = ignore_eos
 
@@ -226,14 +240,16 @@ class OpenAIAPIMoEProfiler:
         self.d_head = attn_info.get("head_dim")
 
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.hf_model_name, trust_remote_code=True
+        )
 
     def _detect_or_set_backend(self, backend: str) -> BackendType:
         """Detect or set the backend type.
-        
+
         Args:
             backend: "vllm", "sglang", or "auto"
-            
+
         Returns:
             BackendType enum value
         """
@@ -247,11 +263,11 @@ class OpenAIAPIMoEProfiler:
         else:
             print(f"Warning: Unknown backend '{backend}', defaulting to auto-detect")
             return self._auto_detect_backend()
-    
+
     def _auto_detect_backend(self) -> BackendType:
         """Auto-detect backend by probing available endpoints."""
         import requests
-        
+
         # Try SGLang endpoint first (more specific)
         try:
             response = requests.get(f"{self.base_url}/get_model_info", timeout=5)
@@ -263,7 +279,7 @@ class OpenAIAPIMoEProfiler:
                     return BackendType.SGLANG
         except Exception:
             pass
-        
+
         # Try vLLM endpoint
         try:
             response = requests.get(f"{self.base_url}/v1/models", timeout=5)
@@ -272,7 +288,7 @@ class OpenAIAPIMoEProfiler:
                 return BackendType.VLLM
         except Exception:
             pass
-        
+
         # Default to vLLM if detection fails
         print("Warning: Could not auto-detect backend, defaulting to vLLM")
         return BackendType.VLLM
@@ -286,105 +302,134 @@ class OpenAIAPIMoEProfiler:
 
         all_input_raw = loader.get_input()
         return all_input_raw, max_new_tokens
-        
+
     def _prepare_inputs(self, all_input_raw, max_new_tokens):
-        """Prepare inputs for the model"""       
+        """Prepare inputs for the model"""
         system_prompt = "You are an expert problem solver. Provide concise answers."
-        chat_prompts = [[{"role": "system", "content": system_prompt},
-                        {"role": "user", "content": q}] for q in all_input_raw]
+        chat_prompts = [
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": q},
+            ]
+            for q in all_input_raw
+        ]
         chat_prompts = self.tokenizer.apply_chat_template(
-            chat_prompts, 
-            add_generation_prompt=True,
-            tokenize=False
+            chat_prompts, add_generation_prompt=True, tokenize=False
         )
-        
+
         # Calculate prompt lengths
         prompt_lengths = [len(self.tokenizer.encode(p)) for p in chat_prompts]
-        
+
         return chat_prompts, prompt_lengths, max_new_tokens
-    
+
     def _check_batch_recording_status(self):
         """Check if batch recording endpoints are available."""
         import requests
+
         try:
             if self.backend_type == BackendType.SGLANG:
                 # SGLang doesn't have a status endpoint, just return True
                 return {"available": True, "backend": "sglang"}
             else:
-                response = requests.get(f"{self.base_url}/batch_recording_status", timeout=5)
+                response = requests.get(
+                    f"{self.base_url}/batch_recording_status", timeout=5
+                )
                 response.raise_for_status()
                 return response.json()
         except Exception as e:
             print(f"Warning: Batch recording endpoints not available: {e}")
             if self.backend_type == BackendType.VLLM:
-                print("Make sure you're using the custom vllm server (moe_cap.systems.vllm)")
+                print(
+                    "Make sure you're using the custom vllm server (moe_cap.systems.vllm)"
+                )
             return None
-    
+
     def _start_batch_recording(self):
         """Start batch statistics recording on the server."""
         import requests
+
         try:
             if self.backend_type == BackendType.SGLANG:
-                response = requests.post(f"{self.base_url}/start_expert_distribution_record", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/start_expert_distribution_record", timeout=10
+                )
             else:
-                response = requests.post(f"{self.base_url}/start_batch_recording", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/start_batch_recording", timeout=10
+                )
             response.raise_for_status()
-            print(f"Started {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server")
+            print(
+                f"Started {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server"
+            )
             return True
         except Exception as e:
             print(f"Warning: Could not start recording: {e}")
             return False
-    
+
     def _stop_batch_recording(self):
         """Stop batch statistics recording on the server."""
         import requests
+
         try:
             if self.backend_type == BackendType.SGLANG:
-                response = requests.post(f"{self.base_url}/stop_expert_distribution_record", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/stop_expert_distribution_record", timeout=10
+                )
             else:
-                response = requests.post(f"{self.base_url}/stop_batch_recording", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/stop_batch_recording", timeout=10
+                )
             response.raise_for_status()
-            print(f"Stopped {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server")
+            print(
+                f"Stopped {'expert distribution' if self.backend_type == BackendType.SGLANG else 'batch'} recording on server"
+            )
             return True
         except Exception as e:
             print(f"Warning: Could not stop recording: {e}")
             return False
-    
+
     def _dump_batch_recording(self):
         """Dump and retrieve batch statistics from the server."""
         import requests
+
         try:
             if self.backend_type == BackendType.SGLANG:
                 # SGLang dumps to file, need to trigger dump and then read from file
-                response = requests.post(f"{self.base_url}/dump_expert_distribution_record", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/dump_expert_distribution_record", timeout=10
+                )
                 response.raise_for_status()
                 print("Expert distribution record dumped to file")
-                
+
                 # Read the dumped records from the file location
                 server_output_base = os.environ.get(
-                    "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", 
-                    os.path.join(os.getcwd(), "expert_records")
+                    "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR",
+                    os.path.join(os.getcwd(), "expert_records"),
                 )
                 record_file = os.path.join(
-                    server_output_base, 
-                    self.hf_model_name, 
-                    "expert_distribution_record.jsonl"
+                    server_output_base,
+                    self.hf_model_name,
+                    "expert_distribution_record.jsonl",
                 )
-                
+
                 if os.path.exists(record_file):
                     records = []
-                    with open(record_file, 'r', encoding='utf-8') as f:
+                    with open(record_file, "r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if line:
                                 records.append(json.loads(line))
-                    print(f"Retrieved {len(records)} expert distribution records from file")
+                    print(
+                        f"Retrieved {len(records)} expert distribution records from file"
+                    )
                     return records
                 else:
                     print(f"Warning: Expected record file not found at {record_file}")
                     return []
             else:
-                response = requests.post(f"{self.base_url}/dump_batch_recording", timeout=10)
+                response = requests.post(
+                    f"{self.base_url}/dump_batch_recording", timeout=10
+                )
                 response.raise_for_status()
                 data = response.json()
                 records = data.get("records", [])
@@ -393,10 +438,16 @@ class OpenAIAPIMoEProfiler:
         except Exception as e:
             print(f"Warning: Could not dump recording: {e}")
             return []
-    
-    def get_metrics(self, results: List[RequestFuncOutput], prompt_lengths: List[int], batch_size: int = 1, server_records: List[dict] = None):
+
+    def get_metrics(
+        self,
+        results: List[RequestFuncOutput],
+        prompt_lengths: List[int],
+        batch_size: int = 1,
+        server_records: List[dict] = None,
+    ):
         """Calculate metrics from profiling results.
-        
+
         Args:
             results: List of request outputs
             prompt_lengths: List of prompt lengths
@@ -404,10 +455,10 @@ class OpenAIAPIMoEProfiler:
             server_records: Optional list of batch records from server
         """
         successful_results = [r for r in results if r.success]
-        
+
         if not successful_results:
             return {"error": "No successful requests"}
-        
+
         # Use server records if available, otherwise create from results
         if server_records:
             output_data = server_records
@@ -416,35 +467,42 @@ class OpenAIAPIMoEProfiler:
             # Fallback: Convert results to continuous batching format
             # WARNING: This fallback assumes batch_size=1 (no batching) which is inaccurate
             # for continuous batching servers. Server records should be used for accurate metrics.
-            print("WARNING: No server records available. Using fallback with batch_size=1 approximation.")
+            print(
+                "WARNING: No server records available. Using fallback with batch_size=1 approximation."
+            )
             print("This will NOT reflect actual continuous batching behavior!")
             output_data = []
             for i, r in enumerate(successful_results):
                 # Add prefill record (assuming no batching - batch_size=1)
-                output_data.append({
-                    'expert_activation': 0,  # Will be populated with actual expert data later
-                    'latency': r.ttft,
-                    'seq_lens_sum': prompt_lengths[i] if i < len(prompt_lengths) else 0,
-                    'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                    'forward_mode': 'prefill',
-                    'gpu_num': "N/A"
-                })
-                
+                output_data.append(
+                    {
+                        "expert_activation": 0,  # Will be populated with actual expert data later
+                        "latency": r.ttft,
+                        "seq_lens_sum": prompt_lengths[i]
+                        if i < len(prompt_lengths)
+                        else 0,
+                        "batch_size": 1,  # Approximation: client doesn't know actual server batch size
+                        "forward_mode": "prefill",
+                        "gpu_num": "N/A",
+                    }
+                )
+
                 # Add decoding record (assuming no batching - batch_size=1)
                 if r.output_len > 0:
                     # Average time per token for decoding
                     decode_time = r.latency - r.ttft
                     tpot = decode_time / r.output_len if r.output_len > 0 else 0
-                    output_data.append({
-                        'expert_activation': 0,  # Will be populated with actual expert data later
-                        'latency': tpot,
-                        'seq_lens_sum': r.output_len,
-                        'batch_size': 1,  # Approximation: client doesn't know actual server batch size
-                        'forward_mode': 'decoding',
-                        'gpu_num': "N/A"
-                    })
+                    output_data.append(
+                        {
+                            "expert_activation": 0,  # Will be populated with actual expert data later
+                            "latency": tpot,
+                            "seq_lens_sum": r.output_len,
+                            "batch_size": 1,  # Approximation: client doesn't know actual server batch size
+                            "forward_mode": "decoding",
+                            "gpu_num": "N/A",
+                        }
+                    )
 
-        
         # Use continuous batching metrics calculation
         try:
             gpu_raw_type = output_data[0].get("gpu_raw_type", None)
@@ -461,27 +519,28 @@ class OpenAIAPIMoEProfiler:
                 model_name=self.hf_model_name,
                 used_dtype=self.used_dtype,
                 precision=self.precision,
-                output_data=output_data
+                output_data=output_data,
             )
         except Exception as e:
             print(f"Warning: Could not calculate continuous batching metrics: {e}")
             import traceback
+
             traceback.print_exc()
             res_dict = {}
-        
-        res_dict.update({
-            # "avg_ttft": total_ttft / len(successful_results),
-            # "avg_latency": sum(r.latency for r in successful_results) / len(successful_results),
-            # "avg_output_len": avg_output_len,
-            # "avg_context_len": avg_context_len,
-            # "decode_throughput_tokens_per_sec": total_output_tokens / total_decode_time if total_decode_time > 0 else 0,
-            "total_requests": len(results),
-            "successful_requests": len(successful_results),
-            "failed_requests": len(results) - len(successful_results),
-        })
 
+        res_dict.update(
+            {
+                # "avg_ttft": total_ttft / len(successful_results),
+                # "avg_latency": sum(r.latency for r in successful_results) / len(successful_results),
+                # "avg_output_len": avg_output_len,
+                # "avg_context_len": avg_context_len,
+                # "decode_throughput_tokens_per_sec": total_output_tokens / total_decode_time if total_decode_time > 0 else 0,
+                "total_requests": len(results),
+                "successful_requests": len(successful_results),
+                "failed_requests": len(results) - len(successful_results),
+            }
+        )
 
-        
         return res_dict
 
     def get_model_simple_name(self):
@@ -610,7 +669,9 @@ class OpenAIAPIMoEProfiler:
 
             # Load and prepare inputs
             all_input_raw, max_new_tokens = self._load_data_for_task(dataset_name)
-            prompts, prompt_lengths, max_output_len = self._prepare_inputs(all_input_raw, max_new_tokens)
+            prompts, prompt_lengths, max_output_len = self._prepare_inputs(
+                all_input_raw, max_new_tokens
+            )
 
             # Get ground truth targets for evaluation
             try:
@@ -642,86 +703,203 @@ class OpenAIAPIMoEProfiler:
                 print(f"Detected num_gpus from records: {num_gpus}")
 
             # Calculate metrics
-            res_dict = self.get_metrics(results, prompt_lengths, batch_size=self.server_batch_size or 1, server_records=server_records)
+            res_dict = self.get_metrics(
+                results,
+                prompt_lengths,
+                batch_size=self.server_batch_size or 1,
+                server_records=server_records,
+            )
 
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
                 try:
                     # Extract predictions from results
                     predictions = [r.generated_text for r in results if r.success]
-                    
+
                     # Compute accuracy using utility function
                     accuracy_metrics = compute_accuracy_metrics(
                         predictions=predictions,
-                        targets=ground_truth[:len(predictions)],  # Match length in case some failed
+                        targets=ground_truth[
+                            : len(predictions)
+                        ],  # Match length in case some failed
                         dataset_name=dataset_name,
-                        extract_answers=True
+                        extract_answers=True,
                     )
                     res_dict.update(accuracy_metrics)
-                    
+
                     # Print formatted accuracy summary
                     summary = format_accuracy_summary(accuracy_metrics)
                     print(f"Accuracy for {dataset_name}: {summary}")
                 except Exception as e:
                     print(f"Warning: Could not compute accuracy metrics: {e}")
-            
+
             # Auto-detect GPU type and number from hardware_utils
             gpu_raw_type = res_dict.get("gpu_raw_type", None)
-            res_dict['cost'] = calculate_cost(round(total_time, 2), gpu_raw_type, num_gpus)
-            if gpu_raw_type:
-                gpu_name_pattern = re.compile(r'NVIDIA[\s-]+(RTX[\s-]+)?([A-Z0-9]+)')
-                match = gpu_name_pattern.search(gpu_raw_type)  
-                if match:
-                    gpu_type = ''.join(filter(None, match.groups())).strip()
-                else:
-                    gpu_type = "Unknown"
-            else:
-                gpu_type = "Unknown"
-            
+            res_dict["cost"] = calculate_cost(
+                round(total_time, 2), gpu_raw_type, num_gpus
+            )
+            gpu_type = gpu_raw_type if gpu_raw_type else "Unknown"
+
             # Remove gpu_raw_type from metrics if present
             if "gpu_raw_type" in res_dict:
                 del res_dict["gpu_raw_type"]
 
             # Add metadata fields to the output
             res_dict["model_name"] = self.hf_model_name
-            res_dict["method"] = self.backend_type.value  # Use detected/configured backend
+            res_dict["method"] = (
+                self.backend_type.value
+            )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
-            res_dict["e2e_s"] = round(total_time, 2)
-            res_dict["server_batch_size"] = self.server_batch_size  # None indicates all inputs sent at once
+            if self.server_batch_size and self.server_batch_size < len(prompts):
+                num_batches = math.ceil(len(prompts) / self.server_batch_size)
+            else:
+                num_batches = 1  # All requests sent at once
+            res_dict["e2e_s"] = round(total_time / num_batches, 2)
+            res_dict["server_batch_size"] = (
+                self.server_batch_size
+            )  # None indicates all inputs sent at once
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
             res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
             res_dict["profiling_only"] = self.profiling_only
             # Determine model type based on model name (heuristic)
-            res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
-            
-            print(f"Metrics for {dataset_name}: {res_dict}")
+            res_dict["model_type"] = (
+                "instruct"
+                if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"])
+                else "thinking"
+            )
 
-            # Save results
+            # --- Prepare output directory ---
             dest_dir = os.path.join(self.output_dir, self.get_model_simple_name())
             os.makedirs(dest_dir, exist_ok=True)
-            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(dest_dir, f"cap_metrics_{dataset_name}_{timestamp}.json")
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(res_dict, f, indent=4)
-            print(f"Metrics written to {output_path}")
 
-            # Save detailed results
-            detailed_output_path = os.path.join(dest_dir, f"detailed_results_{dataset_name}.jsonl")
-            with open(detailed_output_path, 'w', encoding='utf-8') as f:
-                for i, result in enumerate(results):
-                    record = {
-                        "index": i,
-                        "prompt_length": prompt_lengths[i] if i < len(prompt_lengths) else 0,
-                        "success": result.success,
-                        "output_len": result.output_len,
-                        "ttft": result.ttft,
-                        "latency": result.latency,
-                        "itl": result.itl,
-                        "error": result.error,
-                    }
-                    f.write(json.dumps(record) + '\n')
+            # === 1. Output Data (Conditional: only when accuracy measurement is needed) ===
+            if ground_truth is not None:
+                output_data_path = os.path.join(
+                    dest_dir, f"output_data_{dataset_name}_{timestamp}.jsonl"
+                )
+                with open(output_data_path, "w", encoding="utf-8") as f:
+                    for i, result in enumerate(results):
+                        record = {
+                            "index": i,
+                            "input_tokens": prompt_lengths[i]
+                            if i < len(prompt_lengths)
+                            else 0,
+                            "output_tokens": result.generated_text
+                            if result.success
+                            else "",
+                        }
+                        f.write(json.dumps(record) + "\n")
+                print(f"Output data written to {output_data_path}")
+
+            # === 2. Metrics File (Always required) ===
+            # Compute average expert activation for prefill and decode from server records
+            prefill_activations = []
+            decode_activations = []
+            if server_records:
+                for sr in server_records:
+                    ea = sr.get("expert_activation")
+                    if ea is None or ea < 0:
+                        continue
+                    if sr.get("forward_mode") == "prefill":
+                        prefill_activations.append(ea)
+                    else:
+                        decode_activations.append(ea)
+
+            metrics_dict = {
+                "performance": {
+                    "e2e_s": res_dict.get("e2e_s", round(total_time / num_batches, 2)),
+                    "ttft": res_dict.get("ttft", 0),
+                    "tpot": res_dict.get("tpot", 0),
+                },
+                "expert_activation": {
+                    "avg_expert_activation_prefill": (
+                        sum(prefill_activations) / len(prefill_activations)
+                        if prefill_activations
+                        else 0
+                    ),
+                    "avg_expert_activation_decode": (
+                        sum(decode_activations) / len(decode_activations)
+                        if decode_activations
+                        else 0
+                    ),
+                },
+            }
+
+            # Quality: Accuracy (conditional — only when accuracy measurement is needed)
+            accuracy_keys = ["exact_match", "correct", "total", "no_answer"]
+            accuracy_section = {k: res_dict[k] for k in accuracy_keys if k in res_dict}
+            if accuracy_section:
+                metrics_dict["quality"] = accuracy_section
+
+            metrics_path = os.path.join(
+                dest_dir, f"metrics_{dataset_name}_{timestamp}.json"
+            )
+            with open(metrics_path, "w", encoding="utf-8") as f:
+                json.dump(metrics_dict, f, indent=4)
+            print(f"Metrics written to {metrics_path}")
+
+            # === 3. Metadata (Always required) ===
+            # Detect inference engine name and version separately
+            engine_name = self.backend_type.value
+            engine_ver = "unknown"
+            try:
+                if self.backend_type == BackendType.SGLANG:
+                    import sglang
+
+                    engine_ver = getattr(sglang, "__version__", "unknown")
+                else:
+                    import vllm
+
+                    engine_ver = getattr(vllm, "__version__", "unknown")
+            except ImportError:
+                pass
+
+            metadata_dict = {
+                "hardware": {
+                    "gpu_type": gpu_type,
+                    "num_gpus": num_gpus,
+                },
+                "model_config": {
+                    "model_name": self.hf_model_name,
+                    "precision": self.used_dtype,
+                },
+                "system_environment": {
+                    "inference_engine": engine_name,
+                    "inference_engine_version": engine_ver,
+                    "batch_size": self.server_batch_size,
+                },
+            }
+
+            metadata_path = os.path.join(
+                dest_dir, f"metadata_{dataset_name}_{timestamp}.json"
+            )
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata_dict, f, indent=4)
+            print(f"Metadata written to {metadata_path}")
+
+            # === 4. Detailed Results (per-forward-step from server records) ===
+            detailed_output_path = os.path.join(
+                dest_dir, f"detailed_results_{dataset_name}_{timestamp}.jsonl"
+            )
+            with open(detailed_output_path, "w", encoding="utf-8") as f:
+                if server_records:
+                    for i, sr in enumerate(server_records):
+                        record = {
+                            "index": i,
+                            "forward_mode": sr.get("forward_mode", "unknown"),
+                            "expert_activation": sr.get("expert_activation", 0),
+                            "batch_size": sr.get("batch_size", 0),
+                            "seq_lens_sum": sr.get("seq_lens_sum", 0),
+                        }
+                        if sr.get("forward_mode") == "prefill":
+                            record["ttft"] = sr.get("latency", 0)
+                        else:
+                            record["tpot"] = sr.get("latency", 0)
+                        f.write(json.dumps(record) + "\n")
+                else:
+                    print("Warning: No server records available for detailed results")
             print(f"Detailed results written to {detailed_output_path}")
 
     def run(self):
@@ -750,53 +928,129 @@ Examples:
   # Mix config file and CLI (CLI overrides config):
   python -m moe_cap.runner.openai_api_profile --config-file configs/base.yaml --model_name my/custom-model \
     --api-url http://localhost:8000/v1/completions
-"""
+""",
     )
     # Config file option
-    parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields. CLI args override config file values.")
-    
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        help="Path to a JSON or YAML config file that contains CAPConfig fields. CLI args override config file values.",
+    )
+
     # Required fields (can come from config file, except api-url which is always required)
-    parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
-    parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k nq), required unless specified in config file")
-    parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
-    
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        help="HuggingFace model ID (required unless specified in config file)",
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        help="One or more dataset names (e.g. gsm8k nq), required unless specified in config file",
+    )
+    parser.add_argument(
+        "--api-url",
+        type=str,
+        required=True,
+        help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)",
+    )
+
     # CAPConfig optional fields
-    parser.add_argument("--metrics", nargs='*', default=None, help="Metrics to compute (e.g. em f1). Default: [] (no metrics)")
-    parser.add_argument("--precision", type=str, default=None, choices=["bfloat16", "float16", "float32", "int8", "int4"],
-                       help="Model precision. Default: bfloat16")
-    parser.add_argument("--dataset-subset", type=str, default=None,
-                       help="Dataset subset to use (e.g. 'main' for gsm8k, or a specific LongBench task)")
-    parser.add_argument("--dataset-split", type=str, default=None,
-                       help="Dataset split to use (e.g. test, validation). Default: test")
-    
+    parser.add_argument(
+        "--metrics",
+        nargs="*",
+        default=None,
+        help="Metrics to compute (e.g. em f1). Default: [] (no metrics)",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        choices=["bfloat16", "float16", "float32", "int8", "int4"],
+        help="Model precision. Default: bfloat16",
+    )
+    parser.add_argument(
+        "--dataset-subset",
+        type=str,
+        default=None,
+        help="Dataset subset to use (e.g. 'main' for gsm8k, or a specific LongBench task)",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        type=str,
+        default=None,
+        help="Dataset split to use (e.g. test, validation). Default: test",
+    )
+
     # Fixed-length benchmarking options
-    parser.add_argument("--fixed-length-mode", action="store_true", default=None,
-                       help="Enable fixed-length benchmarking mode (no accuracy eval, pure performance)")
-    parser.add_argument("--target-input-tokens", type=int, default=None,
-                       help="Target input token length for fixed-length benchmarking")
-    parser.add_argument("--target-output-tokens", type=int, default=None,
-                       help="Target output token length for fixed-length benchmarking")
-    parser.add_argument("--num-samples", type=int, default=None,
-                       help="Number of samples for fixed-length benchmarking")
-    
+    parser.add_argument(
+        "--fixed-length-mode",
+        action="store_true",
+        default=None,
+        help="Enable fixed-length benchmarking mode (no accuracy eval, pure performance)",
+    )
+    parser.add_argument(
+        "--target-input-tokens",
+        type=int,
+        default=None,
+        help="Target input token length for fixed-length benchmarking",
+    )
+    parser.add_argument(
+        "--target-output-tokens",
+        type=int,
+        default=None,
+        help="Target output token length for fixed-length benchmarking",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Number of samples for fixed-length benchmarking",
+    )
+
     # Server and output options
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for metrics. Default: ./output")
-    parser.add_argument("--server-batch-size", type=int, default=None, 
-                       help="Number of concurrent requests to send. If not set, all requests are sent at once.")
-    parser.add_argument("--backend", type=str, default="auto", choices=["vllm", "sglang", "auto"],
-                       help="Backend server type. 'auto' will attempt to detect automatically.")
-    
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory for metrics. Default: ./output",
+    )
+    parser.add_argument(
+        "--server-batch-size",
+        type=int,
+        default=None,
+        help="Number of concurrent requests to send. If not set, all requests are sent at once.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=["vllm", "sglang", "auto"],
+        help="Backend server type. 'auto' will attempt to detect automatically.",
+    )
+
     # EOS handling
-    parser.add_argument("--ignore-eos", action="store_true", default=None,
-                       help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
-    parser.add_argument("--no-ignore-eos", action="store_true",
-                       help="Explicitly disable ignore_eos even in fixed_length_mode.")
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        default=None,
+        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.",
+    )
+    parser.add_argument(
+        "--no-ignore-eos",
+        action="store_true",
+        help="Explicitly disable ignore_eos even in fixed_length_mode.",
+    )
     # Profiling-only mode
-    parser.add_argument("--profiling-only", action="store_true", default=None,
-                       help="Profiling-only mode: skip expert distribution recording, only collect "
-                            "TTFT/TPOT/throughput. Server must be started with MOE_CAP_PROFILING_ONLY=1.")
+    parser.add_argument(
+        "--profiling-only",
+        action="store_true",
+        default=None,
+        help="Profiling-only mode: skip expert distribution recording, only collect "
+        "TTFT/TPOT/throughput. Server must be started with MOE_CAP_PROFILING_ONLY=1.",
+    )
     args = parser.parse_args()
-    
+
     # Handle ignore_eos logic
     ignore_eos = None  # Let profiler auto-detect based on config
     if args.ignore_eos:
@@ -808,56 +1062,62 @@ Examples:
     file_cfg = {}
     if args.config_file:
         cf = args.config_file
-        if cf.endswith('.json'):
-            with open(cf, 'r', encoding='utf-8') as f:
+        if cf.endswith(".json"):
+            with open(cf, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
         else:
             # try yaml first (if installed), fall back to json
             try:
                 import yaml
-                with open(cf, 'r', encoding='utf-8') as f:
+
+                with open(cf, "r", encoding="utf-8") as f:
                     file_cfg = yaml.safe_load(f)
             except Exception:
                 # try json fallback
-                with open(cf, 'r', encoding='utf-8') as f:
+                with open(cf, "r", encoding="utf-8") as f:
                     file_cfg = json.load(f)
 
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
-    
+
     # Override with CLI args if provided (None means not specified)
     if args.model_name is not None:
-        merged['model_id'] = args.model_name
+        merged["model_id"] = args.model_name
     if args.datasets is not None:
-        merged['dataset_names'] = args.datasets
+        merged["dataset_names"] = args.datasets
     if args.metrics is not None:
-        merged['metrics'] = args.metrics
+        merged["metrics"] = args.metrics
     if args.precision is not None:
-        merged['precision'] = args.precision
+        merged["precision"] = args.precision
     if args.dataset_subset is not None:
-        merged['dataset_subset'] = args.dataset_subset
+        merged["dataset_subset"] = args.dataset_subset
     if args.dataset_split is not None:
-        merged['dataset_split'] = args.dataset_split
+        merged["dataset_split"] = args.dataset_split
     if args.fixed_length_mode is not None:
-        merged['fixed_length_mode'] = args.fixed_length_mode
+        merged["fixed_length_mode"] = args.fixed_length_mode
     if args.target_input_tokens is not None:
-        merged['target_input_tokens'] = args.target_input_tokens
+        merged["target_input_tokens"] = args.target_input_tokens
     if args.target_output_tokens is not None:
-        merged['target_output_tokens'] = args.target_output_tokens
+        merged["target_output_tokens"] = args.target_output_tokens
     if args.num_samples is not None:
-        merged['num_samples'] = args.num_samples
+        merged["num_samples"] = args.num_samples
     if args.profiling_only is not None:
-        merged['profiling_only'] = args.profiling_only
+        merged["profiling_only"] = args.profiling_only
 
     # Validate required fields
-    if not merged.get('model_id'):
-        parser.error("--model_name is required (or 'model_id' must be specified in the config file)")
-    if not merged.get('dataset_names'):
-        parser.error("--datasets is required (or 'dataset_names' must be specified in the config file)")
+    if not merged.get("model_id"):
+        parser.error(
+            "--model_name is required (or 'model_id' must be specified in the config file)"
+        )
+    if not merged.get("dataset_names"):
+        parser.error(
+            "--datasets is required (or 'dataset_names' must be specified in the config file)"
+        )
 
     # Validate that all datasets have registered loaders
     from moe_cap.data_loader.loader_registry import _REGISTRY
-    unsupported = [ds for ds in merged['dataset_names'] if ds.lower() not in _REGISTRY]
+
+    unsupported = [ds for ds in merged["dataset_names"] if ds.lower() not in _REGISTRY]
     if unsupported:
         available = sorted(_REGISTRY.keys())
         parser.error(
@@ -867,17 +1127,17 @@ Examples:
 
     # Build CAPConfig and pass it to the profiler
     cap_cfg = CAPConfig(
-        dataset_names=merged.get('dataset_names'),
-        metrics=merged.get('metrics', []),
-        model_id=merged.get('model_id'),
-        precision=merged.get('precision', 'bfloat16'),
-        dataset_subset=merged.get('dataset_subset'),
-        dataset_split=merged.get('dataset_split', 'test'),
-        fixed_length_mode=merged.get('fixed_length_mode', False),
-        target_input_tokens=merged.get('target_input_tokens'),
-        target_output_tokens=merged.get('target_output_tokens'),
-        num_samples=merged.get('num_samples'),
-        profiling_only=merged.get('profiling_only', False),
+        dataset_names=merged.get("dataset_names"),
+        metrics=merged.get("metrics", []),
+        model_id=merged.get("model_id"),
+        precision=merged.get("precision", "bfloat16"),
+        dataset_subset=merged.get("dataset_subset"),
+        dataset_split=merged.get("dataset_split", "test"),
+        fixed_length_mode=merged.get("fixed_length_mode", False),
+        target_input_tokens=merged.get("target_input_tokens"),
+        target_output_tokens=merged.get("target_output_tokens"),
+        num_samples=merged.get("num_samples"),
+        profiling_only=merged.get("profiling_only", False),
     )
 
     profiler = OpenAIAPIMoEProfiler(
