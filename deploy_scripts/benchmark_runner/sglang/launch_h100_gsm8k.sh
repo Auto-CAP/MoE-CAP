@@ -21,22 +21,6 @@ CONFIG_FILE="${CONFIG_FILE:-configs/gsm8k_qwen3_235b_a22b.yaml}"
 server_name="bmk-server"
 client_name="bmk-client"
 
-CHUNKED_PREFILL_ARG=""
-TARGET_INPUT=$(python3 -c "
-import yaml
-with open('${CONFIG_FILE}') as f:
-    cfg = yaml.safe_load(f)
-if cfg.get('fixed_length_mode'):
-    print(cfg.get('target_input_tokens', 0))
-else:
-    print(0)
-" 2>/dev/null)
-if [ "$TARGET_INPUT" -gt 0 ] 2>/dev/null; then
-    CHUNKED_PREFILL_SIZE=$((TARGET_INPUT + 50))
-    CHUNKED_PREFILL_ARG="--chunked-prefill-size ${CHUNKED_PREFILL_SIZE}"
-    echo "Fixed-length mode: setting chunked-prefill-size=${CHUNKED_PREFILL_SIZE} (target_input=${TARGET_INPUT} + 50)"
-fi
-
 # Launch server container
 set -x
 docker run --rm -d --network=host --name=$server_name \
@@ -47,7 +31,7 @@ docker run --rm -d --network=host --name=$server_name \
 -e TORCH_CUDA_ARCH_LIST="9.0" -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
 --entrypoint=/bin/bash \
 $IMAGE \
--c "python -m moe_cap.systems.sglang --model-path \${MODEL} --port \${PORT} --expert-distribution-recorder-mode \${EXPERT_MODE} --tp-size \${TP} ${CHUNKED_PREFILL_ARG}"
+-c "python -m moe_cap.systems.sglang --model-path \${MODEL} --port \${PORT} --expert-distribution-recorder-mode \${EXPERT_MODE} --tp-size \${TP}"
 
 set +x
 echo "Waiting for server to start..."
