@@ -1,3 +1,5 @@
+# pyright: reportIncompatibleMethodOverride=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
+
 from sglang.srt.model_executor.model_runner import ModelRunner, logger
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
@@ -34,13 +36,18 @@ from moe_cap.utils.hardware_utils import get_gpu_details
 
 _PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
 if _PROFILING_ONLY:
-    print(f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled", flush=True)
+    print(
+        f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled",
+        flush=True,
+    )
 
 _OutputMode = Literal["file", "object"]
+
 
 @dataclasses.dataclass
 class ExpertDistributionReq2(BaseReq):
     action: ExpertDistributionReqType
+
 
 # Fix the module and qualname so pickle can find it correctly
 ExpertDistributionReq2.__module__ = iostruct.ExpertDistributionReq.__module__
@@ -57,6 +64,7 @@ def _dump_to_file(name, data):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
     torch.save(data, str(path_output))
+
 
 sglang_eplb_expert_distribution._dump_to_file = _dump_to_file
 GLOBAL_GPU_TYPE = get_gpu_details()
@@ -130,7 +138,9 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+            self._accumulator.append(
+                forward_pass_id, gatherer_key, single_pass_data, outputs
+            )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -179,9 +189,9 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert (
-            self._current_layer_idx.value is None
-        ), f"{self._current_layer_idx.value=}"
+        assert self._current_layer_idx.value is None, (
+            f"{self._current_layer_idx.value=}"
+        )
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -210,7 +220,10 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         if output_mode == "file":
             # Use SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR as the base directory
             save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
-            path_output = os.path.join(save_dir, f"{self._server_args.model_path}/expert_distribution_record.jsonl")
+            path_output = os.path.join(
+                save_dir,
+                f"{self._server_args.model_path}/expert_distribution_record.jsonl",
+            )
             out_dirs = os.path.dirname(path_output)
             if not os.path.exists(out_dirs):
                 os.makedirs(out_dirs, exist_ok=True)
@@ -227,10 +240,55 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
 
 # Set expert distribution recorder directory (can be overridden by environment variable)
 if "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR" not in os.environ:
-    os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(os.path.expanduser("~"), "expert_records")
+    os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(
+        os.path.expanduser("~"), "expert_records"
+    )
 
 
 _original_forward = ModelRunner.forward
+
+
+def _to_cpu_list(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.cpu().tolist()
+    return list(value)
+
+
+def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: ServerArgs):
+    req_indices = _to_cpu_list(forward_batch.req_pool_indices) or []
+
+    extend_lens = _to_cpu_list(forward_batch.extend_seq_lens_cpu)
+    if extend_lens is None:
+        extend_lens = _to_cpu_list(forward_batch.extend_seq_lens) or []
+
+    total_lens = _to_cpu_list(forward_batch.seq_lens_cpu)
+    if total_lens is None:
+        total_lens = _to_cpu_list(forward_batch.seq_lens) or []
+
+    chunk_size = getattr(server_args, "chunked_prefill_size", None)
+    chunk_size_int = int(chunk_size) if chunk_size is not None else None
+    chunking_enabled = chunk_size_int is not None and chunk_size_int > 0
+
+    per_req_info = []
+    for req_idx, extend_len, total_len in zip(req_indices, extend_lens, total_lens):
+        is_last_chunk = True
+        if chunking_enabled:
+            assert chunk_size_int is not None
+            is_last_chunk = int(extend_len) < chunk_size_int
+        per_req_info.append(
+            {
+                "req_pool_idx": int(req_idx),
+                "extend_len": int(extend_len),
+                "total_len": int(total_len),
+                "is_last_chunk": is_last_chunk,
+            }
+        )
+
+    return per_req_info
+
+
 def forward_expert_record(
     self,
     forward_batch: ForwardBatch,
@@ -238,95 +296,95 @@ def forward_expert_record(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     reinit_attn_backend: bool = False,
     split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        self.forward_pass_id += 1
-        gpu_num = self.tp_size * self.pp_size
-        gpu_raw_type = GLOBAL_GPU_TYPE
+) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    self.forward_pass_id += 1
+    gpu_num = self.tp_size * self.pp_size
+    gpu_raw_type = GLOBAL_GPU_TYPE
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
+    with get_global_expert_distribution_recorder().with_forward_pass(
+        self.forward_pass_id,
+        forward_batch,
+    ):
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        output = self._forward_raw(
             forward_batch,
-        ):  
-            torch.cuda.synchronize()
-            start_time = time.perf_counter()
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+            skip_attn_backend_init,
+            pp_proxy_tensors,
+            reinit_attn_backend,
+            split_forward_count,
+        )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        latency = end_time - start_time
+
+    logger.info(f"Batch size: {forward_batch.batch_size}")
+    record_output = get_global_expert_distribution_recorder().dump_record(
+        output_mode="object"
+    )
+    sum_seq_len = forward_batch.seq_lens_sum
+    if forward_batch.forward_mode.is_extend():
+        forward_mode = "prefill"
+    elif forward_batch.forward_mode.is_decode():
+        forward_mode = "decode"
+    else:
+        raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode.name}")
+
+    if self.tp_size and self.moe_ep_size == 1:
+        record_output["logical_count"] = record_output["logical_count"] / self.tp_size
+        # extra_dim, num_layer, num_experts = record_output['logical_count'].shape
+
+    elif self.moe_ep_size > 1 and self.moe_ep_size != self.tp_size:
+        record_output["logical_count"] = (
+            record_output["logical_count"] / self.moe_ep_size
+        )
+        # extra_dim, num_layer, num_experts = record_output['logical_count'].shape
+    elif self.moe_ep_size == self.tp_size:
+        record_output["logical_count"] = record_output["logical_count"]
+    else:
+        raise ValueError(
+            f"Invalid tp_size {self.tp_size} and moe_ep_size {self.moe_ep_size} combination."
+        )
+
+    activated_experts = (
+        record_output["logical_count"] > 0
+    ).float()  # Shape: [extra_dim, num_layer, num_experts]
+    # Sum across experts dimension to get number of activated experts per layer per step
+    activated_per_layer_per_step = activated_experts.sum(
+        dim=2
+    )  # Shape: [extra_dim, num_layer]
+    # Average across layers to get one number per step
+    avg_activated_per_step = activated_per_layer_per_step.mean(dim=1)
+
+    if self.tp_rank == 0:
+        # logger.info(avg_activated_per_step)
+        non_zero_values = avg_activated_per_step[avg_activated_per_step != 0]
+        non_zero_value = non_zero_values.item() if non_zero_values.numel() > 0 else 0
+
+        record_dict = {
+            "forward_pass_id": self.forward_pass_id,
+            "batch_size": forward_batch.batch_size,
+            "latency": latency,
+            "seq_lens_sum": sum_seq_len,
+            "forward_mode": forward_mode,
+            "expert_activation": non_zero_value,
+            "gpu_num": gpu_num,
+            "gpu_raw_type": gpu_raw_type,
+        }
+        if forward_mode == "prefill":
+            record_dict["per_req_info"] = _build_prefill_per_req_info(
+                forward_batch, self.server_args
             )
-            
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            latency = end_time - start_time
+        get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
+        logger.info(
+            f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}"
+        )
+    if self.eplb_manager is not None:
+        self.eplb_manager.on_forward_pass_end()
 
-        logger.info(f"Batch size: {forward_batch.batch_size}")
-        record_output = get_global_expert_distribution_recorder().dump_record(output_mode="object")
-        sum_seq_len = forward_batch.seq_lens_sum
-        if forward_batch.forward_mode.is_extend():
-            forward_mode = "prefill"
-        elif forward_batch.forward_mode.is_decode():
-            forward_mode = "decode"
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_batch.forward_mode.name}"
-            )
+    return output
 
-        if self.tp_size and self.moe_ep_size == 1:
-            record_output['logical_count'] = record_output['logical_count'] / self.tp_size
-            # extra_dim, num_layer, num_experts = record_output['logical_count'].shape
-
-        elif self.moe_ep_size > 1 and self.moe_ep_size != self.tp_size:
-            record_output['logical_count'] = record_output['logical_count'] / self.moe_ep_size
-            # extra_dim, num_layer, num_experts = record_output['logical_count'].shape
-        elif self.moe_ep_size == self.tp_size:
-            record_output['logical_count'] = record_output['logical_count']
-        else:
-            raise ValueError(
-                f"Invalid tp_size {self.tp_size} and moe_ep_size {self.moe_ep_size} combination."
-            )
-
-        activated_experts = (record_output['logical_count'] > 0).float()  # Shape: [extra_dim, num_layer, num_experts]
-        # Sum across experts dimension to get number of activated experts per layer per step
-        activated_per_layer_per_step = activated_experts.sum(dim=2)  # Shape: [extra_dim, num_layer]
-        # Average across layers to get one number per step
-        avg_activated_per_step = activated_per_layer_per_step.mean(dim=1)
-
-        if self.tp_rank == 0:
-            # logger.info(avg_activated_per_step)
-            non_zero_values = avg_activated_per_step[avg_activated_per_step != 0]
-            non_zero_value = non_zero_values.item() if non_zero_values.numel() > 0 else 0
-            
-            # Adjust prefill latency for chunked prefill:
-            # When --max-running-requests is set on the server, the actual prefill forward
-            # may only process a subset of requests due to chunked prefill. Scale latency
-            # to reflect the true TTFT as if all max_running_requests were prefilled together.
-            adjusted_latency = latency
-            max_running = getattr(self.server_args, 'max_running_requests', None)
-            if forward_mode == "prefill" and max_running is not None:
-                prefill_bs = forward_batch.batch_size
-                if prefill_bs > 0 and prefill_bs < max_running:
-                    adjusted_latency = (max_running / prefill_bs) * latency
-                    logger.info(f"TTFT adjusted: {latency:.4f}s -> {adjusted_latency:.4f}s "
-                               f"(max_running_requests={max_running}, prefill_bs={prefill_bs})")
-            
-            record_dict = {
-                "forward_pass_id": self.forward_pass_id,
-                "batch_size": forward_batch.batch_size,
-                "latency": adjusted_latency,
-                "seq_lens_sum": sum_seq_len,
-                "forward_mode": forward_mode,
-                "expert_activation": non_zero_value,
-                "gpu_num": gpu_num,
-                "gpu_raw_type": gpu_raw_type
-            }
-            get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
-            logger.info(f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}")
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
-
-        return output
 
 # ---------------------------------------------------------------------------
 # Profiling-only forward: skip expert distribution hooks, only measure timing
@@ -338,74 +396,73 @@ def forward_profiling_only(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     reinit_attn_backend: bool = False,
     split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        self.forward_pass_id += 1
-        gpu_num = self.tp_size * self.pp_size
-        gpu_raw_type = GLOBAL_GPU_TYPE
+) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    self.forward_pass_id += 1
+    gpu_num = self.tp_size * self.pp_size
+    gpu_raw_type = GLOBAL_GPU_TYPE
 
-        recorder = get_global_expert_distribution_recorder()
-        # Disable expert hooks during the forward pass so they become no-ops
-        with recorder.disable_this_region():
-            torch.cuda.synchronize()
-            start_time = time.perf_counter()
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+    recorder = get_global_expert_distribution_recorder()
+    # Disable expert hooks during the forward pass so they become no-ops
+    with recorder.disable_this_region():
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        output = self._forward_raw(
+            forward_batch,
+            skip_attn_backend_init,
+            pp_proxy_tensors,
+            reinit_attn_backend,
+            split_forward_count,
+        )
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        latency = end_time - start_time
+
+    sum_seq_len = forward_batch.seq_lens_sum
+    if forward_batch.forward_mode.is_extend():
+        forward_mode = "prefill"
+    elif forward_batch.forward_mode.is_decode():
+        forward_mode = "decode"
+    else:
+        raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode.name}")
+
+    if self.tp_rank == 0:
+        record_dict = {
+            "forward_pass_id": self.forward_pass_id,
+            "batch_size": forward_batch.batch_size,
+            "latency": latency,
+            "seq_lens_sum": sum_seq_len,
+            "forward_mode": forward_mode,
+            "expert_activation": 0,
+            "gpu_num": gpu_num,
+            "gpu_raw_type": gpu_raw_type,
+        }
+        if forward_mode == "prefill":
+            record_dict["per_req_info"] = _build_prefill_per_req_info(
+                forward_batch, self.server_args
             )
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            latency = end_time - start_time
+        recorder.expert_record_list.append(record_dict)
+        logger.info(
+            f"[profiling-only] Forward pass {self.forward_pass_id} latency {latency:.4f}s"
+        )
 
-        sum_seq_len = forward_batch.seq_lens_sum
-        if forward_batch.forward_mode.is_extend():
-            forward_mode = "prefill"
-        elif forward_batch.forward_mode.is_decode():
-            forward_mode = "decode"
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_batch.forward_mode.name}"
-            )
+    if self.eplb_manager is not None:
+        self.eplb_manager.on_forward_pass_end()
 
-        if self.tp_rank == 0:
-            # Adjust prefill latency for chunked prefill
-            adjusted_latency = latency
-            max_running = getattr(self.server_args, 'max_running_requests', None)
-            if forward_mode == "prefill" and max_running is not None:
-                prefill_bs = forward_batch.batch_size
-                if prefill_bs > 0 and prefill_bs < max_running:
-                    adjusted_latency = (max_running / prefill_bs) * latency
-                    logger.info(f"TTFT adjusted: {latency:.4f}s -> {adjusted_latency:.4f}s "
-                               f"(max_running_requests={max_running}, prefill_bs={prefill_bs})")
-
-            record_dict = {
-                "forward_pass_id": self.forward_pass_id,
-                "batch_size": forward_batch.batch_size,
-                "latency": adjusted_latency,
-                "seq_lens_sum": sum_seq_len,
-                "forward_mode": forward_mode,
-                "expert_activation": 0,
-                "gpu_num": gpu_num,
-                "gpu_raw_type": gpu_raw_type
-            }
-            recorder.expert_record_list.append(record_dict)
-            logger.info(f"[profiling-only] Forward pass {self.forward_pass_id} latency {latency:.4f}s")
-
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
-
-        return output
+    return output
 
 
 if _PROFILING_ONLY:
     ModelRunner.forward = forward_profiling_only
-    print(f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)", flush=True)
+    print(
+        f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)",
+        flush=True,
+    )
 else:
     ModelRunner.forward = forward_expert_record
 
-sglang_eplb_expert_distribution._ExpertDistributionRecorderReal = _ExpertDistributionRecorderReal2
+sglang_eplb_expert_distribution._ExpertDistributionRecorderReal = (
+    _ExpertDistributionRecorderReal2
+)
 
 
 # --- Monkey-patch _SelectExpertsSinglePassGatherer to support on_expert_hist ---
@@ -417,26 +474,32 @@ def _on_expert_hist(self, layer_idx: int, expt_hist: torch.Tensor):
     hist = expt_hist[:num_experts].to(device=self._data.device, dtype=self._data.dtype)
     self._data[layer_idx, :] += hist
 
+
 _SelectExpertsSinglePassGatherer.on_expert_hist = _on_expert_hist
 
 
 # --- Monkey-patch TopK.forward_cuda to call expert distribution recorder for TRITON_KERNEL path ---
 _original_topk_forward_cuda = TopK.forward_cuda
 
-def _patched_topk_forward_cuda(self, hidden_states, router_logits, **kwargs) -> TopKOutput:
+
+def _patched_topk_forward_cuda(
+    self, hidden_states, router_logits, **kwargs
+) -> TopKOutput:
     result = _original_topk_forward_cuda(self, hidden_states, router_logits, **kwargs)
     # If the result is a TritonKernelTopKOutput, the original code skips on_select_experts.
     # We use the expt_hist from routing_data to record expert distribution.
-    if hasattr(result, 'routing_data') and hasattr(result.routing_data, 'expt_hist'):
+    if hasattr(result, "routing_data") and hasattr(result.routing_data, "expt_hist"):
         recorder = get_global_expert_distribution_recorder()
-        if hasattr(recorder, 'on_expert_hist'):
+        if hasattr(recorder, "on_expert_hist"):
             recorder.on_expert_hist(expt_hist=result.routing_data.expt_hist)
     return result
+
 
 TopK.forward_cuda = _patched_topk_forward_cuda
 
 if __name__ == "__main__":
     from sglang.srt.entrypoints.http_server import launch_server
+
     server_args = prepare_server_args(sys.argv[1:])
 
     try:
