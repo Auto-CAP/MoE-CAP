@@ -36,10 +36,7 @@ from moe_cap.utils.hardware_utils import get_gpu_details
 
 _PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
 if _PROFILING_ONLY:
-    print(
-        f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled",
-        flush=True,
-    )
+    logger.debug("Profiling-only mode: expert distribution recording disabled")
 
 _OutputMode = Literal["file", "object"]
 
@@ -60,7 +57,7 @@ iostruct.ExpertDistributionReq = ExpertDistributionReq2
 def _dump_to_file(name, data):
     save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
     path_output = f"{save_dir}/{name}"
-    logger.info(f"Write expert distribution to {path_output}")
+    logger.debug(f"Write expert distribution to {path_output}")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
     torch.save(data, str(path_output))
@@ -95,7 +92,7 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         }
 
         if server_args.enable_expert_distribution_metrics:
-            logger.info(
+            logger.debug(
                 "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
             )
             self.start_record()
@@ -188,7 +185,7 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
 
     def _reset(self):
         """Reset the expert distribution recorder."""
-        logger.info("Resetting ExpertDistributionRecorder...")
+        logger.debug("Resetting ExpertDistributionRecorder...")
         assert self._current_layer_idx.value is None, (
             f"{self._current_layer_idx.value=}"
         )
@@ -227,7 +224,7 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
             out_dirs = os.path.dirname(path_output)
             if not os.path.exists(out_dirs):
                 os.makedirs(out_dirs, exist_ok=True)
-            logger.info(f"Write expert distribution jsonl to {path_output}")
+            logger.debug(f"Write expert distribution jsonl to {path_output}")
             with open(path_output, "w", encoding="utf-8") as f:
                 for record in self.expert_record_list:
                     f.write(json.dumps(record) + "\n")
@@ -319,7 +316,7 @@ def forward_expert_record(
         end_time = time.perf_counter()
         latency = end_time - start_time
 
-    logger.info(f"Batch size: {forward_batch.batch_size}")
+    logger.debug(f"Batch size: {forward_batch.batch_size}")
     record_output = get_global_expert_distribution_recorder().dump_record(
         output_mode="object"
     )
@@ -377,7 +374,7 @@ def forward_expert_record(
                 forward_batch, self.server_args
             )
         get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
-        logger.info(
+        logger.debug(
             f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}"
         )
     if self.eplb_manager is not None:
@@ -441,7 +438,7 @@ def forward_profiling_only(
                 forward_batch, self.server_args
             )
         recorder.expert_record_list.append(record_dict)
-        logger.info(
+        logger.debug(
             f"[profiling-only] Forward pass {self.forward_pass_id} latency {latency:.4f}s"
         )
 
@@ -453,10 +450,10 @@ def forward_profiling_only(
 
 if _PROFILING_ONLY:
     ModelRunner.forward = forward_profiling_only
-    print(
-        f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)",
-        flush=True,
-    )
+    # print(
+    #     f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)",
+    #     flush=True,
+    # )
 else:
     ModelRunner.forward = forward_expert_record
 

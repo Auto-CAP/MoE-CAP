@@ -65,15 +65,11 @@ _PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
 # In profiling-only mode, automatically skip expert patching as well
 if _PROFILING_ONLY:
     _SKIP_EXPERT_PATCHING = True
-    print(
-        f"[PID {os.getpid()}] Profiling-only mode: expert distribution recording disabled",
-        flush=True,
-    )
+    logger.debug(f"Profiling-only mode: expert distribution recording disabled")
 
 if _SKIP_EXPERT_PATCHING:
-    print(
-        f"[PID {os.getpid()}] Skipping expert distribution monkey patching (MOE_CAP_SKIP_EXPERT_PATCHING=1)",
-        flush=True,
+    logger.debug(
+        f"Skipping expert distribution monkey patching (MOE_CAP_SKIP_EXPERT_PATCHING=1)"
     )
 else:
     try:
@@ -92,22 +88,10 @@ else:
         apply_vllm_monkey_patching()
         # print(f"[PID {os.getpid()}] Expert distribution monkey patching applied successfully!", flush=True)
     except ImportError as e:
-        print(
-            f"[PID {os.getpid()}] Warning: Could not import expert distribution patching: {e}",
-            flush=True,
-        )
-        print(
-            f"[PID {os.getpid()}] Expert distribution recording will not be available.",
-            flush=True,
-        )
+        logger.debug(f"Warning: Could not import expert distribution patching: {e}")
+        logger.debug("Expert distribution recording will not be available.")
     except Exception as e:
-        print(
-            f"[PID {os.getpid()}] Warning: Failed to apply expert distribution patching: {e}",
-            flush=True,
-        )
-        import traceback
-
-        traceback.print_exc()
+        logger.debug(f"Warning: Failed to apply expert distribution patching: {e}")
 
 # ============================================================================
 # Global recording state - using file-based flags for multiprocessing safety
@@ -704,13 +688,7 @@ def execute_model_custom(
 
         except Exception as e:
             # Don't fail if expert recording is not available or fails
-            print(
-                f"[ExpertDist-Error] Failed to calculate/record metrics: {e}",
-                flush=True,
-            )
-            import traceback
-
-            traceback.print_exc()
+            logger.debug(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}")
             logger.debug(f"Could not collect expert distribution data: {e}")
 
     # Record batch statistics if recording is enabled (file-based check for multiprocessing)

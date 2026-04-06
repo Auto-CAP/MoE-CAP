@@ -114,6 +114,49 @@ python -m moe_cap.runner.sglang_profile \
 ## Benchmark Pipeline
 ![Benchmark Pipeline](assets/cap_design.png)
 
+## Logging & Environment Variables
+
+### Logging Behavior
+
+By default, MoE-CAP's expert distribution recording runs **silently** — no per-forward-pass logs are printed to the console. Only critical errors (e.g., recorder initialization failures) are shown.
+
+To enable verbose debug logging for troubleshooting:
+
+| Backend | Enable Debug Logs |
+|---------|-------------------|
+| SGLang  | `SGLANG_LOG_LEVEL=DEBUG python -m moe_cap.systems.sglang ...` |
+| vLLM    | `VLLM_LOGGING_LEVEL=DEBUG python -m moe_cap.systems.vllm ...` |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOE_CAP_PROFILING_ONLY` | `0` | Set to `1` to disable expert distribution recording entirely. Only collects TTFT/TPOT/throughput. Must be set on both server and client. See [Profiling-Only Guide](PROFILING_ONLY_GUIDE.md). |
+| `MOE_CAP_SKIP_EXPERT_PATCHING` | `0` | Set to `1` to skip expert distribution monkey patching on the vLLM server. Useful for models with incompatible MoE implementations (e.g., Mixtral). Automatically set when `MOE_CAP_PROFILING_ONLY=1`. |
+| `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` | `~/expert_records` | Directory where SGLang writes expert distribution JSONL records. |
+
+### Example: Quiet Run (default)
+
+```bash
+# Server — no expert logs printed
+python -m moe_cap.systems.sglang \
+    --model-path Qwen/Qwen3-235B-A22B \
+    --port 30000 \
+    --expert-distribution-recorder-mode stat \
+    --tp-size 8
+```
+
+### Example: Debug Logging
+
+```bash
+# Server — verbose expert recording logs for debugging
+SGLANG_LOG_LEVEL=DEBUG python -m moe_cap.systems.sglang \
+    --model-path Qwen/Qwen3-235B-A22B \
+    --port 30000 \
+    --expert-distribution-recorder-mode stat \
+    --tp-size 8
+```
+
 ## Contributing to MoE-CAP
 
 Thank you for your interest in contributing to the MoE-CAP project! We welcome contributions from everyone. Below you'll find guidance on how to set up your development environment, understand our architecture, and contribute effectively. If you have any questions or wish to discuss your contributions, please reach out to Yinsicheng Jiang, Yao Fu or Yeqi Huang via email at [ysc.jiang@ed.ac.uk](mailto:ysc.jiang@ed.ac.uk), [Y.Fu@ed.ac.uk](mailto:y.fu@ed.ac.uk) or [yeqi.huang@ed.ac.uk](mailto:yeqi.huang@ed.ac.uk).

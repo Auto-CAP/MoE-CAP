@@ -25,6 +25,9 @@ Usage:
 
 import sys
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -34,110 +37,122 @@ sys.path.insert(0, os.path.dirname(__file__))
 # Helper Functions for Common Patching Logic
 # ============================================================================
 
+
 def _create_select_experts_patcher(original_func, debug_prefix=""):
     """Create a patched select_experts function with expert distribution recording.
-    
+
     This helper function creates the patching logic that's shared between
     FusedMoE.select_experts and SharedFusedMoE.select_experts, and between
     main process and worker process patching.
     """
+
     def patched_select_experts(*args, **kwargs):
         # Call original function
         result = original_func(*args, **kwargs)
-        
+
         # Report expert selection for distribution recording
         try:
-            from expert_distribution_recorder import get_global_expert_distribution_recorder
+            from expert_distribution_recorder import (
+                get_global_expert_distribution_recorder,
+            )
+
             recorder = get_global_expert_distribution_recorder()
-            
+
             if recorder is not None:
                 # Extract topk_ids from result
                 topk_weights, topk_ids, _ = result
-                
+
                 # Pass layer_idx as fallback, but on_select_experts will prefer _current_layer_idx
                 recorder.on_select_experts(layer_idx=None, topk_ids=topk_ids)
         except Exception as e:
             # Silently fail - don't crash if recording fails
             pass
-        
+
         return result
-    
+
     return patched_select_experts
 
 
 def _patch_execute_model(runner_class):
     """Patch execute_model to collect expert distribution data after execution.
-    
+
     This is required for Cuda Graph compatibility, as the Python-side forward method
     is not executed during graph replay. We must collect data in execute_model instead.
     """
-    if hasattr(runner_class, '_expert_dist_patched_execute_model'):
+    if hasattr(runner_class, "_expert_dist_patched_execute_model"):
         return
 
     original_execute_model = runner_class.execute_model
 
     def patched_execute_model(self, *args, **kwargs):
         import torch
+
         # Call original execute_model (this runs the graph replay if enabled)
         result = original_execute_model(self, *args, **kwargs)
 
         # Post-execution collection for per_pass/per_token modes
         try:
-            if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder:
+            if (
+                hasattr(self, "expert_distribution_recorder")
+                and self.expert_distribution_recorder
+            ):
                 recorder = self.expert_distribution_recorder
                 # Only collect if recording is active and mode requires per-pass collection
                 # (stat mode uses atomic accumulation so it doesn't need per-pass collection)
-                if getattr(recorder, '_recording', False):
-                    mode = getattr(recorder, '_recording_mode', None)
-                    
+                if getattr(recorder, "_recording", False):
+                    mode = getattr(recorder, "_recording_mode", None)
+
                     if mode in ["per_pass", "per_token"]:
                         # Collect data from gatherer
                         # Note: collect() calls clone() which is a GPU operation.
                         # append() calls item() which triggers synchronization.
                         # This is safe here (after graph replay) but adds a small overhead.
                         collected_data = recorder._gatherer.collect()
-                        
+
                         recorder._gatherer.reset()
-                        
+
                         # Append to accumulator
-                        if not hasattr(recorder, '_forward_pass_counter'):
+                        if not hasattr(recorder, "_forward_pass_counter"):
                             recorder._forward_pass_counter = 0
-                        recorder._accumulator.append(recorder._forward_pass_counter, collected_data)
+                        recorder._accumulator.append(
+                            recorder._forward_pass_counter, collected_data
+                        )
                         recorder._forward_pass_counter += 1
         except Exception as e:
             # Don't crash if collection fails
             pass
-            
+
         return result
 
     runner_class.execute_model = patched_execute_model
     runner_class._expert_dist_patched_execute_model = True
     # print(f"[ExpertDist-Worker] Patched {runner_class.__name__}.execute_model")
 
+
 def _patch_qwen2_attention(attention_class):
     """Patch Qwen2MoeAttention to support QK-Norm for Qwen3."""
-    if hasattr(attention_class, '_expert_dist_patched_qknorm'):
+    if hasattr(attention_class, "_expert_dist_patched_qknorm"):
         return
 
     # We need to reimplement forward to apply norms if they exist
     def patched_forward(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         # Apply QK-Norm if present (injected by _patch_decoder_layer_init for Qwen3)
-        if hasattr(self, 'q_norm'):
+        if hasattr(self, "q_norm"):
             # Reshape to (batch, seq, num_heads, head_dim) to apply norm on head_dim
             q_shape = q.shape
             q = q.view(*q_shape[:-1], self.num_heads, self.head_dim)
             q = self.q_norm(q)
             q = q.view(*q_shape)
-            
-        if hasattr(self, 'k_norm'):
+
+        if hasattr(self, "k_norm"):
             k_shape = k.shape
             k = k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
             k = self.k_norm(k)
             k = k.view(*k_shape)
-            
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -148,20 +163,24 @@ def _patch_qwen2_attention(attention_class):
     # print(f"[ExpertDist] Patched {attention_class.__name__}.forward for QK-Norm support")
 
 
-def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_worker=False):
+def _patch_decoder_layer_init(
+    layer_class, extract_layer_idx_fn, layer_name, is_worker=False
+):
     """Patch decoder layer __init__ to extract and store layer_idx.
-    
+
     Args:
         layer_class: The decoder layer class to patch
         extract_layer_idx_fn: Function to extract layer_idx from prefix
         layer_name: Name of the layer class for logging
         is_worker: Whether this is being patched in a worker process
     """
-    if hasattr(layer_class, '_expert_dist_patched_init' + ('_worker' if is_worker else '')):
+    if hasattr(
+        layer_class, "_expert_dist_patched_init" + ("_worker" if is_worker else "")
+    ):
         return  # Already patched
-    
+
     original_init = layer_class.__init__
-    
+
     def patched_init(self, *args, **kwargs):
         # Extract layer_idx from prefix
         layer_idx = None
@@ -169,12 +188,12 @@ def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_
             layer_idx = extract_layer_idx_fn(args[3])
         elif len(args) >= 2:  # DeepSeek: vllm_config, prefix
             layer_idx = extract_layer_idx_fn(args[1])
-        elif 'prefix' in kwargs:
-            layer_idx = extract_layer_idx_fn(kwargs['prefix'])
-        
+        elif "prefix" in kwargs:
+            layer_idx = extract_layer_idx_fn(kwargs["prefix"])
+
         # Call original __init__
         original_init(self, *args, **kwargs)
-        
+
         # Store layer_idx as instance attribute
         if layer_idx is not None:
             self.layer_idx = layer_idx
@@ -185,48 +204,57 @@ def _patch_decoder_layer_init(layer_class, extract_layer_idx_fn, layer_name, is_
         try:
             # Check if this is a Qwen3 model (based on config)
             # args[0] is usually config
-            config = args[0] if len(args) > 0 else kwargs.get('config')
-            if config and getattr(config, 'model_type', '') == 'qwen3_moe':
+            config = args[0] if len(args) > 0 else kwargs.get("config")
+            if config and getattr(config, "model_type", "") == "qwen3_moe":
                 # Inject RMSNorm layers for Qwen3
-                if hasattr(self, 'self_attn'):
+                if hasattr(self, "self_attn"):
                     from vllm.model_executor.layers.layernorm import RMSNorm
-                    
+
                     # Qwen3 uses RMSNorm on head_dim
                     head_dim = self.self_attn.head_dim
-                    eps = getattr(config, 'rms_norm_eps', 1e-6)
-                    
-                    if not hasattr(self.self_attn, 'q_norm'):
+                    eps = getattr(config, "rms_norm_eps", 1e-6)
+
+                    if not hasattr(self.self_attn, "q_norm"):
                         # print(f"[ExpertDist] Injecting q_norm (RMSNorm) for Qwen3 in layer {layer_idx}")
                         self.self_attn.q_norm = RMSNorm(head_dim, eps=eps)
-                        
-                    if not hasattr(self.self_attn, 'k_norm'):
+
+                    if not hasattr(self.self_attn, "k_norm"):
                         # print(f"[ExpertDist] Injecting k_norm (RMSNorm) for Qwen3 in layer {layer_idx}")
                         self.self_attn.k_norm = RMSNorm(head_dim, eps=eps)
-                
+
                 # Check for qkv_proj bias compatibility
                 # Qwen2MoeAttention creates qkv_proj with bias=True by default
                 # But Qwen3 might not use bias. If so, we need to remove it to avoid "initialized from checkpoint" error.
-                if hasattr(self, 'self_attn') and hasattr(self.self_attn, 'qkv_proj'):
+                if hasattr(self, "self_attn") and hasattr(self.self_attn, "qkv_proj"):
                     # Check if config says no bias (or if we should assume no bias for Qwen3)
                     # Note: Qwen2MoeAttention doesn't seem to look at config.attention_bias
-                    
+
                     # For Qwen3, default to False if not specified
-                    if getattr(config, 'model_type', '') == 'qwen3_moe':
-                        should_have_bias = getattr(config, 'attention_bias', False)
+                    if getattr(config, "model_type", "") == "qwen3_moe":
+                        should_have_bias = getattr(config, "attention_bias", False)
                     else:
-                        should_have_bias = getattr(config, 'attention_bias', True)
-                    
+                        should_have_bias = getattr(config, "attention_bias", True)
+
                     # If config says no bias, but layer has bias, remove it
-                    if not should_have_bias and getattr(self.self_attn.qkv_proj, 'bias', None) is not None:
+                    if (
+                        not should_have_bias
+                        and getattr(self.self_attn.qkv_proj, "bias", None) is not None
+                    ):
                         # print(f"[ExpertDist] Removing qkv_proj.bias for Qwen3 compatibility in layer {layer_idx}")
                         self.self_attn.qkv_proj.bias = None
-                        
+
         except Exception as e:
-            print(f"[ExpertDist] Warning: Failed to apply Qwen3 QK-Norm/Bias fix: {e}")
-    
+            logger.debug(
+                f"[ExpertDist] Warning: Failed to apply Qwen3 QK-Norm/Bias fix: {e}"
+            )
+
     layer_class.__init__ = patched_init
-    setattr(layer_class, '_expert_dist_patched_init' + ('_worker' if is_worker else ''), True)
-    
+    setattr(
+        layer_class,
+        "_expert_dist_patched_init" + ("_worker" if is_worker else ""),
+        True,
+    )
+
     if is_worker:
         # import os
         # print(f"[ExpertDist-Worker PID {os.getpid()}] Patched {layer_name}.__init__ BEFORE model load", flush=True)
@@ -248,10 +276,11 @@ def apply_vllm_monkey_patching():
         # ============================================================================
         try:
             from vllm.model_executor.models import ModelRegistry
+
             try:
                 # Try to import Qwen2MoE implementation
                 from vllm.model_executor.models.qwen2_moe import Qwen2MoeForCausalLM
-                
+
                 # Register Qwen3 to use Qwen2 implementation
                 # This allows loading "Qwen/Qwen3-30B-A3B" using the native vLLM Qwen2MoE class
                 # instead of falling back to HuggingFace implementation (which vLLM doesn't support well for MoE)
@@ -259,17 +288,21 @@ def apply_vllm_monkey_patching():
                 ModelRegistry.register_model("qwen3_moe", Qwen2MoeForCausalLM)
                 # print("Registered Qwen3MoeForCausalLM to use Qwen2MoeForCausalLM implementation")
             except ImportError:
-                print("[ExpertDist] Warning: Could not import Qwen2MoeForCausalLM. Qwen3 support may not work.")
+                logger.debug(
+                    "[ExpertDist] Warning: Could not import Qwen2MoeForCausalLM. Qwen3 support may not work."
+                )
             except Exception as e:
-                print(f"[ExpertDist] Warning: Failed to register Qwen3 model: {e}")
+                logger.debug(
+                    f"[ExpertDist] Warning: Failed to register Qwen3 model: {e}"
+                )
         except ImportError:
             pass
 
-
         # Import Worker early and store original __init__
         from vllm.v1.worker.gpu_worker import Worker
+
         # Store the original __init__ before we patch it (only once)
-        if not hasattr(Worker, '_original_init'):
+        if not hasattr(Worker, "_original_init"):
             Worker._original_init = Worker.__init__
         _original_worker_init = Worker._original_init
 
@@ -278,12 +311,16 @@ def apply_vllm_monkey_patching():
 
         # Replace the module in sys.modules BEFORE any imports happen
         import expert_distribution_recorder as custom_recorder
-        sys.modules['vllm.distributed.eplb.expert_distribution_recorder'] = custom_recorder
+
+        sys.modules["vllm.distributed.eplb.expert_distribution_recorder"] = (
+            custom_recorder
+        )
         eplb_module.expert_distribution_recorder = custom_recorder
 
         # Also ensure our moe_hooks is used
         import moe_hooks as custom_hooks
-        sys.modules['vllm.distributed.eplb.moe_hooks'] = custom_hooks
+
+        sys.modules["vllm.distributed.eplb.moe_hooks"] = custom_hooks
         eplb_module.moe_hooks = custom_hooks
 
         # ============================================================================
@@ -292,71 +329,79 @@ def apply_vllm_monkey_patching():
         # ============================================================================
         try:
             from vllm.model_executor.models.qwen2_moe import Qwen2MoeSparseMoeBlock
-            
-            if not hasattr(Qwen2MoeSparseMoeBlock, '_expert_dist_patched_init_compat'):
+
+            if not hasattr(Qwen2MoeSparseMoeBlock, "_expert_dist_patched_init_compat"):
                 original_block_init = Qwen2MoeSparseMoeBlock.__init__
-                
+
                 def patched_block_init(self, config, *args, **kwargs):
                     # Inject missing attribute if needed (for Qwen3 compatibility)
-                    if not hasattr(config, 'shared_expert_intermediate_size'):
+                    if not hasattr(config, "shared_expert_intermediate_size"):
                         # Qwen3 doesn't seem to have shared experts in the same way, or defaults to 0
-                        setattr(config, 'shared_expert_intermediate_size', 0)
-                    
+                        setattr(config, "shared_expert_intermediate_size", 0)
+
                     original_block_init(self, config, *args, **kwargs)
-                    
+
                     # Fix for Qwen3: Qwen2MoeSparseMoeBlock creates shared_expert_gate unconditionally
                     # even if shared_expert_intermediate_size is 0.
                     # But Qwen3 checkpoint doesn't have this weight if it doesn't use shared experts.
                     # So we remove it if shared_expert is None.
-                    if getattr(self, 'shared_expert', None) is None:
+                    if getattr(self, "shared_expert", None) is None:
                         self.shared_expert_gate = None
-                
+
                 Qwen2MoeSparseMoeBlock.__init__ = patched_block_init
                 Qwen2MoeSparseMoeBlock._expert_dist_patched_init_compat = True
                 # print("Patched Qwen2MoeSparseMoeBlock for Qwen3 config compatibility")
         except ImportError:
             pass
         except Exception as e:
-            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}")
+            logger.debug(
+                f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}"
+            )
         except Exception as e:
-            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}")
+            logger.debug(
+                f"[ExpertDist] Warning: Failed to patch Qwen2MoeSparseMoeBlock: {e}"
+            )
 
         # ============================================================================
         # NEW: Patch Qwen2MoeModel.load_weights to skip QK-Norm if replaced by Identity
         # ============================================================================
         try:
             from vllm.model_executor.models.qwen2_moe import Qwen2MoeModel
-            
-            if not hasattr(Qwen2MoeModel, '_expert_dist_patched_load_weights'):
+
+            if not hasattr(Qwen2MoeModel, "_expert_dist_patched_load_weights"):
                 original_load_weights = Qwen2MoeModel.load_weights
-                
+
                 def patched_load_weights(self, weights):
                     # Filter out q_norm/k_norm weights if they are not in the model parameters
                     # This happens when we replace them with Identity for Qwen3 compatibility
                     # but the checkpoint still contains them (or vLLM thinks they should be there)
-                    
+
                     # Actually, the error happens because vLLM iterates over weights from the loader
                     # and tries to find them in params_dict.
                     # We need to wrap the iterator to skip these keys if they are not in params_dict
-                    
+
                     params_dict = dict(self.named_parameters())
-                    
+
                     def filtered_weights(weights_iterable):
                         for name, tensor in weights_iterable:
                             # Check if this is a q_norm/k_norm weight that we removed
-                            if ("q_norm" in name or "k_norm" in name) and name not in params_dict:
+                            if (
+                                "q_norm" in name or "k_norm" in name
+                            ) and name not in params_dict:
                                 # print(f"[ExpertDist] Skipping weight {name} as it is not in the model (likely replaced by Identity)")
                                 continue
                             yield name, tensor
-                            
+
                     return original_load_weights(self, filtered_weights(weights))
-                
+
                 Qwen2MoeModel.load_weights = patched_load_weights
                 Qwen2MoeModel._expert_dist_patched_load_weights = True
         except ImportError:
             pass
         except Exception as e:
-            print(f"[ExpertDist] Warning: Failed to patch Qwen2MoeModel.load_weights: {e}")
+            logger.debug(
+                f"[ExpertDist] Warning: Failed to patch Qwen2MoeModel.load_weights: {e}"
+            )
 
         # print("Successfully monkey-patched vLLM with custom expert_distribution_recorder")
 
@@ -364,40 +409,63 @@ def apply_vllm_monkey_patching():
         # This ensures layer_idx is set when layers are created during model loading
         try:
             from vllm.model_executor.models.utils import extract_layer_index
-            
+
             # Patch Qwen2 models if available
             try:
                 from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
-                _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=False)
-                
+
+                _patch_decoder_layer_init(
+                    Qwen2MoeDecoderLayer,
+                    extract_layer_index,
+                    "Qwen2MoeDecoderLayer",
+                    is_worker=False,
+                )
+
                 # Patch Qwen2MoeAttention for Qwen3 QK-Norm support
                 from vllm.model_executor.models.qwen2_moe import Qwen2MoeAttention
+
                 _patch_qwen2_attention(Qwen2MoeAttention)
             except ImportError:
                 pass
-            
+
             # Patch Qwen3 MoE models if available (for Qwen3-30B-A3B and similar)
             try:
                 from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
-                _patch_decoder_layer_init(Qwen3MoeDecoderLayer, extract_layer_index, "Qwen3MoeDecoderLayer", is_worker=False)
+
+                _patch_decoder_layer_init(
+                    Qwen3MoeDecoderLayer,
+                    extract_layer_index,
+                    "Qwen3MoeDecoderLayer",
+                    is_worker=False,
+                )
             except ImportError:
                 pass
-            
+
             # Patch DeepSeek models if available
             try:
-                from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
-                _patch_decoder_layer_init(DeepseekV2DecoderLayer, extract_layer_index, "DeepseekV2DecoderLayer", is_worker=False)
+                from vllm.model_executor.models.deepseek_v2 import (
+                    DeepseekV2DecoderLayer,
+                )
+
+                _patch_decoder_layer_init(
+                    DeepseekV2DecoderLayer,
+                    extract_layer_index,
+                    "DeepseekV2DecoderLayer",
+                    is_worker=False,
+                )
             except ImportError:
                 pass
         except Exception as e:
-            print(f"[ExpertDist] Warning: Could not patch decoder layer __init__ in main process: {e}")
+            logger.debug(
+                f"[ExpertDist] Warning: Could not patch decoder layer __init__ in main process: {e}"
+            )
 
         # Monkey patch Worker to add expert distribution methods
         try:
             from vllm.v1.worker.gpu_worker import Worker
 
             # Add expert distribution recorder attribute if it doesn't exist
-            if not hasattr(Worker, 'expert_distribution_recorder'):
+            if not hasattr(Worker, "expert_distribution_recorder"):
                 Worker.expert_distribution_recorder = None
 
             # Define the worker monkey patching method
@@ -408,17 +476,21 @@ def apply_vllm_monkey_patching():
 
                     # Apply module replacements in worker process
                     import expert_distribution_recorder as custom_recorder
-                    sys.modules['vllm.distributed.eplb.expert_distribution_recorder'] = custom_recorder
+
+                    sys.modules[
+                        "vllm.distributed.eplb.expert_distribution_recorder"
+                    ] = custom_recorder
 
                     import moe_hooks as custom_hooks
-                    sys.modules['vllm.distributed.eplb.moe_hooks'] = custom_hooks
+
+                    sys.modules["vllm.distributed.eplb.moe_hooks"] = custom_hooks
 
                     # Also monkey patch GPUModelRunner in worker process
                     try:
                         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
                         # Add expert_distribution_recorder attribute
-                        if not hasattr(GPUModelRunner, 'expert_distribution_recorder'):
+                        if not hasattr(GPUModelRunner, "expert_distribution_recorder"):
                             GPUModelRunner.expert_distribution_recorder = None
 
                         # Always ensure all methods are available in worker process
@@ -428,27 +500,44 @@ def apply_vllm_monkey_patching():
                                 hf_config = self.model_config.hf_config
 
                                 def is_mixture_of_experts(model):
-                                    return hasattr(model, "num_logical_experts") and hasattr(model, "num_expert_layers")
+                                    return hasattr(
+                                        model, "num_logical_experts"
+                                    ) and hasattr(model, "num_expert_layers")
 
                                 if is_mixture_of_experts(model):
                                     num_logical_experts = model.num_logical_experts
                                     num_layers = model.num_expert_layers
-                                    ep_size = getattr(model, 'ep_size', 1)
+                                    ep_size = getattr(model, "ep_size", 1)
                                     num_physical_experts = num_logical_experts
-                                    num_local_physical_experts = num_logical_experts // ep_size if ep_size > 1 else num_logical_experts
+                                    num_local_physical_experts = (
+                                        num_logical_experts // ep_size
+                                        if ep_size > 1
+                                        else num_logical_experts
+                                    )
                                 else:
                                     # Try to detect from hf_config with support for DeepSeek (n_routed_experts)
-                                    num_experts = getattr(hf_config, 'num_experts', None)
+                                    num_experts = getattr(
+                                        hf_config, "num_experts", None
+                                    )
                                     if num_experts is None:
-                                        num_experts = getattr(hf_config, 'n_routed_experts', 60)
-                                        
-                                    num_layers = getattr(hf_config, 'num_hidden_layers', getattr(hf_config, 'n_layer', 24))
-                                    
+                                        num_experts = getattr(
+                                            hf_config, "n_routed_experts", 60
+                                        )
+
+                                    num_layers = getattr(
+                                        hf_config,
+                                        "num_hidden_layers",
+                                        getattr(hf_config, "n_layer", 24),
+                                    )
+
                                     num_physical_experts = num_experts
                                     num_local_physical_experts = num_experts
                                     ep_size = 1
 
-                                from expert_distribution_recorder import ExpertLocationMetadata
+                                from expert_distribution_recorder import (
+                                    ExpertLocationMetadata,
+                                )
+
                                 return ExpertLocationMetadata(
                                     num_layers=num_layers,
                                     num_logical_experts=num_experts,
@@ -459,21 +548,42 @@ def apply_vllm_monkey_patching():
                             except Exception:
                                 return None
 
-                        def configure_expert_distribution_recording(self, recording_mode=None, enable_metrics=False, buffer_size=-1):
-                            from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
-                            expert_location_metadata = self._get_expert_location_metadata()
+                        def configure_expert_distribution_recording(
+                            self,
+                            recording_mode=None,
+                            enable_metrics=False,
+                            buffer_size=-1,
+                        ):
+                            from expert_distribution_recorder import (
+                                ExpertDistributionRecorder,
+                                set_global_expert_distribution_recorder,
+                            )
+
+                            expert_location_metadata = (
+                                self._get_expert_location_metadata()
+                            )
                             if expert_location_metadata is None:
                                 return
 
                             import torch
                             import os
                             import tempfile
-                            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                            
+
+                            rank = (
+                                torch.distributed.get_rank()
+                                if torch.distributed.is_initialized()
+                                else 0
+                            )
+
                             # Check for auto-start flag (similar to sglang.py's enable_expert_distribution_metrics)
-                            EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
-                            auto_start_enabled = os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE)
-                            
+                            EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(
+                                tempfile.gettempdir(),
+                                "vllm_expert_distribution_auto_start.flag",
+                            )
+                            auto_start_enabled = os.path.exists(
+                                EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE
+                            )
+
                             # Auto-configure if flag is set but no mode specified
                             if auto_start_enabled and recording_mode is None:
                                 recording_mode = "per_pass"  # Default to per_pass mode (CUDA graph compatible)
@@ -482,16 +592,20 @@ def apply_vllm_monkey_patching():
                                     # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-starting expert distribution recording (mode={recording_mode})", flush=True)
                                     pass
 
-                            self.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
-                                recording_mode=recording_mode,
-                                expert_location_metadata=expert_location_metadata,
-                                rank=rank,
-                                device=str(self.device),
-                                buffer_size=buffer_size,
-                                enable_metrics=enable_metrics,
+                            self.expert_distribution_recorder = (
+                                ExpertDistributionRecorder.init_new(
+                                    recording_mode=recording_mode,
+                                    expert_location_metadata=expert_location_metadata,
+                                    rank=rank,
+                                    device=str(self.device),
+                                    buffer_size=buffer_size,
+                                    enable_metrics=enable_metrics,
+                                )
                             )
-                            set_global_expert_distribution_recorder(self.expert_distribution_recorder)
-                            
+                            set_global_expert_distribution_recorder(
+                                self.expert_distribution_recorder
+                            )
+
                             # Auto-start recording if flag is set (similar to sglang.py)
                             if auto_start_enabled:
                                 self.expert_distribution_recorder.start_record()
@@ -509,7 +623,9 @@ def apply_vllm_monkey_patching():
 
                         def dump_expert_distribution_record(self, output_path=None):
                             if self.expert_distribution_recorder:
-                                return self.expert_distribution_recorder.dump_record(output_path)
+                                return self.expert_distribution_recorder.dump_record(
+                                    output_path
+                                )
                             return {}
 
                         def check_expert_buffer(self):
@@ -517,16 +633,28 @@ def apply_vllm_monkey_patching():
                                 buffer = self.expert_distribution_recorder.get_expert_counts_buffer()
                                 return {
                                     "buffer_available": buffer is not None,
-                                    "buffer_shape": buffer.shape if buffer is not None else None,
+                                    "buffer_shape": buffer.shape
+                                    if buffer is not None
+                                    else None,
                                 }
                             return {"buffer_available": False}
 
                         # Always apply the methods in worker process (overwrite any existing)
-                        GPUModelRunner._get_expert_location_metadata = _get_expert_location_metadata
-                        GPUModelRunner.configure_expert_distribution_recording = configure_expert_distribution_recording
-                        GPUModelRunner.start_expert_distribution_recording = start_expert_distribution_recording
-                        GPUModelRunner.stop_expert_distribution_recording = stop_expert_distribution_recording
-                        GPUModelRunner.dump_expert_distribution_record = dump_expert_distribution_record
+                        GPUModelRunner._get_expert_location_metadata = (
+                            _get_expert_location_metadata
+                        )
+                        GPUModelRunner.configure_expert_distribution_recording = (
+                            configure_expert_distribution_recording
+                        )
+                        GPUModelRunner.start_expert_distribution_recording = (
+                            start_expert_distribution_recording
+                        )
+                        GPUModelRunner.stop_expert_distribution_recording = (
+                            stop_expert_distribution_recording
+                        )
+                        GPUModelRunner.dump_expert_distribution_record = (
+                            dump_expert_distribution_record
+                        )
                         GPUModelRunner.check_expert_buffer = check_expert_buffer
 
                     except ImportError:
@@ -534,102 +662,146 @@ def apply_vllm_monkey_patching():
 
                     # Patch decoder layer forward methods for per_token/per_pass mode data collection
                     from vllm.model_executor.models.utils import extract_layer_index
-                    
+
                     # Patch Qwen models forward method
                     try:
-                        from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
-                        if not hasattr(Qwen2MoeDecoderLayer, '_expert_dist_patched_forward'):
+                        from vllm.model_executor.models.qwen2_moe import (
+                            Qwen2MoeDecoderLayer,
+                        )
+
+                        if not hasattr(
+                            Qwen2MoeDecoderLayer, "_expert_dist_patched_forward"
+                        ):
                             original_forward = Qwen2MoeDecoderLayer.forward
-                            
+
                             def patched_qwen_forward(self, *args, **kwargs):
-                                layer_idx = getattr(self, 'layer_idx', None)
-                                
+                                layer_idx = getattr(self, "layer_idx", None)
+
                                 if layer_idx is not None:
-                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    from expert_distribution_recorder import (
+                                        get_global_expert_distribution_recorder,
+                                    )
+
                                     recorder = get_global_expert_distribution_recorder()
-                                    
-                                    if recorder is not None and getattr(recorder, '_recording', False):
+
+                                    if recorder is not None and getattr(
+                                        recorder, "_recording", False
+                                    ):
                                         with recorder.with_current_layer(layer_idx):
-                                            result = original_forward(self, *args, **kwargs)
-                                        
+                                            result = original_forward(
+                                                self, *args, **kwargs
+                                            )
+
                                         # For per_pass and per_token modes, collection is now done in execute_model
                                         # to support Cuda Graph (where forward is skipped during replay)
                                         return result
                                 return original_forward(self, *args, **kwargs)
-                            
+
                             Qwen2MoeDecoderLayer.forward = patched_qwen_forward
                             Qwen2MoeDecoderLayer._expert_dist_patched_forward = True
                             # print(f"[ExpertDist-Worker] Patched Qwen2MoeDecoderLayer.forward successfully", flush=True)
                     except ImportError:
                         # print(f"[ExpertDist-Worker] Failed to import Qwen2MoeDecoderLayer for forward patching", flush=True)
                         pass
-                    
+
                     # Patch Qwen3MoE models forward method (for Qwen3-30B-A3B and similar)
                     try:
-                        from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
-                        if not hasattr(Qwen3MoeDecoderLayer, '_expert_dist_patched_forward'):
+                        from vllm.model_executor.models.qwen3_moe import (
+                            Qwen3MoeDecoderLayer,
+                        )
+
+                        if not hasattr(
+                            Qwen3MoeDecoderLayer, "_expert_dist_patched_forward"
+                        ):
                             original_qwen3_forward = Qwen3MoeDecoderLayer.forward
-                            
+
                             def patched_qwen3_forward(self, *args, **kwargs):
-                                layer_idx = getattr(self, 'layer_idx', None)
-                                
+                                layer_idx = getattr(self, "layer_idx", None)
+
                                 if layer_idx is not None:
-                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    from expert_distribution_recorder import (
+                                        get_global_expert_distribution_recorder,
+                                    )
+
                                     recorder = get_global_expert_distribution_recorder()
-                                    
-                                    if recorder is not None and getattr(recorder, '_recording', False):
+
+                                    if recorder is not None and getattr(
+                                        recorder, "_recording", False
+                                    ):
                                         with recorder.with_current_layer(layer_idx):
-                                            result = original_qwen3_forward(self, *args, **kwargs)
-                                        
+                                            result = original_qwen3_forward(
+                                                self, *args, **kwargs
+                                            )
+
                                         # For per_pass and per_token modes, collection is now done in execute_model
                                         # to support Cuda Graph (where forward is skipped during replay)
                                         return result
                                 return original_qwen3_forward(self, *args, **kwargs)
-                            
+
                             Qwen3MoeDecoderLayer.forward = patched_qwen3_forward
                             Qwen3MoeDecoderLayer._expert_dist_patched_forward = True
-                            print(f"[ExpertDist-Worker] Patched Qwen3MoeDecoderLayer.forward successfully", flush=True)
+                            # print(f"[ExpertDist-Worker] Patched Qwen3MoeDecoderLayer.forward successfully", flush=True)
                     except ImportError:
                         pass
-                    
+
                     # Patch DeepSeek models forward method
                     try:
-                        from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
-                        if not hasattr(DeepseekV2DecoderLayer, '_expert_dist_patched_forward'):
+                        from vllm.model_executor.models.deepseek_v2 import (
+                            DeepseekV2DecoderLayer,
+                        )
+
+                        if not hasattr(
+                            DeepseekV2DecoderLayer, "_expert_dist_patched_forward"
+                        ):
                             original_forward = DeepseekV2DecoderLayer.forward
-                            
+
                             def patched_deepseek_forward(self, *args, **kwargs):
-                                layer_idx = getattr(self, 'layer_idx', None)
+                                layer_idx = getattr(self, "layer_idx", None)
                                 if layer_idx is not None:
-                                    from expert_distribution_recorder import get_global_expert_distribution_recorder
+                                    from expert_distribution_recorder import (
+                                        get_global_expert_distribution_recorder,
+                                    )
+
                                     recorder = get_global_expert_distribution_recorder()
-                                    if recorder is not None and getattr(recorder, '_recording', False):
+                                    if recorder is not None and getattr(
+                                        recorder, "_recording", False
+                                    ):
                                         with recorder.with_current_layer(layer_idx):
-                                            result = original_forward(self, *args, **kwargs)
-                                        
+                                            result = original_forward(
+                                                self, *args, **kwargs
+                                            )
+
                                         # For per_pass and per_token modes, collection is now done in execute_model
                                         # to support Cuda Graph (where forward is skipped during replay)
                                         return result
                                 return original_forward(self, *args, **kwargs)
-                            
+
                             DeepseekV2DecoderLayer.forward = patched_deepseek_forward
                             DeepseekV2DecoderLayer._expert_dist_patched_forward = True
                             # print(f"[ExpertDist-Worker] Patched DeepseekV2DecoderLayer.forward successfully", flush=True)
                     except ImportError:
                         pass
-                    
+
                     # IMPORTANT: Also patch FusedMoE.select_experts in worker process
                     # This is needed because worker processes might reload modules
                     try:
                         from vllm.model_executor.layers.fused_moe import FusedMoE
-                        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_worker_after_init'):
+
+                        if not hasattr(
+                            FusedMoE.select_experts,
+                            "_expert_dist_patched_worker_after_init",
+                        ):
                             original_select_experts_worker = FusedMoE.select_experts
-                            patched_func = _create_select_experts_patcher(original_select_experts_worker)
+                            patched_func = _create_select_experts_patcher(
+                                original_select_experts_worker
+                            )
                             FusedMoE.select_experts = staticmethod(patched_func)
                             FusedMoE.select_experts._expert_dist_patched_worker_after_init = True
                             # print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts in worker process")
                     except Exception as e:
-                        print(f"[ExpertDist-Worker] Could not patch FusedMoE.select_experts in worker: {e}")
+                        logger.debug(
+                            f"[ExpertDist-Worker] Could not patch FusedMoE.select_experts in worker: {e}"
+                        )
 
                 except Exception as e:
                     # Don't crash if monkey patching fails in worker
@@ -637,13 +809,18 @@ def apply_vllm_monkey_patching():
 
             # Add the method to the Worker class
             Worker._apply_worker_monkey_patching = _apply_worker_monkey_patching
-            
+
             # IMPORTANT: Also add the RPC methods to Worker class so they're available for collective_rpc
             # These need to be added BEFORE patching __init__ so they're available when workers are created
-            def configure_expert_distribution_recorder(self, recording_mode: str | None = None, enable_metrics: bool = False, buffer_size: int = -1):
+            def configure_expert_distribution_recorder(
+                self,
+                recording_mode: str | None = None,
+                enable_metrics: bool = False,
+                buffer_size: int = -1,
+            ):
                 """Configure the expert distribution recorder on the worker."""
                 # Ensure model_runner exists (it should be initialized by now)
-                if not hasattr(self, 'model_runner') or self.model_runner is None:
+                if not hasattr(self, "model_runner") or self.model_runner is None:
                     # If model_runner not ready yet, return error
                     return {"success": False, "error": "model_runner not initialized"}
 
@@ -663,7 +840,7 @@ def apply_vllm_monkey_patching():
                     if mode_lower not in valid_modes:
                         return {
                             "success": False,
-                            "error": f"Invalid recording mode: '{recording_mode}'. Valid modes are: {', '.join(sorted(valid_modes))}"
+                            "error": f"Invalid recording mode: '{recording_mode}'. Valid modes are: {', '.join(sorted(valid_modes))}",
                         }
                     recording_mode = mode_lower
                 else:
@@ -671,7 +848,10 @@ def apply_vllm_monkey_patching():
                     recording_mode = "per_pass"
 
                 # Call the GPUModelRunner method directly to avoid delegation issues
-                from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
+                from expert_distribution_recorder import (
+                    ExpertDistributionRecorder,
+                    set_global_expert_distribution_recorder,
+                )
 
                 # Get expert location metadata inline (avoid method call issues)
                 try:
@@ -679,27 +859,38 @@ def apply_vllm_monkey_patching():
                     hf_config = self.model_runner.model_config.hf_config
 
                     def is_mixture_of_experts(model):
-                        return hasattr(model, "num_logical_experts") and hasattr(model, "num_expert_layers")
+                        return hasattr(model, "num_logical_experts") and hasattr(
+                            model, "num_expert_layers"
+                        )
 
                     if is_mixture_of_experts(model):
                         num_logical_experts = model.num_logical_experts
                         num_layers = model.num_expert_layers
-                        ep_size = getattr(model, 'ep_size', 1)
+                        ep_size = getattr(model, "ep_size", 1)
                         num_physical_experts = num_logical_experts
-                        num_local_physical_experts = num_logical_experts // ep_size if ep_size > 1 else num_logical_experts
+                        num_local_physical_experts = (
+                            num_logical_experts // ep_size
+                            if ep_size > 1
+                            else num_logical_experts
+                        )
                     else:
                         # Try to detect from hf_config with support for DeepSeek (n_routed_experts)
-                        num_experts = getattr(hf_config, 'num_experts', None)
+                        num_experts = getattr(hf_config, "num_experts", None)
                         if num_experts is None:
-                            num_experts = getattr(hf_config, 'n_routed_experts', 60)
-                            
-                        num_layers = getattr(hf_config, 'num_hidden_layers', getattr(hf_config, 'n_layer', 24))
-                        
+                            num_experts = getattr(hf_config, "n_routed_experts", 60)
+
+                        num_layers = getattr(
+                            hf_config,
+                            "num_hidden_layers",
+                            getattr(hf_config, "n_layer", 24),
+                        )
+
                         num_physical_experts = num_experts
                         num_local_physical_experts = num_experts
                         ep_size = 1
 
                     from expert_distribution_recorder import ExpertLocationMetadata
+
                     expert_location_metadata = ExpertLocationMetadata(
                         num_layers=num_layers,
                         num_logical_experts=num_experts,
@@ -708,21 +899,33 @@ def apply_vllm_monkey_patching():
                         ep_size=ep_size,
                     )
                 except Exception as e:
-                    return {"success": False, "error": f"Failed to get expert metadata: {e}"}
+                    return {
+                        "success": False,
+                        "error": f"Failed to get expert metadata: {e}",
+                    }
 
                 import torch
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
 
                 try:
-                    self.model_runner.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
-                        recording_mode=recording_mode,
-                        expert_location_metadata=expert_location_metadata,
-                        rank=rank,
-                        device=str(self.model_runner.device),
-                        buffer_size=buffer_size,
-                        enable_metrics=enable_metrics,
+                    self.model_runner.expert_distribution_recorder = (
+                        ExpertDistributionRecorder.init_new(
+                            recording_mode=recording_mode,
+                            expert_location_metadata=expert_location_metadata,
+                            rank=rank,
+                            device=str(self.model_runner.device),
+                            buffer_size=buffer_size,
+                            enable_metrics=enable_metrics,
+                        )
                     )
-                    set_global_expert_distribution_recorder(self.model_runner.expert_distribution_recorder)
+                    set_global_expert_distribution_recorder(
+                        self.model_runner.expert_distribution_recorder
+                    )
                 except Exception as e:
                     # Return error instead of raising to prevent worker crash
                     return {"success": False, "error": str(e)}
@@ -735,37 +938,51 @@ def apply_vllm_monkey_patching():
                 }
 
             # Backward compatibility alias for older RPC name
-            def configure_expert_distribution_recording(self, mode: str, verbose: bool = False):
+            def configure_expert_distribution_recording(
+                self, mode: str, verbose: bool = False
+            ):
                 """Configure expert distribution recording mode."""
-                return self.configure_expert_distribution_recorder(recording_mode=mode, enable_metrics=verbose)
+                return self.configure_expert_distribution_recorder(
+                    recording_mode=mode, enable_metrics=verbose
+                )
 
             def start_expert_distribution_recording(self):
                 """Start recording expert distributions."""
-                if hasattr(self, 'model_runner') and self.model_runner is not None:
+                if hasattr(self, "model_runner") and self.model_runner is not None:
                     self.model_runner.start_expert_distribution_recording()
 
             def dump_expert_distribution_record(self, output_path=None):
                 """Dump recorded expert distribution data."""
-                if hasattr(self, 'model_runner') and self.model_runner is not None:
-                    return self.model_runner.dump_expert_distribution_record(output_path)
+                if hasattr(self, "model_runner") and self.model_runner is not None:
+                    return self.model_runner.dump_expert_distribution_record(
+                        output_path
+                    )
                 return {}
 
             def stop_expert_distribution_recording(self):
                 """Stop recording expert distributions."""
-                if hasattr(self, 'model_runner') and self.model_runner is not None:
+                if hasattr(self, "model_runner") and self.model_runner is not None:
                     self.model_runner.stop_expert_distribution_recording()
 
             # Add methods to Worker class BEFORE patching __init__
-            Worker.configure_expert_distribution_recorder = configure_expert_distribution_recorder
-            Worker.configure_expert_distribution_recording = configure_expert_distribution_recording
-            Worker.start_expert_distribution_recording = start_expert_distribution_recording
+            Worker.configure_expert_distribution_recorder = (
+                configure_expert_distribution_recorder
+            )
+            Worker.configure_expert_distribution_recording = (
+                configure_expert_distribution_recording
+            )
+            Worker.start_expert_distribution_recording = (
+                start_expert_distribution_recording
+            )
             Worker.dump_expert_distribution_record = dump_expert_distribution_record
-            Worker.stop_expert_distribution_recording = stop_expert_distribution_recording
+            Worker.stop_expert_distribution_recording = (
+                stop_expert_distribution_recording
+            )
 
             def patched_init(self, *args, **kwargs):
                 import sys
                 import os
-                
+
                 # CRITICAL: Apply ALL patching BEFORE Worker.__init__ loads the model
                 # This ensures patching is applied BEFORE torch.compile and CUDA graph capture
                 # This must happen BEFORE model loading, especially for spawned workers
@@ -773,48 +990,91 @@ def apply_vllm_monkey_patching():
                     # Patch decoder layers BEFORE model is loaded
                     import inspect
                     from vllm.model_executor.models.utils import extract_layer_index
-                    
+
                     # Patch Qwen2 models if available
                     try:
-                        from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
-                        _patch_decoder_layer_init(Qwen2MoeDecoderLayer, extract_layer_index, "Qwen2MoeDecoderLayer", is_worker=True)
+                        from vllm.model_executor.models.qwen2_moe import (
+                            Qwen2MoeDecoderLayer,
+                        )
+
+                        _patch_decoder_layer_init(
+                            Qwen2MoeDecoderLayer,
+                            extract_layer_index,
+                            "Qwen2MoeDecoderLayer",
+                            is_worker=True,
+                        )
                     except ImportError:
                         pass
-                    
+
                     # Patch Qwen3 MoE models if available (for Qwen3-30B-A3B and similar)
                     try:
-                        from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
-                        _patch_decoder_layer_init(Qwen3MoeDecoderLayer, extract_layer_index, "Qwen3MoeDecoderLayer", is_worker=True)
+                        from vllm.model_executor.models.qwen3_moe import (
+                            Qwen3MoeDecoderLayer,
+                        )
+
+                        _patch_decoder_layer_init(
+                            Qwen3MoeDecoderLayer,
+                            extract_layer_index,
+                            "Qwen3MoeDecoderLayer",
+                            is_worker=True,
+                        )
                     except ImportError:
                         pass
-                    
+
                     # Patch DeepSeek models if available
                     try:
-                        from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
-                        _patch_decoder_layer_init(DeepseekV2DecoderLayer, extract_layer_index, "DeepseekV2DecoderLayer", is_worker=True)
+                        from vllm.model_executor.models.deepseek_v2 import (
+                            DeepseekV2DecoderLayer,
+                        )
+
+                        _patch_decoder_layer_init(
+                            DeepseekV2DecoderLayer,
+                            extract_layer_index,
+                            "DeepseekV2DecoderLayer",
+                            is_worker=True,
+                        )
                     except ImportError:
                         pass
-                    
+
                     # CRITICAL: Patch FusedMoE.select_experts BEFORE torch.compile
                     # torch.compile happens during model loading, so we must patch before that
                     try:
                         from vllm.model_executor.layers.fused_moe import FusedMoE
-                        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_worker'):
+
+                        if not hasattr(
+                            FusedMoE.select_experts, "_expert_dist_patched_worker"
+                        ):
                             original_select_experts_worker = FusedMoE.select_experts
-                            patched_func = _create_select_experts_patcher(original_select_experts_worker)
+                            patched_func = _create_select_experts_patcher(
+                                original_select_experts_worker
+                            )
                             FusedMoE.select_experts = staticmethod(patched_func)
                             FusedMoE.select_experts._expert_dist_patched_worker = True
                             # print(f"[ExpertDist-Worker] Patched FusedMoE.select_experts BEFORE torch.compile", flush=True)
                     except Exception as e:
-                        print(f"[ExpertDist-Worker] Warning: Could not patch FusedMoE.select_experts before compile: {e}", flush=True)
-                        
+                        logger.debug(
+                            f"[ExpertDist-Worker] Warning: Could not patch FusedMoE.select_experts before compile: {e}"
+                        )
+
                 except Exception as e:
-                    print(f"[ExpertDist-Worker] Warning: Could not patch decoder layers before model load: {e}")
-                
+                    logger.debug(
+                        f"[ExpertDist-Worker] Warning: Could not patch decoder layers before model load: {e}"
+                    )
+
                 # Only pass Worker.__init__ parameters to avoid passing them to model constructors
                 # Worker.__init__ accepts: vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
-                worker_kwargs = {k: v for k, v in kwargs.items()
-                               if k in ['vllm_config', 'local_rank', 'rank', 'distributed_init_method', 'is_driver_worker']}
+                worker_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k
+                    in [
+                        "vllm_config",
+                        "local_rank",
+                        "rank",
+                        "distributed_init_method",
+                        "is_driver_worker",
+                    ]
+                }
 
                 # Apply additional monkey patching BEFORE initialization (for forward methods, etc.)
                 # This ensures model methods are patched BEFORE they are used/compiled in Worker.__init__
@@ -822,7 +1082,9 @@ def apply_vllm_monkey_patching():
                     self._apply_worker_monkey_patching()
                 except Exception as e:
                     # Don't crash if patching fails, but log it
-                    print(f"[ExpertDist] Warning: Worker monkey patching failed: {e}")
+                    logger.debug(
+                        f"[ExpertDist] Warning: Worker monkey patching failed: {e}"
+                    )
 
                 # Call the original Worker.__init__ (this loads the model, which now uses patched decoder layers)
                 # Use Worker._original_init directly (not super()) to avoid calling our patched version recursively
@@ -834,23 +1096,48 @@ def apply_vllm_monkey_patching():
                 # Auto-configure and start expert distribution recording if flag is set (similar to sglang.py)
                 try:
                     import tempfile
-                    EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
-                    auto_start_enabled = os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE)
-                    
-                    if auto_start_enabled and hasattr(self, 'model_runner') and self.model_runner is not None:
+
+                    EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(
+                        tempfile.gettempdir(),
+                        "vllm_expert_distribution_auto_start.flag",
+                    )
+                    auto_start_enabled = os.path.exists(
+                        EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE
+                    )
+
+                    if (
+                        auto_start_enabled
+                        and hasattr(self, "model_runner")
+                        and self.model_runner is not None
+                    ):
                         # Auto-configure with per_pass mode (CUDA graph compatible)
-                        self.configure_expert_distribution_recorder(recording_mode="per_pass", enable_metrics=True, buffer_size=-1)
+                        self.configure_expert_distribution_recorder(
+                            recording_mode="per_pass",
+                            enable_metrics=True,
+                            buffer_size=-1,
+                        )
                         # Auto-start recording
-                        if hasattr(self.model_runner, 'expert_distribution_recorder') and self.model_runner.expert_distribution_recorder is not None:
+                        if (
+                            hasattr(self.model_runner, "expert_distribution_recorder")
+                            and self.model_runner.expert_distribution_recorder
+                            is not None
+                        ):
                             self.model_runner.expert_distribution_recorder.start_record()
                             import torch
-                            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+                            rank = (
+                                torch.distributed.get_rank()
+                                if torch.distributed.is_initialized()
+                                else 0
+                            )
                             if rank == 0:
                                 # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-configured and started expert distribution recording", flush=True)
                                 pass
                 except Exception as e:
                     # Don't fail if auto-start fails
-                    print(f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not auto-start expert distribution recording: {e}", flush=True)
+                    logger.debug(
+                        f"[ExpertDist-Worker PID {os.getpid()}] Warning: Could not auto-start expert distribution recording: {e}"
+                    )
 
             # Monkey patch __init__ (methods are already added above)
             Worker.__init__ = patched_init
@@ -862,7 +1149,7 @@ def apply_vllm_monkey_patching():
                 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
                 # Add expert_distribution_recorder attribute
-                if not hasattr(GPUModelRunner, 'expert_distribution_recorder'):
+                if not hasattr(GPUModelRunner, "expert_distribution_recorder"):
                     GPUModelRunner.expert_distribution_recorder = None
 
                 def _get_expert_location_metadata(self):
@@ -873,18 +1160,26 @@ def apply_vllm_monkey_patching():
 
                         # Check if it's a MoE model
                         def is_mixture_of_experts(model):
-                            return hasattr(model, "num_logical_experts") and hasattr(model, "num_expert_layers")
+                            return hasattr(model, "num_logical_experts") and hasattr(
+                                model, "num_expert_layers"
+                            )
 
                         if is_mixture_of_experts(model):
                             num_logical_experts = model.num_logical_experts
                             num_layers = model.num_expert_layers
-                            ep_size = getattr(model, 'ep_size', 1)
+                            ep_size = getattr(model, "ep_size", 1)
 
                             num_physical_experts = num_logical_experts
-                            num_local_physical_experts = num_logical_experts // ep_size if ep_size > 1 else num_logical_experts
+                            num_local_physical_experts = (
+                                num_logical_experts // ep_size
+                                if ep_size > 1
+                                else num_logical_experts
+                            )
                         else:
                             # Fallback to config-based extraction
-                            num_experts = getattr(hf_config, 'num_experts', 60)  # Qwen default
+                            num_experts = getattr(
+                                hf_config, "num_experts", 60
+                            )  # Qwen default
                             num_layers = 24  # Qwen 1.5 MoE layers
 
                             num_physical_experts = num_experts
@@ -892,6 +1187,7 @@ def apply_vllm_monkey_patching():
                             ep_size = 1
 
                         from expert_distribution_recorder import ExpertLocationMetadata
+
                         return ExpertLocationMetadata(
                             num_layers=num_layers,
                             num_logical_experts=num_experts,
@@ -900,31 +1196,67 @@ def apply_vllm_monkey_patching():
                             ep_size=ep_size,
                         )
                     except Exception as e:
-                        print(f"Failed to extract expert location metadata: {e}")
+                        logger.debug(f"Failed to extract expert location metadata: {e}")
                         return None
 
-                def configure_expert_distribution_recording(self, recording_mode=None, enable_metrics=False, buffer_size=-1):
+                def configure_expert_distribution_recording(
+                    self, recording_mode=None, enable_metrics=False, buffer_size=-1
+                ):
                     """Configure expert distribution recording."""
-                    from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
+                    from expert_distribution_recorder import (
+                        ExpertDistributionRecorder,
+                        set_global_expert_distribution_recorder,
+                    )
 
                     expert_location_metadata = self._get_expert_location_metadata()
                     if expert_location_metadata is None:
-                        print("[ExpertRecorder] Could not extract expert location metadata from model")
-                        
+                        logger.debug(
+                            "[ExpertRecorder] Could not extract expert location metadata from model"
+                        )
+
                         return
 
                     import torch
-                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+                    rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    )
 
                     # Reuse existing recorder if it exists to preserve CUDA graph buffer references.
                     # Creating a new recorder would break CUDA graphs captured with the old buffer.
-                    if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder is not None:
-                        existing_mode = getattr(self.expert_distribution_recorder, '_recording_mode', None)
+                    if (
+                        hasattr(self, "expert_distribution_recorder")
+                        and self.expert_distribution_recorder is not None
+                    ):
+                        existing_mode = getattr(
+                            self.expert_distribution_recorder, "_recording_mode", None
+                        )
                         if existing_mode == recording_mode:
-                            print(f"[ExpertRecorder] Recorder already exists with mode={existing_mode}, reusing")
+                            logger.debug(
+                                f"[ExpertRecorder] Recorder already exists with mode={existing_mode}, reusing"
+                            )
                         else:
-                            print(f"[ExpertRecorder] Changing recording mode from {existing_mode} to {recording_mode}. This may break CUDA graphs if they were already captured.")
-                            self.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
+                            logger.debug(
+                                f"[ExpertRecorder] Changing recording mode from {existing_mode} to {recording_mode}. This may break CUDA graphs if they were already captured."
+                            )
+                            self.expert_distribution_recorder = (
+                                ExpertDistributionRecorder.init_new(
+                                    recording_mode=recording_mode,
+                                    expert_location_metadata=expert_location_metadata,
+                                    rank=rank,
+                                    device=str(self.device),
+                                    buffer_size=buffer_size,
+                                    enable_metrics=enable_metrics,
+                                )
+                            )
+                            set_global_expert_distribution_recorder(
+                                self.expert_distribution_recorder
+                            )
+                    else:
+                        self.expert_distribution_recorder = (
+                            ExpertDistributionRecorder.init_new(
                                 recording_mode=recording_mode,
                                 expert_location_metadata=expert_location_metadata,
                                 rank=rank,
@@ -932,18 +1264,13 @@ def apply_vllm_monkey_patching():
                                 buffer_size=buffer_size,
                                 enable_metrics=enable_metrics,
                             )
-                            set_global_expert_distribution_recorder(self.expert_distribution_recorder)
-                    else:
-                        self.expert_distribution_recorder = ExpertDistributionRecorder.init_new(
-                            recording_mode=recording_mode,
-                            expert_location_metadata=expert_location_metadata,
-                            rank=rank,
-                            device=str(self.device),
-                            buffer_size=buffer_size,
-                            enable_metrics=enable_metrics,
                         )
-                        set_global_expert_distribution_recorder(self.expert_distribution_recorder)
-                    print(f"[ExpertRecorder] Expert distribution recording configured with mode={recording_mode}")
+                        set_global_expert_distribution_recorder(
+                            self.expert_distribution_recorder
+                        )
+                    logger.debug(
+                        f"[ExpertRecorder] Expert distribution recording configured with mode={recording_mode}"
+                    )
 
                 def start_expert_distribution_recording(self):
                     """Start recording expert distributions."""
@@ -958,16 +1285,22 @@ def apply_vllm_monkey_patching():
                 def dump_expert_distribution_record(self, output_path=None):
                     """Dump recorded expert distribution data."""
                     if self.expert_distribution_recorder:
-                        return self.expert_distribution_recorder.dump_record(output_path)
+                        return self.expert_distribution_recorder.dump_record(
+                            output_path
+                        )
                     return {}
 
                 def check_expert_buffer(self):
                     """Check if expert buffer is available."""
                     if self.expert_distribution_recorder:
-                        buffer = self.expert_distribution_recorder.get_expert_counts_buffer()
+                        buffer = (
+                            self.expert_distribution_recorder.get_expert_counts_buffer()
+                        )
                         return {
                             "buffer_available": buffer is not None,
-                            "buffer_shape": buffer.shape if buffer is not None else None,
+                            "buffer_shape": buffer.shape
+                            if buffer is not None
+                            else None,
                         }
                     return {"buffer_available": False}
 
@@ -975,89 +1308,120 @@ def apply_vllm_monkey_patching():
                 def patched_load_model(self, *args, **kwargs):
                     # Call original load_model
                     original_load_model(self, *args, **kwargs)
-                    
+
                     # Auto-initialize recorder immediately after load
                     try:
-                         import os
-                         # print(f"[ExpertDist-Worker PID {os.getpid()}] patched_load_model: Model loaded. Attempting auto-init...", flush=True)
-                         
-                         # Verify if forward patch is effective on the loaded model
-                         try:
-                             model = self.get_model()
-                             if hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0:
-                                 layer0 = model.model.layers[0]
-                                 # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 type: {type(layer0)}", flush=True)
-                                 # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward: {layer0.forward}", flush=True)
-                                 if hasattr(layer0.forward, '__name__'):
-                                     # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward name: {layer0.forward.__name__}", flush=True)
-                                     pass
-                         except Exception as e:
-                             print(f"[ExpertDist-Worker PID {os.getpid()}] Failed to inspect model layers: {e}", flush=True)
-                         
-                         # We can use self._get_expert_location_metadata() now since we patched it into the class
-                         metadata = self._get_expert_location_metadata()
-                         
-                         if metadata:
-                             from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
-                             import torch
-                             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                             
-                             # Default to per_pass mode (most common and graph-compatible)
-                             # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default PER_PASS recorder for CUDAGraph capture", flush=True)
-                             recorder = ExpertDistributionRecorder.init_new(
-                                 recording_mode="per_pass",
-                                 expert_location_metadata=metadata,
-                                 rank=rank,
-                                 device=str(self.device),
-                             )
-                             
-                             self.expert_distribution_recorder = recorder
-                             set_global_expert_distribution_recorder(recorder)
-                             
-                             # CRITICAL: Start recording immediately so it's active during CUDAGraph capture
-                             recorder.start_record()
-                             
-                             # print(f"[ExpertDist-Worker PID {os.getpid()}] Recorder initialized, started, and set globally.", flush=True)
-                         else:
-                             print(f"[ExpertDist-Worker PID {os.getpid()}] Metadata is None", flush=True)
-                    except Exception as e:
-                         import os
-                         print(f"[ExpertDist-Worker PID {os.getpid()}] CRITICAL: Failed to auto-initialize recorder in load_model: {e}", flush=True)
-                         import traceback
-                         traceback.print_exc()
-                         # Re-raise exception to ensure we don't proceed with broken state
-                         raise e
+                        import os
+                        # print(f"[ExpertDist-Worker PID {os.getpid()}] patched_load_model: Model loaded. Attempting auto-init...", flush=True)
 
-                GPUModelRunner._get_expert_location_metadata = _get_expert_location_metadata
-                GPUModelRunner.configure_expert_distribution_recording = configure_expert_distribution_recording
-                GPUModelRunner.start_expert_distribution_recording = start_expert_distribution_recording
-                GPUModelRunner.stop_expert_distribution_recording = stop_expert_distribution_recording
-                GPUModelRunner.dump_expert_distribution_record = dump_expert_distribution_record
+                        # Verify if forward patch is effective on the loaded model
+                        try:
+                            model = self.get_model()
+                            if (
+                                hasattr(model, "model")
+                                and hasattr(model.model, "layers")
+                                and len(model.model.layers) > 0
+                            ):
+                                layer0 = model.model.layers[0]
+                                # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 type: {type(layer0)}", flush=True)
+                                # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward: {layer0.forward}", flush=True)
+                                if hasattr(layer0.forward, "__name__"):
+                                    # print(f"[ExpertDist-Worker PID {os.getpid()}] Layer 0 forward name: {layer0.forward.__name__}", flush=True)
+                                    pass
+                        except Exception as e:
+                            logger.debug(
+                                f"[ExpertDist-Worker PID {os.getpid()}] Failed to inspect model layers: {e}"
+                            )
+
+                        # We can use self._get_expert_location_metadata() now since we patched it into the class
+                        metadata = self._get_expert_location_metadata()
+
+                        if metadata:
+                            from expert_distribution_recorder import (
+                                ExpertDistributionRecorder,
+                                set_global_expert_distribution_recorder,
+                            )
+                            import torch
+
+                            rank = (
+                                torch.distributed.get_rank()
+                                if torch.distributed.is_initialized()
+                                else 0
+                            )
+
+                            # Default to per_pass mode (most common and graph-compatible)
+                            # print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default PER_PASS recorder for CUDAGraph capture", flush=True)
+                            recorder = ExpertDistributionRecorder.init_new(
+                                recording_mode="per_pass",
+                                expert_location_metadata=metadata,
+                                rank=rank,
+                                device=str(self.device),
+                            )
+
+                            self.expert_distribution_recorder = recorder
+                            set_global_expert_distribution_recorder(recorder)
+
+                            # CRITICAL: Start recording immediately so it's active during CUDAGraph capture
+                            recorder.start_record()
+
+                            # print(f"[ExpertDist-Worker PID {os.getpid()}] Recorder initialized, started, and set globally.", flush=True)
+                        else:
+                            logger.debug(
+                                f"[ExpertDist-Worker PID {os.getpid()}] Metadata is None"
+                            )
+                    except Exception as e:
+                        import os
+
+                        logger.error(
+                            f"[ExpertDist-Worker PID {os.getpid()}] CRITICAL: Failed to auto-initialize recorder in load_model: {e}"
+                        )
+                        import traceback
+
+                        logger.error(traceback.format_exc())
+                        # Re-raise exception to ensure we don't proceed with broken state
+                        raise e
+
+                GPUModelRunner._get_expert_location_metadata = (
+                    _get_expert_location_metadata
+                )
+                GPUModelRunner.configure_expert_distribution_recording = (
+                    configure_expert_distribution_recording
+                )
+                GPUModelRunner.start_expert_distribution_recording = (
+                    start_expert_distribution_recording
+                )
+                GPUModelRunner.stop_expert_distribution_recording = (
+                    stop_expert_distribution_recording
+                )
+                GPUModelRunner.dump_expert_distribution_record = (
+                    dump_expert_distribution_record
+                )
                 GPUModelRunner.check_expert_buffer = check_expert_buffer
-                
+
                 # Patch load_model
                 original_load_model = GPUModelRunner.load_model
                 GPUModelRunner.load_model = patched_load_model
-                
+
                 # Patch execute_model for Cuda Graph support
                 _patch_execute_model(GPUModelRunner)
 
                 # print("Successfully monkey-patched GPUModelRunner with expert distribution methods")
 
             except ImportError as e:
-                print(f"Could not monkey-patch GPUModelRunner: {e}")
+                logger.debug(f"Could not monkey-patch GPUModelRunner: {e}")
 
         except ImportError as e:
-            print(f"vLLM not available: {e}")
+            logger.debug(f"vLLM not available: {e}")
 
     except ImportError as e:
-        print(f"vLLM not available: {e}")
+        logger.debug(f"vLLM not available: {e}")
 
     # Patch FusedMoE.select_experts and SharedFusedMoE.select_experts in main process
     # Note: Worker processes will patch these again during initialization
     try:
         from vllm.model_executor.layers.fused_moe import FusedMoE
-        if not hasattr(FusedMoE.select_experts, '_expert_dist_patched_main'):
+
+        if not hasattr(FusedMoE.select_experts, "_expert_dist_patched_main"):
             original_select_experts = FusedMoE.select_experts
             patched_func = _create_select_experts_patcher(original_select_experts)
             FusedMoE.select_experts = staticmethod(patched_func)
@@ -1067,10 +1431,15 @@ def apply_vllm_monkey_patching():
 
     # Also patch SharedFusedMoE.select_experts
     try:
-        from vllm.model_executor.layers.shared_fused_moe.shared_fused_moe import SharedFusedMoE
-        if not hasattr(SharedFusedMoE.select_experts, '_expert_dist_patched_main'):
+        from vllm.model_executor.layers.shared_fused_moe.shared_fused_moe import (
+            SharedFusedMoE,
+        )
+
+        if not hasattr(SharedFusedMoE.select_experts, "_expert_dist_patched_main"):
             original_shared_select_experts = SharedFusedMoE.select_experts
-            patched_func = _create_select_experts_patcher(original_shared_select_experts)
+            patched_func = _create_select_experts_patcher(
+                original_shared_select_experts
+            )
             SharedFusedMoE.select_experts = staticmethod(patched_func)
             SharedFusedMoE.select_experts._expert_dist_patched_main = True
     except Exception:
@@ -1087,64 +1456,91 @@ def _patch_api_server():
         from vllm.entrypoints.openai import api_server
         from fastapi import Response
         from vllm.engine.async_llm_engine import AsyncLLMEngine
-        
+
         # 1. Add methods to AsyncLLMEngine to support expert distribution RPCs
         if not hasattr(AsyncLLMEngine, "start_expert_distribution_record"):
+
             async def start_expert_distribution_record(self, mode="per_pass"):
                 # Calls configure_expert_distribution_recording on workers
                 # We use configure because it handles init + start
                 return await self.engine.model_executor.collective_rpc(
-                    "configure_expert_distribution_recording", 
-                    args=(mode, True, -1)
+                    "configure_expert_distribution_recording", args=(mode, True, -1)
                 )
-            AsyncLLMEngine.start_expert_distribution_record = start_expert_distribution_record
+
+            AsyncLLMEngine.start_expert_distribution_record = (
+                start_expert_distribution_record
+            )
 
         if not hasattr(AsyncLLMEngine, "stop_expert_distribution_record"):
+
             async def stop_expert_distribution_record(self):
-                return await self.engine.model_executor.collective_rpc("stop_expert_distribution_recording")
-            AsyncLLMEngine.stop_expert_distribution_record = stop_expert_distribution_record
-            
+                return await self.engine.model_executor.collective_rpc(
+                    "stop_expert_distribution_recording"
+                )
+
+            AsyncLLMEngine.stop_expert_distribution_record = (
+                stop_expert_distribution_record
+            )
+
         if not hasattr(AsyncLLMEngine, "dump_expert_distribution_record"):
+
             async def dump_expert_distribution_record(self):
                 # We probably want to dump to a specific path derived from model path or config
                 # For now, let the worker decide the path or use default
-                return await self.engine.model_executor.collective_rpc("dump_expert_distribution_record")
-            AsyncLLMEngine.dump_expert_distribution_record = dump_expert_distribution_record
+                return await self.engine.model_executor.collective_rpc(
+                    "dump_expert_distribution_record"
+                )
+
+            AsyncLLMEngine.dump_expert_distribution_record = (
+                dump_expert_distribution_record
+            )
 
         # 2. Register routes on the FastAPI app
         # Note: api_server.app is the FastAPI instance
         app = api_server.app
-        
+
         # Define route handlers
         @app.post("/start_expert_distribution")
         async def api_start_record(mode: str = "per_pass"):
             # Get engine from app state or global
-            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            engine = (
+                app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            )
             if engine and hasattr(engine, "start_expert_distribution_record"):
                 await engine.start_expert_distribution_record(mode)
                 return {"status": "started", "mode": mode}
-            return Response(content="Engine not ready or patching failed", status_code=500)
+            return Response(
+                content="Engine not ready or patching failed", status_code=500
+            )
 
         @app.post("/stop_expert_distribution")
         async def api_stop_record():
-            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            engine = (
+                app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            )
             if engine and hasattr(engine, "stop_expert_distribution_record"):
                 await engine.stop_expert_distribution_record()
                 return {"status": "stopped"}
-            return Response(content="Engine not ready or patching failed", status_code=500)
+            return Response(
+                content="Engine not ready or patching failed", status_code=500
+            )
 
         @app.post("/dump_expert_distribution")
         async def api_dump_record():
-            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            engine = (
+                app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            )
             if engine and hasattr(engine, "dump_expert_distribution_record"):
                 result = await engine.dump_expert_distribution_record()
                 return {"status": "dumped", "result": result}
-            return Response(content="Engine not ready or patching failed", status_code=500)
-            
-        print(f"[ExpertDist] API server endpoints patched successfully.", flush=True)
-            
+            return Response(
+                content="Engine not ready or patching failed", status_code=500
+            )
+
+        # print(f"[ExpertDist] API server endpoints patched successfully.", flush=True)
+
     except ImportError:
         # API server modules might not be available in worker process
         pass
     except Exception as e:
-        print(f"[ExpertDist] Warning: Failed to patch API server: {e}", flush=True)
+        logger.debug(f"[ExpertDist] Warning: Failed to patch API server: {e}")
