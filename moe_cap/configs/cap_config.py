@@ -6,24 +6,27 @@ from typing import List, Optional
 class CAPConfig:
     """
     Configuration for a single evaluation run.
-    
+
     Attributes:
         dataset_names: The names of the datasets to load (e.g "gsm8k", "nq").
         metrics: A list of metrics to compute (e.g ["em", "f1"]).
-        dataset_subset: Optional: for datasets with multiple subsets 
+        dataset_subset: Optional: for datasets with multiple subsets
                         (e.g "main" for gsm8k, or a specific Longbench task).
         dataset_split: The split to use (e.g "test", "validation").
         fixed_length_mode: Enable fixed-length benchmarking (no accuracy eval).
         target_input_tokens: Fixed input length for performance benchmarking.
         target_output_tokens: Fixed output length for performance benchmarking.
-        num_samples: Number of samples for fixed-length benchmarking.
+        num_samples: Number of samples to use. In fixed-length mode, controls how many
+                     synthetic prompts to generate. In regular mode, takes the first N
+                     samples from the dataset (deterministic).
     """
+
     dataset_names: List[str]
     metrics: List[str]
     model_id: str
     precision: str = "bfloat16"
     dataset_subset: Optional[str] = None
-    dataset_split: str = "test" # Default
+    dataset_split: str = "test"  # Default
     # Fixed-length benchmarking settings
     fixed_length_mode: bool = False  # Enable fixed-length mode
     target_input_tokens: Optional[int] = None
