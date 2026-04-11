@@ -371,259 +371,58 @@ def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
 # ============================================================================
 # Custom execute_model implementation
 # ============================================================================
+# Save original execute_model before patching
+_original_execute_model = GPUModelRunner.execute_model
+
+
 @torch.inference_mode()
 def execute_model_custom(
     self,
     scheduler_output: "SchedulerOutput",
     intermediate_tensors: Optional[IntermediateTensors] = None,
 ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-    """Custom execute_model with latency tracking."""
-
-    # Lazy initialization of recording state on workers
-    if not expert_distribution_recording_state.checked_auto_start:
-        if os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE):
-            expert_distribution_recording_state.enable()
-        expert_distribution_recording_state.checked_auto_start = True
-
-    # Ensure model path is set if recording is enabled
-    if (
-        expert_distribution_recording_state.enabled
-        and not expert_distribution_recording_state.model_path
-    ):
-        if hasattr(self, "model_config") and hasattr(self.model_config, "model"):
-            expert_distribution_recording_state.set_model_path(self.model_config.model)
+    """Wrapper around original execute_model that adds timing and expert recording."""
 
     world_size = self.vllm_config.parallel_config.world_size
     gpu_raw_type = GLOBAL_GPU_TYPE
 
-    # Lazy initialization of recording state on workers
+    # Auto-start expert distribution recording if flag file exists
     if not expert_distribution_recording_state.checked_auto_start:
         if os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE):
             expert_distribution_recording_state.enable()
         expert_distribution_recording_state.checked_auto_start = True
 
-    # Ensure model path is set if recording is enabled
     if (
         expert_distribution_recording_state.enabled
         and not expert_distribution_recording_state.model_path
     ):
         if hasattr(self, "model_config") and hasattr(self.model_config, "model"):
             expert_distribution_recording_state.set_model_path(self.model_config.model)
-    with record_function_or_nullcontext("Preprocess"):
-        with self.synchronize_input_prep():
-            # Update persistent batch states.
-            self._update_states(scheduler_output)
-            if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-            if self.cache_config.kv_sharing_fast_prefill:
-                assert not self.input_batch.num_prompt_logprobs, (
-                    "--kv-sharing-fast-prefill produces incorrect "
-                    "logprobs for prompt tokens, tokens, please disable "
-                    "it when the requests need prompt logprobs"
-                )
-            # Prepare the decoder inputs.
-            (
-                attn_metadata,
-                logits_indices,
-                spec_decode_metadata,
-                num_scheduled_tokens_np,
-                spec_decode_common_attn_metadata,
-                max_query_len,
-                ubatch_slices,
-                num_tokens_after_padding,
-            ) = self._prepare_inputs(scheduler_output)
-        (
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
-            input_ids,
-            inputs_embeds,
-            positions,
-            intermediate_tensors,
-            model_kwargs,
-        ) = self._preprocess(
-            scheduler_output,
-            intermediate_tensors,
-            ubatch_slices,
-            num_tokens_after_padding,
-        )
-        uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-            num_scheduled_tokens == self.input_batch.num_reqs * max_query_len
-        )
-        batch_descriptor = BatchDescriptor(
-            num_tokens=num_input_tokens, uniform_decode=uniform_decode
-        )
-        cudagraph_runtime_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
-            batch_descriptor
-        )
-
-    if ubatch_slices is not None:
-        num_input_tokens = ubatch_slices[0].num_tokens
 
     # ======== START TIMING ========
     torch.cuda.synchronize()
     start_time = time.perf_counter()
 
-    # Run the model
-    with (
-        set_forward_context(
-            attn_metadata,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            batch_descriptor=batch_descriptor,
-            ubatch_slices=ubatch_slices,
-        ),
-        record_function_or_nullcontext("Forward"),
-        self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-    ):
-        model_output = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
-
-    with record_function_or_nullcontext("Postprocess"):
-        if self.use_aux_hidden_state_outputs:
-            hidden_states, aux_hidden_states = model_output
-        else:
-            hidden_states = model_output
-            aux_hidden_states = None
-        if not self.broadcast_pp_output:
-            if not get_pp_group().is_last_rank:
-                assert isinstance(hidden_states, IntermediateTensors)
-                hidden_states.kv_connector_output = kv_connector_output
-                return hidden_states
-            if self.is_pooling_model:
-                output = self._pool(
-                    hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
-                )
-                output.kv_connector_output = kv_connector_output
-                return output
-            sample_hidden_states = hidden_states[logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
-        else:
-            assert not self.is_pooling_model
-            if not get_pp_group().is_last_rank:
-                all_gather_tensors = {
-                    "residual": not is_residual_scattered_for_sp(
-                        self.vllm_config, num_input_tokens
-                    )
-                }
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors,
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
-                )
-                logits = None
-            else:
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            model_output_broadcast_data = {}
-            if logits is not None:
-                model_output_broadcast_data["logits"] = logits.contiguous()
-            model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
-                model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-            )
-            assert model_output_broadcast_data is not None
-            logits = model_output_broadcast_data["logits"]
-
-        if scheduler_output.grammar_bitmask is not None:
-            apply_grammar_bitmask(
-                scheduler_output, self.input_batch, logits, self.device
-            )
-
-    with record_function_or_nullcontext("Sample"):
-        sampler_output = self._sample(logits, spec_decode_metadata)
-
-    def propose_draft_token_ids(sampled_token_ids):
-        assert spec_decode_common_attn_metadata is not None
-        with record_function_or_nullcontext("Draft"):
-            self._draft_token_ids = self.propose_draft_token_ids(
-                scheduler_output,
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                hidden_states,
-                sample_hidden_states,
-                aux_hidden_states,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-            )
-
-    use_padded_batch_for_eagle = (
-        self.speculative_config
-        and self.speculative_config.use_eagle()
-        and not self.speculative_config.disable_padded_drafter_batch
-    )
-    effective_drafter_max_model_len = self.max_model_len
-    if effective_drafter_max_model_len is None:
-        effective_drafter_max_model_len = self.model_config.max_model_len
-    if (
-        self.speculative_config
-        and self.speculative_config.draft_model_config is not None
-        and self.speculative_config.draft_model_config.max_model_len is not None
-    ):
-        effective_drafter_max_model_len = (
-            self.speculative_config.draft_model_config.max_model_len
-        )
-    input_fits_in_drafter = spec_decode_common_attn_metadata and (
-        spec_decode_common_attn_metadata.seq_lens.max()
-        + self.speculative_config.num_speculative_tokens
-        <= effective_drafter_max_model_len
-    )
-    if use_padded_batch_for_eagle and input_fits_in_drafter:
-        propose_draft_token_ids(sampler_output.sampled_token_ids)
-
-    with record_function_or_nullcontext("Bookkeep"):
-        (
-            num_nans_in_logits,
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        ) = self._bookkeeping_sync(
-            scheduler_output,
-            sampler_output,
-            logits,
-            hidden_states,
-            num_scheduled_tokens,
-        )
-
-    if (
-        self.speculative_config
-        and not use_padded_batch_for_eagle
-        and input_fits_in_drafter
-    ):
-        propose_draft_token_ids(valid_sampled_token_ids)
-
-    with record_function_or_nullcontext("EPLB"):
-        self.eplb_step()
-
-    output = ModelRunnerOutput(
-        req_ids=req_ids_output_copy,
-        req_id_to_index=req_id_to_index_output_copy,
-        sampled_token_ids=valid_sampled_token_ids,
-        logprobs=logprobs_lists,
-        prompt_logprobs_dict=prompt_logprobs_dict,
-        pooler_output=[],
-        kv_connector_output=kv_connector_output,
-        num_nans_in_logits=num_nans_in_logits,
-    )
+    # Call original execute_model
+    result = _original_execute_model(self, scheduler_output, intermediate_tensors)
 
     # ======== END TIMING ========
     torch.cuda.synchronize()
     end_time = time.perf_counter()
     latency = end_time - start_time
-    batch_size = input_ids.size(0)
-    forward_mode = "decode" if uniform_decode else "prefill"
-    sum_seq_len = num_input_tokens
+
+    # Determine batch info from scheduler_output and input_batch
+    num_reqs = getattr(getattr(self, "input_batch", None), "num_reqs", 0)
+    batch_size = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+
+    tokens_per_req = []
+    if hasattr(self, "input_batch") and hasattr(self.input_batch, "req_ids"):
+        for rid in self.input_batch.req_ids:
+            tokens_per_req.append(scheduler_output.num_scheduled_tokens.get(rid, 1))
+    is_decode = num_reqs > 0 and all(t == 1 for t in tokens_per_req)
+    forward_mode = "decode" if is_decode else "prefill"
+    sum_seq_len = batch_size
+
     per_req_info = []
     if forward_mode == "prefill":
         per_req_info = _build_prefill_per_req_info_vllm(scheduler_output)
@@ -639,44 +438,28 @@ def execute_model_custom(
     expert_utilization = 0
     if not _PROFILING_ONLY:
         try:
-            # Try to get expert distribution data from the model runner
             if (
                 hasattr(self, "expert_distribution_recorder")
                 and self.expert_distribution_recorder is not None
             ):
                 recorder = self.expert_distribution_recorder
-                # Check if recording is active
                 if hasattr(recorder, "_recording") and recorder._recording:
-                    # CRITICAL: Use per_pass collection logic (collect -> reset -> append)
-                    # This is what allows it to work with CUDAGraph (where forward hooks don't run CPU code)
-
-                    # 1. Collect data from gatherer (syncs if needed)
                     if hasattr(recorder, "_gatherer"):
                         collected_data = recorder._gatherer.collect()
-                        # Inject forward_mode into collected data so it's available for dump/accumulation
                         collected_data["forward_mode"] = forward_mode
                         recorder._gatherer.reset()
 
-                        # 2. Append to accumulator with current pass ID
                         if hasattr(recorder, "_accumulator"):
                             recorder._accumulator.append(
                                 forward_pass_id, collected_data
                             )
 
-                        # 3. Calculate metric for logging from the collected data
-                        # collected_data['expert_count'] is [num_layers, num_experts]
-                        # Note: The key is 'expert_count' (singular) in the recorder implementation
                         if "expert_count" in collected_data:
                             counts = collected_data["expert_count"]
                             if counts is not None:
-                                # Average activated experts per layer
-                                # (counts > 0).float() -> [num_layers, num_experts]
-                                # .sum(dim=1) -> [num_layers]
-                                # .mean() -> scalar
                                 active = (counts > 0).float().sum(dim=1).mean().item()
                                 expert_activation = active
 
-                        # Calculate utilization
                         if expert_activation > 0 and hasattr(
                             recorder, "_expert_location_metadata"
                         ):
@@ -687,26 +470,17 @@ def execute_model_custom(
                                 expert_utilization = expert_activation / num_experts
 
         except Exception as e:
-            # Don't fail if expert recording is not available or fails
             logger.debug(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}")
             logger.debug(f"Could not collect expert distribution data: {e}")
 
-    # Record batch statistics if recording is enabled (file-based check for multiprocessing)
+    # Record batch statistics if recording is enabled
     if recording_state.is_recording():
-        # Use attn_metadata for seq_lens_sum if available (gives full context length)
-        if hasattr(attn_metadata, "seq_lens"):
-            if isinstance(attn_metadata.seq_lens, torch.Tensor):
-                sum_seq_len = attn_metadata.seq_lens.sum().item()
-            elif isinstance(attn_metadata.seq_lens, list):
-                sum_seq_len = sum(attn_metadata.seq_lens)
-
         rec_dict = {
             "batch_size": batch_size,
             "latency": latency,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
             "expert_activation": expert_activation,
-            # "expert_utilization": round(expert_utilization, 4),
             "gpu_num": world_size,
             "gpu_raw_type": gpu_raw_type,
         }
@@ -715,7 +489,6 @@ def execute_model_custom(
         recording_state.add_record(rec_dict)
 
     # Automatic expert distribution recording
-    # Only record on rank 0 to avoid duplicates
     if expert_distribution_recording_state.enabled:
         try:
             from vllm.distributed.parallel_state import get_tp_group
@@ -723,14 +496,7 @@ def execute_model_custom(
             tp_group = get_tp_group()
             tp_rank = tp_group.rank if tp_group is not None else 0
 
-            if tp_rank == 0:  # Only record on rank 0 (like sglang.py)
-                # Recalculate seq_lens_sum for this record as well
-                if hasattr(attn_metadata, "seq_lens"):
-                    if isinstance(attn_metadata.seq_lens, torch.Tensor):
-                        sum_seq_len = attn_metadata.seq_lens.sum().item()
-                    elif isinstance(attn_metadata.seq_lens, list):
-                        sum_seq_len = sum(attn_metadata.seq_lens)
-
+            if tp_rank == 0:
                 record_dict = {
                     "forward_pass_id": forward_pass_id,
                     "batch_size": batch_size,
@@ -738,7 +504,6 @@ def execute_model_custom(
                     "seq_lens_sum": sum_seq_len,
                     "forward_mode": forward_mode,
                     "expert_activation": expert_activation,
-                    # "expert_utilization": round(expert_utilization, 4)
                     "gpu_num": world_size,
                     "gpu_raw_type": gpu_raw_type,
                 }
@@ -751,14 +516,8 @@ def execute_model_custom(
         except Exception as e:
             logger.debug(f"Could not record expert distribution automatically: {e}")
 
-    if not self.use_async_scheduling:
-        return output
-    return AsyncGPUModelRunnerOutput(
-        model_runner_output=output,
-        sampled_token_ids=sampler_output.sampled_token_ids,
-        invalid_req_indices=invalid_req_indices,
-        async_output_copy_stream=self.async_output_copy_stream,
-    )
+    assert result is not None
+    return result
 
 
 # ============================================================================
