@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional, Literal
+from typing import List, Dict, Any, Tuple, Optional, Literal, cast
 from dataclasses import dataclass, field
 from enum import Enum
 from tqdm.asyncio import tqdm as async_tqdm
@@ -157,11 +157,11 @@ class OpenAIAPIMoEProfiler:
     def __init__(
         self,
         config: CAPConfig,
-        output_dir: str = None,
-        api_url: str = None,
+        output_dir: Optional[str] = None,
+        api_url: Optional[str] = None,
         backend: str = "auto",
-        ignore_eos: bool = None,
-        server_batch_size: int = None,
+        ignore_eos: Optional[bool] = None,
+        server_batch_size: Optional[int] = None,
         profiling_only: bool = False,
     ):
         """Initialize profiler from a CAPConfig object.
@@ -180,6 +180,8 @@ class OpenAIAPIMoEProfiler:
         self.profiling_only = profiling_only or config.profiling_only
         # store config
         self.config = config
+        if api_url is None:
+            raise ValueError("api_url must be provided")
         self.api_url = api_url
 
         # Extract base URL for control endpoints
@@ -295,6 +297,7 @@ class OpenAIAPIMoEProfiler:
 
     def _load_data_for_task(self, task_name: str):
         """Load data for a single task name using the modern data loader APIs."""
+        loader: Any
         try:
             loader, max_new_tokens = get_loader_for_task(task_name, self.config)
         except KeyError:
@@ -444,7 +447,7 @@ class OpenAIAPIMoEProfiler:
         results: List[RequestFuncOutput],
         prompt_lengths: List[int],
         batch_size: int = 1,
-        server_records: List[dict] = None,
+        server_records: Optional[List[dict]] = None,
     ):
         """Calculate metrics from profiling results.
 
@@ -594,7 +597,7 @@ class OpenAIAPIMoEProfiler:
             return results, total_time
 
         # Batched execution with 50% overlap
-        all_results = [None] * len(prompts)
+        all_results: List[Optional[RequestFuncOutput]] = [None] * len(prompts)
         pbar = async_tqdm(total=len(prompts), desc="Processing requests")
 
         torch.cuda.synchronize()
@@ -659,7 +662,7 @@ class OpenAIAPIMoEProfiler:
         total_time = time.perf_counter() - start_time
         pbar.close()
 
-        return all_results, total_time
+        return cast(List[RequestFuncOutput], all_results), total_time
 
     async def run_async(self):
         """Run profiling for all configured datasets."""
@@ -675,6 +678,7 @@ class OpenAIAPIMoEProfiler:
 
             # Get ground truth targets for evaluation
             try:
+                loader: Any
                 loader, _ = get_loader_for_task(dataset_name, self.config)
                 ground_truth = loader.get_target()
             except Exception as e:
@@ -703,7 +707,7 @@ class OpenAIAPIMoEProfiler:
                 print(f"Detected num_gpus from records: {num_gpus}")
 
             # Calculate metrics
-            res_dict = self.get_metrics(
+            res_dict: Dict[str, Any] = self.get_metrics(
                 results,
                 prompt_lengths,
                 batch_size=self.server_batch_size or 1,
@@ -732,6 +736,62 @@ class OpenAIAPIMoEProfiler:
                     print(f"Accuracy for {dataset_name}: {summary}")
                 except Exception as e:
                     print(f"Warning: Could not compute accuracy metrics: {e}")
+
+            # Arena-Hard: run LLM-as-a-judge evaluation if configured
+            if dataset_name.lower() == "arena-hard" and self.config.judge_api_url:
+                try:
+                    from moe_cap.utils.arena_hard_judge import (
+                        evaluate_arena_hard,
+                        load_baseline_answers,
+                    )
+
+                    predictions = [r.generated_text for r in results if r.success]
+                    questions = all_input_raw[: len(predictions)]
+
+                    # Load baseline answers
+                    if self.config.baseline_answers_path:
+                        baseline_dict = load_baseline_answers(
+                            self.config.baseline_answers_path
+                        )
+                        # Match by index (assume same order)
+                        baseline_answers = list(baseline_dict.values())[
+                            : len(predictions)
+                        ]
+                    else:
+                        print(
+                            "Warning: No baseline_answers_path configured for Arena-Hard judge evaluation"
+                        )
+                        baseline_answers = None
+
+                    if baseline_answers and len(baseline_answers) >= len(predictions):
+                        # Build judge API URL with auth
+                        judge_api_url = self.config.judge_api_url
+                        judge_model = self.config.judge_model or "gpt-4.1"
+                        api_key = self.config.judge_api_key or os.environ.get(
+                            "OPENAI_API_KEY"
+                        )
+
+                        arena_metrics = await evaluate_arena_hard(
+                            questions=questions,
+                            model_answers=predictions,
+                            baseline_answers=baseline_answers[: len(predictions)],
+                            judge_api_url=judge_api_url,
+                            judge_model=judge_model,
+                            api_key=api_key,
+                        )
+                        res_dict.update(arena_metrics)
+                        print(
+                            f"Arena-Hard win rate: {arena_metrics['arena_hard_win_rate']}%"
+                        )
+                    else:
+                        print(
+                            "Warning: Not enough baseline answers for Arena-Hard evaluation"
+                        )
+                except Exception as e:
+                    print(f"Warning: Arena-Hard judge evaluation failed: {e}")
+                    import traceback
+
+                    traceback.print_exc()
 
             # Auto-detect GPU type and number from hardware_utils
             gpu_raw_type = res_dict.get("gpu_raw_type", None)
@@ -1049,6 +1109,30 @@ Examples:
         help="Profiling-only mode: skip expert distribution recording, only collect "
         "TTFT/TPOT/throughput. Server must be started with MOE_CAP_PROFILING_ONLY=1.",
     )
+    parser.add_argument(
+        "--judge-api-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible chat API URL for Arena-Hard judge (e.g. https://api.openai.com/v1/chat/completions)",
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help="Judge model name (default: gpt-4.1)",
+    )
+    parser.add_argument(
+        "--judge-api-key",
+        type=str,
+        default=None,
+        help="API key for judge model (default: OPENAI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--baseline-answers-path",
+        type=str,
+        default=None,
+        help="Path to baseline model answers JSONL for Arena-Hard evaluation",
+    )
     args = parser.parse_args()
 
     # Handle ignore_eos logic
@@ -1103,6 +1187,14 @@ Examples:
         merged["num_samples"] = args.num_samples
     if args.profiling_only is not None:
         merged["profiling_only"] = args.profiling_only
+    if args.judge_api_url is not None:
+        merged["judge_api_url"] = args.judge_api_url
+    if args.judge_model is not None:
+        merged["judge_model"] = args.judge_model
+    if args.judge_api_key is not None:
+        merged["judge_api_key"] = args.judge_api_key
+    if args.baseline_answers_path is not None:
+        merged["baseline_answers_path"] = args.baseline_answers_path
 
     # Validate required fields
     if not merged.get("model_id"):
@@ -1126,10 +1218,12 @@ Examples:
         )
 
     # Build CAPConfig and pass it to the profiler
+    dataset_names = cast(List[str], merged.get("dataset_names"))
+    model_id = cast(str, merged.get("model_id"))
     cap_cfg = CAPConfig(
-        dataset_names=merged.get("dataset_names"),
+        dataset_names=dataset_names,
         metrics=merged.get("metrics", []),
-        model_id=merged.get("model_id"),
+        model_id=model_id,
         precision=merged.get("precision", "bfloat16"),
         dataset_subset=merged.get("dataset_subset"),
         dataset_split=merged.get("dataset_split", "test"),
@@ -1138,6 +1232,10 @@ Examples:
         target_output_tokens=merged.get("target_output_tokens"),
         num_samples=merged.get("num_samples"),
         profiling_only=merged.get("profiling_only", False),
+        judge_api_url=merged.get("judge_api_url"),
+        judge_model=merged.get("judge_model", "gpt-4.1"),
+        judge_api_key=merged.get("judge_api_key"),
+        baseline_answers_path=merged.get("baseline_answers_path"),
     )
 
     profiler = OpenAIAPIMoEProfiler(

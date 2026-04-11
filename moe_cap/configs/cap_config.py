@@ -35,3 +35,10 @@ class CAPConfig:
     # Profiling-only mode: skip expert distribution recording, only collect
     # TTFT / TPOT / throughput metrics from forward-pass timing.
     profiling_only: bool = False
+    # Arena-Hard judge settings
+    judge_api_url: Optional[str] = None  # OpenAI-compatible chat API for judge model
+    judge_model: str = "gpt-4.1"  # Judge model name
+    judge_api_key: Optional[str] = (
+        None  # API key for judge (can also use OPENAI_API_KEY env var)
+    )
+    baseline_answers_path: Optional[str] = None  # Path to baseline model answers JSONL
