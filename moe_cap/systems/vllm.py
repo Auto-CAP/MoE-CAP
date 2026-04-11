@@ -1838,9 +1838,9 @@ def main():
 
     original_build_app = api_server.build_app
 
-    def patched_build_app(args):
+    def patched_build_app(args, *extra_args, **extra_kwargs):
         """Patched build_app that adds custom endpoints."""
-        app = original_build_app(args)
+        app = original_build_app(args, *extra_args, **extra_kwargs)
 
         # vLLM stores the engine in app.state, but we need to access it correctly
         # The engine is typically set by vLLM's build_app function
@@ -1855,11 +1855,13 @@ def main():
 
     api_server.build_app = patched_build_app
 
-    if args.headless or args.api_server_count < 1:
+    if args.headless or (
+        args.api_server_count is not None and args.api_server_count < 1
+    ):
         from vllm.entrypoints.openai.serve import run_headless
 
         run_headless(args)
-    elif args.api_server_count > 1:
+    elif args.api_server_count is not None and args.api_server_count > 1:
         from vllm.entrypoints.openai.serve import run_multi_api_server
 
         run_multi_api_server(args)

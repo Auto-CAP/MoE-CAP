@@ -893,6 +893,11 @@ class OpenAIAPIMoEProfiler:
             if accuracy_section:
                 metrics_dict["quality"] = accuracy_section
 
+            # Arena-Hard judge results
+            arena_keys = [k for k in res_dict if k.startswith("arena_hard_")]
+            if arena_keys:
+                metrics_dict["arena_hard_judge"] = {k: res_dict[k] for k in arena_keys}
+
             metrics_path = os.path.join(
                 dest_dir, f"metrics_{dataset_name}_{timestamp}.json"
             )
