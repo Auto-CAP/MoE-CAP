@@ -3,17 +3,18 @@ from moe_cap.configs.cap_config import CAPConfig
 from datasets import load_dataset
 from typing import List, Dict, Any
 
+
 class LongBenchV2Loader(DataLoader):
     """
     Loads and processes tasks from the 'THUDM/LongBench-v2' benchmark.
-    
+
     It loads the entire dataset and optionally filters it
     if 'config.dataset_subset' is provided, using it to
     filter the 'sub_domain' column.
-    
+
     It formats the multiple-choice prompt from
     'choice_A', 'choice_B', 'choice_C', and 'choice_D'.
-    
+
     Note: LongBench v2 only has a 'train' split, not 'test'.
     """
 
@@ -22,26 +23,29 @@ class LongBenchV2Loader(DataLoader):
         # LongBench v2 only has 'train' split, override config if 'test' was specified
         split = config.dataset_split
         if split == "test":
-            print("Warning: LongBench v2 does not have a 'test' split. Using 'train' split instead.")
+            print(
+                "Warning: LongBench v2 does not have a 'test' split. Using 'train' split instead."
+            )
             split = "train"
         try:
-            dataset = load_dataset(
-                "THUDM/LongBench-v2", 
-                split=split
-            )
+            dataset = load_dataset("THUDM/LongBench-v2", split=split)
         except Exception as e:
             print(f"Failed to load 'THUDM/LongBench-v2'.")
             print("Please ensure you have an internet connection.")
             raise e
-        
+
         #  use 'dataset_subset' to FILTER the loaded data
         if config.dataset_subset:
-            print(f"Filtering LongBench v2 for subset (sub_domain): {config.dataset_subset}")
+            print(
+                f"Filtering LongBench v2 for subset (sub_domain): {config.dataset_subset}"
+            )
             self.dataset = dataset.filter(
-                lambda x: x['sub_domain'] == config.dataset_subset
+                lambda x: x["sub_domain"] == config.dataset_subset
             )
             if len(self.dataset) == 0:
-                print(f"Warning: No data found for sub_domain '{config.dataset_subset}'.")
+                print(
+                    f"Warning: No data found for sub_domain '{config.dataset_subset}'."
+                )
         else:
             self.dataset = dataset
 
@@ -52,11 +56,10 @@ class LongBenchV2Loader(DataLoader):
         Formats the input into a prompt for the LLM.
         This function is updated to use the correct column names.
         """
-        
+
         def format_prompt(example: Dict[str, Any]) -> Dict[str, str]:
-            context = example['context']
-            question = example['question']
-            
+            context = example["context"]
+            question = example["question"]
 
             # pull choice columns
             options = (
@@ -65,15 +68,15 @@ class LongBenchV2Loader(DataLoader):
                 f"C. {example['choice_C']}\n"
                 f"D. {example['choice_D']}"
             )
-            
+
             # prompt template for multiple-choice QA
+            # Uses the official LongBench v2 answer format for reliable extraction
             prompt = (
-                "Please read the following document and answer the multiple-choice question. "
-                "Your answer should be the letter of the correct option only.\n\n"
+                "Please read the following document and answer the multiple-choice question.\n\n"
                 f"--- Document ---\n{context}\n\n"
                 f"--- Question ---\n{question}\n\n"
                 f"--- Options ---\n{options}\n\n"
-                "Answer:"
+                'Format your response as follows: "The correct answer is (insert answer here)".'
             )
             return {"formatted_prompt": prompt}
 
