@@ -892,14 +892,11 @@ class OpenAIAPIMoEProfiler:
                 metrics_dict["quality"] = {
                     "acc": res_dict["arena_hard_win_rate"] / 100.0,
                     "total": res_dict.get("arena_hard_total", 0),
-                    "metric": "win_rate",
-                    "judge_model": res_dict.get("arena_hard_judge_model", ""),
                 }
             elif "exact_match" in res_dict:
                 metrics_dict["quality"] = {
                     "acc": res_dict["exact_match"],
                     "total": res_dict.get("total", 0),
-                    "metric": "exact_match",
                 }
 
             metrics_path = os.path.join(
