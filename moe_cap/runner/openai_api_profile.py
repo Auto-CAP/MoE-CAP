@@ -887,16 +887,20 @@ class OpenAIAPIMoEProfiler:
                 },
             }
 
-            # Quality: Accuracy (conditional — only when accuracy measurement is needed)
-            accuracy_keys = ["exact_match", "correct", "total", "no_answer"]
-            accuracy_section = {k: res_dict[k] for k in accuracy_keys if k in res_dict}
-            if accuracy_section:
-                metrics_dict["quality"] = accuracy_section
-
-            # Arena-Hard judge results
-            arena_keys = [k for k in res_dict if k.startswith("arena_hard_")]
-            if arena_keys:
-                metrics_dict["arena_hard_judge"] = {k: res_dict[k] for k in arena_keys}
+            # Quality: unified acc + total
+            if "arena_hard_win_rate" in res_dict:
+                metrics_dict["quality"] = {
+                    "acc": res_dict["arena_hard_win_rate"] / 100.0,
+                    "total": res_dict.get("arena_hard_total", 0),
+                    "metric": "win_rate",
+                    "judge_model": res_dict.get("arena_hard_judge_model", ""),
+                }
+            elif "exact_match" in res_dict:
+                metrics_dict["quality"] = {
+                    "acc": res_dict["exact_match"],
+                    "total": res_dict.get("total", 0),
+                    "metric": "exact_match",
+                }
 
             metrics_path = os.path.join(
                 dest_dir, f"metrics_{dataset_name}_{timestamp}.json"
