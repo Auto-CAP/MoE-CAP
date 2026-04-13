@@ -76,11 +76,9 @@ async def call_judge_api(
     judge_model: str,
     timeout: int = 300,
     api_key: Optional[str] = None,
+    max_retries: int = 5,
 ) -> str:
-    """Call the judge LLM API for a single pairwise comparison.
-
-    Returns the judge's raw text output.
-    """
+    """Call the judge LLM API for a single pairwise comparison with retry."""
     user_prompt = (
         f"<|User Prompt|>\n{question}\n\n"
         f"<|The Start of Assistant A's Answer|>\n{answer_a}\n<|The End of Assistant A's Answer|>\n\n"
@@ -101,17 +99,23 @@ async def call_judge_api(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout)
-    ) as session:
-        async with session.post(
-            judge_api_url,
-            json=payload,
-            headers=headers,
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session:
+                async with session.post(
+                    judge_api_url,
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2**attempt)
 
 
 async def judge_single_question(
