@@ -198,7 +198,25 @@ class RecordingState:
 
 
 recording_state = RecordingState()
-GLOBAL_GPU_TYPE = get_gpu_details()
+GLOBAL_GPU_TYPE = None
+
+
+def _get_gpu_type():
+    global GLOBAL_GPU_TYPE
+    if GLOBAL_GPU_TYPE is not None:
+        return GLOBAL_GPU_TYPE
+    try:
+        GLOBAL_GPU_TYPE = get_gpu_details()
+    except Exception:
+        try:
+            import torch
+
+            name = torch.cuda.get_device_name(0).replace(" ", "-")
+            mem_gb = round(torch.cuda.get_device_properties(0).total_mem / 1024**3)
+            GLOBAL_GPU_TYPE = f"{name}-{mem_gb}GB"
+        except Exception:
+            GLOBAL_GPU_TYPE = None
+    return GLOBAL_GPU_TYPE
 
 
 # ============================================================================
@@ -384,7 +402,7 @@ def execute_model_custom(
     """Wrapper around original execute_model that adds timing and expert recording."""
 
     world_size = self.vllm_config.parallel_config.world_size
-    gpu_raw_type = GLOBAL_GPU_TYPE
+    gpu_raw_type = _get_gpu_type()
 
     # Auto-start expert distribution recording if flag file exists
     if not expert_distribution_recording_state.checked_auto_start:
