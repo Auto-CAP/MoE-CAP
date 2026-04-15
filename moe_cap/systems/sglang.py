@@ -253,7 +253,11 @@ def _to_cpu_list(value):
     return list(value)
 
 
+_prefill_req_counter = 0
+
+
 def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: ServerArgs):
+    global _prefill_req_counter
     req_indices = _to_cpu_list(forward_batch.req_pool_indices) or []
 
     extend_lens = _to_cpu_list(forward_batch.extend_seq_lens_cpu)
@@ -277,11 +281,14 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
         per_req_info.append(
             {
                 "req_pool_idx": int(req_idx),
+                "req_id": f"{int(req_idx)}_{_prefill_req_counter}",
                 "extend_len": int(extend_len),
                 "total_len": int(total_len),
                 "is_last_chunk": is_last_chunk,
             }
         )
+        if is_last_chunk:
+            _prefill_req_counter += 1
 
     return per_req_info
 
