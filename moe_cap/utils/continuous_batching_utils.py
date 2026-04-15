@@ -60,12 +60,14 @@ def _calculate_continuous_metrics(
         req_prefill_accum = {}
 
         for out in output_data:
-            # Skip only if expert_activation is explicitly None or negative
-            # Allow 0 to support non-MoE models or when expert tracking is not yet implemented
             if (
                 out.get("expert_activation") is None
                 or out.get("expert_activation", 0) < 0
             ):
+                continue
+
+            # Skip warmup/health-check probes (tiny prefills from server startup)
+            if out["forward_mode"] == "prefill" and out.get("seq_lens_sum", 0) <= 10:
                 continue
 
             if out["forward_mode"] != "prefill":
@@ -213,12 +215,13 @@ def _calculate_continuous_metrics(
             prefill_smfus.append(prefill_smfu)
     else:
         for out in output_data:
-            # Skip only if expert_activation is explicitly None or negative
-            # Allow 0 to support non-MoE models or when expert tracking is not yet implemented
             if (
                 out.get("expert_activation") is None
                 or out.get("expert_activation", 0) < 0
             ):
+                continue
+
+            if out["forward_mode"] == "prefill" and out.get("seq_lens_sum", 0) <= 10:
                 continue
 
             metrics_data = _process_outputs_continuous(
