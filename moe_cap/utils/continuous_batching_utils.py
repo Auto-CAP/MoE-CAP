@@ -143,7 +143,7 @@ def _calculate_continuous_metrics(
                 prefill_smfus.append(prefill_smfu)
                 continue
 
-            record_latency = out["latency"]
+            record_latency = out["latency"] / len(per_req_info)
             for req_info in per_req_info:
                 req_idx = req_info.get("req_pool_idx", req_info.get("req_id"))
                 if req_idx not in req_prefill_accum:
