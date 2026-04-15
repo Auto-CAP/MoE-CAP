@@ -209,10 +209,25 @@ def _get_gpu_type():
         GLOBAL_GPU_TYPE = get_gpu_details()
     except Exception:
         try:
-            import torch
+            import subprocess
 
-            name = torch.cuda.get_device_name(0).replace(" ", "-")
-            mem_gb = round(torch.cuda.get_device_properties(0).total_mem / 1024**3)
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            line = result.stdout.strip().split("\n")[0]
+            name, mem_mib = line.rsplit(",", 1)
+            name = name.strip().replace(" ", "-")
+            mem_gb = round(float(mem_mib.strip()) / 1024)
+            for part in name.split("-"):
+                if part.endswith("GB") and part[:-2].isdigit():
+                    name = name.replace(f"-{part}", "").replace(part, "")
             GLOBAL_GPU_TYPE = f"{name}-{mem_gb}GB"
         except Exception:
             GLOBAL_GPU_TYPE = None
