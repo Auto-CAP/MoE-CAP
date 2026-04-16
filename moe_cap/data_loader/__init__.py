@@ -6,6 +6,8 @@ from .ruler_loader import RulerLoader
 from .mmlu_pro_loader import MMLUProLoader
 from .fixed_length_loader import FixedLengthLoader
 from .arena_hard_loader import ArenaHardLoader
+from .longbench_v1_loader import LongBenchV1Loader
+
 __all__ = [
     "SimpleDataLoader",
     "GSM8KLoader",
@@ -15,4 +17,5 @@ __all__ = [
     "MMLUProLoader",
     "FixedLengthLoader",
     "ArenaHardLoader",
-    ]
+    "LongBenchV1Loader",
+]

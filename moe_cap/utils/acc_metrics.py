@@ -183,6 +183,19 @@ def compute_exact_match(predictions: List[str], targets: List[str]) -> Dict[str,
     }
 
 
+def compute_f1(prediction: str, target: str) -> float:
+    pred_tokens = prediction.lower().split()
+    target_tokens = target.lower().split()
+    if not pred_tokens or not target_tokens:
+        return 0.0
+    common = set(pred_tokens) & set(target_tokens)
+    if not common:
+        return 0.0
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(target_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
 def compute_accuracy_metrics(
     predictions: List[str],
     targets: List[str],
@@ -219,8 +232,17 @@ def compute_accuracy_metrics(
         ]
     else:
         extracted_predictions = predictions
+    result = compute_exact_match(extracted_predictions, targets)
 
-    return compute_exact_match(extracted_predictions, targets)
+    if dataset_name.lower() in ["longbench_v1"]:
+        f1_scores = []
+        for pred, tgt in zip(predictions, targets):
+            extracted = extract_answer(pred, dataset_name)
+            f1_scores.append(compute_f1(extracted, tgt))
+        result["exact_match"] = sum(f1_scores) / len(f1_scores) if f1_scores else 0
+        result["correct"] = sum(1 for s in f1_scores if s > 0.5)
+
+    return result
 
 
 def format_accuracy_summary(metrics: Dict[str, Any]) -> str:

@@ -10,6 +10,7 @@ dataset and pad/truncate inputs to fixed token lengths for benchmarking.
 from typing import Tuple
 from . import (
     GSM8KLoader,
+    LongBenchV1Loader,
     LongBenchV2Loader,
     NuminaMathLoader,
     MMLUProLoader,
@@ -21,6 +22,7 @@ from . import (
 
 _REGISTRY = {
     "gsm8k": (GSM8KLoader, 16384),  # (Dataloader Class, default_max_new_tokens)
+    "longbench_v1": (LongBenchV1Loader, 512),
     "longbench_v2": (LongBenchV2Loader, 16384),
     "numinamath": (NuminaMathLoader, 16384),
     "mmlu-pro": (MMLUProLoader, 16384),
