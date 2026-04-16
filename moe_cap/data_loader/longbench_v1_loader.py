@@ -83,7 +83,7 @@ class LongBenchV1Loader(DataLoader):
                 "Please read the following context and answer the question.\n\n"
                 f"Context:\n{context}\n\n"
                 f"Question:\n{question}\n\n"
-                "Answer:"
+                "Answer concisely:"
             )
             self.prompts.append(prompt)
             self.targets.append(
