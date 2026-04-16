@@ -130,9 +130,18 @@ def extract_answer(text: str, dataset_name: str) -> str:
             return match.group(1).upper()
         return ""
 
-    # Strip thinking tokens (e.g. gpt-oss "analysis...assistantfinal..." format)
+    # Strip thinking tokens — models may use various formats:
+    # gpt-oss: "analysis...assistantfinal<answer>"
+    # Qwen3: "<think>...</think><answer>"
+    # DeepSeek: "<reasoning>...</reasoning><answer>"
     if "assistantfinal" in text:
         text = text.split("assistantfinal")[-1]
+    elif "</think>" in text:
+        text = text.split("</think>")[-1]
+    elif "</reasoning>" in text:
+        text = text.split("</reasoning>")[-1]
+    elif text.startswith("analysis") and "assistantfinal" not in text:
+        text = ""
 
     text = text.strip()
     if text.lower() in ["unanswerable", "not answerable", "cannot be answered"]:
