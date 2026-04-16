@@ -277,9 +277,18 @@ def load_baseline_answers(path: str) -> Dict[str, str]:
             if not line:
                 continue
             obj = json.loads(line)
-            qid = obj.get("question_id", obj.get("id", ""))
-            # Support official arena-hard format
-            if "choices" in obj:
+            qid = obj.get("question_id", obj.get("uid", obj.get("id", "")))
+            # Official arena-hard format: messages array with role/content
+            if "messages" in obj:
+                for msg in obj["messages"]:
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+                        if isinstance(content, dict):
+                            answers[qid] = content.get("answer", "")
+                        else:
+                            answers[qid] = content
+                        break
+            elif "choices" in obj:
                 turns = obj["choices"][0].get("turns", [])
                 if turns:
                     answers[qid] = turns[0].get("content", "")
