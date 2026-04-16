@@ -308,10 +308,8 @@ class OpenAIAPIMoEProfiler:
 
     def _prepare_inputs(self, all_input_raw, max_new_tokens):
         """Prepare inputs for the model"""
-        system_prompt = "You are an expert problem solver. Provide concise answers."
         chat_prompts = [
             [
-                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": q},
             ]
             for q in all_input_raw
