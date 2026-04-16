@@ -134,7 +134,11 @@ def extract_answer(text: str, dataset_name: str) -> str:
     if "assistantfinal" in text:
         text = text.split("assistantfinal")[-1]
 
-    return text.strip()
+    text = text.strip()
+    if text.lower() in ["unanswerable", "not answerable", "cannot be answered"]:
+        return "None"
+
+    return text
 
 
 def compute_exact_match(predictions: List[str], targets: List[str]) -> Dict[str, Any]:
