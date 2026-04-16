@@ -866,7 +866,9 @@ class OpenAIAPIMoEProfiler:
 
             metrics_dict = {
                 "performance": {
-                    "e2e_s": res_dict.get("e2e_s", round(total_time / num_batches, 2)),
+                    "e2e_s": res_dict.get(
+                        "e2e_s", round(total_time / max(len(prompts), 1), 2)
+                    ),
                     "ttft": res_dict.get("ttft", 0),
                     "tpot": res_dict.get("tpot", 0),
                 },

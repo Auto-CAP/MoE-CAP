@@ -6,21 +6,18 @@ from .base_data_loader import DataLoader
 from moe_cap.configs.cap_config import CAPConfig
 from typing import List
 
-# English-only subsets (exclude _e variants and Chinese subsets)
+# English QA subsets with non-empty input field
+# Excluded: gov_report, multi_news, passage_count, lcc (no question, summarization/code tasks)
 _EN_SUBSETS = [
     "qasper",
     "multifieldqa_en",
     "hotpotqa",
     "2wikimqa",
     "musique",
-    "gov_report",
-    "multi_news",
     "trec",
     "triviaqa",
     "samsum",
-    "passage_count",
     "passage_retrieval_en",
-    "lcc",
     "repobench-p",
     "narrativeqa",
     "qmsum",
