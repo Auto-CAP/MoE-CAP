@@ -61,6 +61,8 @@ class LongBenchV1Loader(DataLoader):
         else:
             subsets = _EN_SUBSETS
 
+        MAX_WORDS = 33000  # ~50K tokens, skip very long samples
+
         all_data = []
         for subset in subsets:
             path = os.path.join(data_dir, f"{subset}.jsonl")
@@ -69,6 +71,8 @@ class LongBenchV1Loader(DataLoader):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     obj = json.loads(line.strip())
+                    if obj.get("length", 0) > MAX_WORDS:
+                        continue
                     all_data.append(obj)
 
         # Fixed seed shuffle for deterministic sampling

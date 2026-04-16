@@ -22,7 +22,7 @@ from . import (
 
 _REGISTRY = {
     "gsm8k": (GSM8KLoader, 16384),  # (Dataloader Class, default_max_new_tokens)
-    "longbench_v1": (LongBenchV1Loader, 8192),
+    "longbench_v1": (LongBenchV1Loader, 16384),
     "longbench_v2": (LongBenchV2Loader, 16384),
     "numinamath": (NuminaMathLoader, 16384),
     "mmlu-pro": (MMLUProLoader, 16384),
