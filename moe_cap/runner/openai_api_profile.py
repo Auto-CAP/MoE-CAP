@@ -810,11 +810,8 @@ class OpenAIAPIMoEProfiler:
                 self.backend_type.value
             )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
-            if self.server_batch_size and self.server_batch_size < len(prompts):
-                num_batches = math.ceil(len(prompts) / self.server_batch_size)
-            else:
-                num_batches = 1  # All requests sent at once
-            res_dict["e2e_s"] = round(total_time / num_batches, 2)
+            num_requests = len(prompts)
+            res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
