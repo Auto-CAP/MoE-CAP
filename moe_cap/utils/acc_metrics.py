@@ -130,6 +130,10 @@ def extract_answer(text: str, dataset_name: str) -> str:
             return match.group(1).upper()
         return ""
 
+    # Strip thinking tokens (e.g. gpt-oss "analysis...assistantfinal..." format)
+    if "assistantfinal" in text:
+        text = text.split("assistantfinal")[-1]
+
     return text.strip()
 
 
