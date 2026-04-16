@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import zipfile
 from .base_data_loader import DataLoader
 from moe_cap.configs.cap_config import CAPConfig
 from typing import List
@@ -28,10 +29,29 @@ _EN_SUBSETS = [
 SEED = 42
 
 
+def _ensure_data_dir() -> str:
+    """Download and extract LongBench v1 data if not present."""
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "longbench_v1", "data")
+    if os.path.exists(cache_dir) and any(
+        f.endswith(".jsonl") for f in os.listdir(cache_dir)
+    ):
+        return cache_dir
+    from huggingface_hub import hf_hub_download
+
+    zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
+    os.makedirs(os.path.dirname(cache_dir), exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(os.path.dirname(cache_dir))
+    extracted = os.path.join(os.path.dirname(cache_dir), "data")
+    if extracted != cache_dir:
+        os.rename(extracted, cache_dir)
+    return cache_dir
+
+
 class LongBenchV1Loader(DataLoader):
     def __init__(self, config: CAPConfig) -> None:
         super().__init__(config)
-        data_dir = os.environ.get("LONGBENCH_V1_DATA_DIR", "/tmp/longbench_v1/data")
+        data_dir = os.environ.get("LONGBENCH_V1_DATA_DIR") or _ensure_data_dir()
 
         self.prompts = []
         self.targets = []
