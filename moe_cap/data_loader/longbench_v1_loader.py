@@ -89,11 +89,16 @@ class LongBenchV1Loader(DataLoader):
                 "Answer:"
             )
             self.prompts.append(prompt)
-            answers = obj.get("answers", [])
-            self.targets.append(answers[0] if answers else "")
+            self.targets.append(
+                {
+                    "answers": obj.get("answers", []),
+                    "dataset": obj.get("dataset", ""),
+                    "all_classes": obj.get("all_classes"),
+                }
+            )
 
     def get_input(self) -> List[str]:
         return self.prompts
 
-    def get_target(self) -> List[str]:
+    def get_target(self) -> List[dict]:
         return self.targets
