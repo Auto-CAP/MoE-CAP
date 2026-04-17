@@ -312,7 +312,7 @@ class OpenAIAPIMoEProfiler:
             [
                 {
                     "role": "system",
-                    "content": "Output the answer directly without description.",
+                    "content": "Output the answer directly without description. Be concise, within 5 words if possible.",
                 },
                 {"role": "user", "content": q},
             ]
