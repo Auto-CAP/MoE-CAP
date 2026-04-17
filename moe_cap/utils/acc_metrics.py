@@ -415,5 +415,5 @@ def format_accuracy_summary(metrics: Dict[str, Any]) -> str:
     no_answer = metrics.get("no_answer", 0)
 
     if no_answer > 0:
-        return f"EM = {em:.4f} ({correct}/{total}, {no_answer} no answer)"
-    return f"EM = {em:.4f} ({correct}/{total})"
+        return f"Accuracy = {em:.4f} ({correct}/{total}, {no_answer} no answer)"
+    return f"Accuracy = {em:.4f} ({correct}/{total})"
