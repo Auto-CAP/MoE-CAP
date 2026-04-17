@@ -516,7 +516,6 @@ def execute_model_custom(
         except Exception as e:
             logger.debug(f"Could not record expert distribution automatically: {e}")
 
-    assert result is not None
     return result
 
 
