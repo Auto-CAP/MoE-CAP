@@ -310,6 +310,10 @@ class OpenAIAPIMoEProfiler:
         """Prepare inputs for the model"""
         chat_prompts = [
             [
+                {
+                    "role": "system",
+                    "content": "Output the answer directly without description.",
+                },
                 {"role": "user", "content": q},
             ]
             for q in all_input_raw
