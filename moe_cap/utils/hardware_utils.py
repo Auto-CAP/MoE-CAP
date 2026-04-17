@@ -302,8 +302,12 @@ def get_gpu_details():
 
 
 def get_peak_bw(gpu_name):
-    return MEM_BW_DICT[gpu_name]
+    if gpu_name is None:
+        return 0
+    return MEM_BW_DICT.get(gpu_name, 0)
 
 
 def get_peak_flops(gpu_name, precision):
-    return PEAK_FLOPS_DICT[precision][gpu_name]
+    if gpu_name is None:
+        return 0
+    return PEAK_FLOPS_DICT.get(precision, {}).get(gpu_name, 0)
