@@ -375,36 +375,34 @@ class OpenAIAPIMoEProfiler:
             raise ValueError(f"Unsupported task '{task_name}'. No loader registered.")
 
         all_input_raw = loader.get_input()
-        return all_input_raw, max_new_tokens
+        system_prompts = getattr(loader, "system_prompts", None)
+        return all_input_raw, max_new_tokens, system_prompts
 
-    def _prepare_inputs(self, all_input_raw, max_new_tokens):
+    def _prepare_inputs(self, all_input_raw, max_new_tokens, system_prompts=None):
         """Prepare inputs for the model"""
+        default_system = "Output the answer directly without description."
+
         if self.use_chat_api:
-            # Chat API: send messages directly, server handles chat template
             prompts = []
-            for q in all_input_raw:
+            for i, q in enumerate(all_input_raw):
+                sys_msg = system_prompts[i] if system_prompts else default_system
                 messages = [
-                    {
-                        "role": "system",
-                        "content": "Output the answer directly without description.",
-                    },
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": q},
                 ]
                 prompts.append(json.dumps(messages))
             prompt_lengths = [len(self.tokenizer.encode(q)) for q in all_input_raw]
             return prompts, prompt_lengths, max_new_tokens
         else:
-            # Completions API: apply chat template locally
-            chat_prompts = [
-                [
-                    {
-                        "role": "system",
-                        "content": "Output the answer directly without description.",
-                    },
-                    {"role": "user", "content": q},
-                ]
-                for q in all_input_raw
-            ]
+            chat_prompts = []
+            for i, q in enumerate(all_input_raw):
+                sys_msg = system_prompts[i] if system_prompts else default_system
+                chat_prompts.append(
+                    [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": q},
+                    ]
+                )
             chat_prompts = self.tokenizer.apply_chat_template(
                 chat_prompts, add_generation_prompt=True, tokenize=False
             )
@@ -755,9 +753,11 @@ class OpenAIAPIMoEProfiler:
             print(f"Running profiling for dataset: {dataset_name}")
 
             # Load and prepare inputs
-            all_input_raw, max_new_tokens = self._load_data_for_task(dataset_name)
+            all_input_raw, max_new_tokens, system_prompts = self._load_data_for_task(
+                dataset_name
+            )
             prompts, prompt_lengths, max_output_len = self._prepare_inputs(
-                all_input_raw, max_new_tokens
+                all_input_raw, max_new_tokens, system_prompts
             )
 
             # Get ground truth targets for evaluation
