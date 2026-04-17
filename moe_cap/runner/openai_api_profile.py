@@ -153,6 +153,61 @@ async def async_request_openai_completions(
     return output
 
 
+async def async_request_openai_chat_completions(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[async_tqdm] = None,
+) -> RequestFuncOutput:
+    """Send async request to OpenAI-compatible chat completions API."""
+    api_url = request_func_input.api_url
+    messages = json.loads(
+        request_func_input.prompt
+    )  # prompt stores JSON-encoded messages
+
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "model": request_func_input.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_completion_tokens": request_func_input.output_len,
+            "stream": False,
+            **request_func_input.extra_request_body,
+        }
+        headers = get_auth_headers()
+
+        output = RequestFuncOutput()
+        st = time.perf_counter()
+
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    choice = data["choices"][0]
+                    # Handle both regular and reasoning model responses
+                    msg = choice.get("message", {})
+                    generated_text = msg.get("content", "")
+                    latency = time.perf_counter() - st
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                    output.output_len = data.get("usage", {}).get(
+                        "completion_tokens", 0
+                    )
+                else:
+                    error_body = await response.text()
+                    output.error = f"{response.status}: {error_body[:200]}"
+                    output.success = False
+        except Exception:
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+            output.success = False
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 class OpenAIAPIMoEProfiler:
     def __init__(
         self,
@@ -163,6 +218,7 @@ class OpenAIAPIMoEProfiler:
         ignore_eos: Optional[bool] = None,
         server_batch_size: Optional[int] = None,
         profiling_only: bool = False,
+        use_chat_api: bool = False,
     ):
         """Initialize profiler from a CAPConfig object.
 
@@ -175,6 +231,7 @@ class OpenAIAPIMoEProfiler:
                        If None, auto-set based on fixed_length_mode in config.
             server_batch_size: Number of concurrent requests to send. If None, send all at once.
             profiling_only: Skip expert distribution recording, only collect TTFT/TPOT/throughput.
+            use_chat_api: Use /v1/chat/completions endpoint instead of /v1/completions.
         """
         self.server_batch_size = server_batch_size
         self.profiling_only = profiling_only or config.profiling_only
@@ -183,6 +240,20 @@ class OpenAIAPIMoEProfiler:
         if api_url is None:
             raise ValueError("api_url must be provided")
         self.api_url = api_url
+        self.use_chat_api = use_chat_api
+        if (
+            self.use_chat_api
+            and "/v1/completions" in self.api_url
+            and "/v1/chat/completions" not in self.api_url
+        ):
+            self.api_url = self.api_url.replace(
+                "/v1/completions", "/v1/chat/completions"
+            )
+        self.request_fn = (
+            async_request_openai_chat_completions
+            if self.use_chat_api
+            else async_request_openai_completions
+        )
 
         # Extract base URL for control endpoints
         # e.g., http://localhost:8000/v1/completions -> http://localhost:8000
@@ -308,24 +379,37 @@ class OpenAIAPIMoEProfiler:
 
     def _prepare_inputs(self, all_input_raw, max_new_tokens):
         """Prepare inputs for the model"""
-        chat_prompts = [
-            [
-                {
-                    "role": "system",
-                    "content": "Output the answer directly without description.",
-                },
-                {"role": "user", "content": q},
+        if self.use_chat_api:
+            # Chat API: send messages directly, server handles chat template
+            prompts = []
+            for q in all_input_raw:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "Output the answer directly without description.",
+                    },
+                    {"role": "user", "content": q},
+                ]
+                prompts.append(json.dumps(messages))
+            prompt_lengths = [len(self.tokenizer.encode(q)) for q in all_input_raw]
+            return prompts, prompt_lengths, max_new_tokens
+        else:
+            # Completions API: apply chat template locally
+            chat_prompts = [
+                [
+                    {
+                        "role": "system",
+                        "content": "Output the answer directly without description.",
+                    },
+                    {"role": "user", "content": q},
+                ]
+                for q in all_input_raw
             ]
-            for q in all_input_raw
-        ]
-        chat_prompts = self.tokenizer.apply_chat_template(
-            chat_prompts, add_generation_prompt=True, tokenize=False
-        )
-
-        # Calculate prompt lengths
-        prompt_lengths = [len(self.tokenizer.encode(p)) for p in chat_prompts]
-
-        return chat_prompts, prompt_lengths, max_new_tokens
+            chat_prompts = self.tokenizer.apply_chat_template(
+                chat_prompts, add_generation_prompt=True, tokenize=False
+            )
+            prompt_lengths = [len(self.tokenizer.encode(p)) for p in chat_prompts]
+            return chat_prompts, prompt_lengths, max_new_tokens
 
     def _check_batch_recording_status(self):
         """Check if batch recording endpoints are available."""
@@ -588,7 +672,7 @@ class OpenAIAPIMoEProfiler:
                     extra_request_body={},
                     ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                 )
-                tasks.append(async_request_openai_completions(request_input, pbar))
+                tasks.append(self.request_fn(request_input, pbar))
 
             torch.cuda.synchronize()
             start_time = time.perf_counter()
@@ -623,9 +707,7 @@ class OpenAIAPIMoEProfiler:
                         extra_request_body={},
                         ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                     )
-                    task = asyncio.create_task(
-                        async_request_openai_completions(request_input, pbar)
-                    )
+                    task = asyncio.create_task(self.request_fn(request_input, pbar))
                     active_tasks[task] = idx
 
                 current_batch_size = batch_end_idx - batch_start_idx
@@ -1021,6 +1103,12 @@ Examples:
         required=True,
         help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)",
     )
+    parser.add_argument(
+        "--use-chat-api",
+        action="store_true",
+        default=False,
+        help="Use /v1/chat/completions instead of /v1/completions",
+    )
 
     # CAPConfig optional fields
     parser.add_argument(
@@ -1253,6 +1341,7 @@ Examples:
         ignore_eos=ignore_eos,
         server_batch_size=args.server_batch_size,
         profiling_only=cap_cfg.profiling_only,
+        use_chat_api=args.use_chat_api,
     )
 
     profiler.run()
