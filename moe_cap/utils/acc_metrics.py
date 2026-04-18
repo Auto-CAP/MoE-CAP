@@ -357,7 +357,11 @@ def compute_accuracy_metrics(
         ]
     else:
         extracted_predictions = predictions
-    result = compute_exact_match(extracted_predictions, targets)
+
+    if dataset_name.lower() in ["longbench_v1"]:
+        result = {"exact_match": 0.0, "correct": 0, "total": 0, "no_answer": 0}
+    else:
+        result = compute_exact_match(extracted_predictions, targets)
 
     if dataset_name.lower() in ["longbench_v1"]:
         scores = []
