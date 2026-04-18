@@ -359,7 +359,7 @@ def compute_accuracy_metrics(
         extracted_predictions = predictions
 
     if dataset_name.lower() in ["longbench_v1"]:
-        result = {"exact_match": 0.0, "correct": 0, "total": 0, "no_answer": 0}
+        result = {"acc": 0.0, "correct": 0, "total": 0, "no_answer": 0}
     else:
         result = compute_exact_match(extracted_predictions, targets)
 
@@ -392,7 +392,7 @@ def compute_accuracy_metrics(
             scores.append(best_score)
 
         avg_score = sum(scores) / len(scores) if scores else 0.0
-        result["exact_match"] = avg_score
+        result["acc"] = avg_score
         result["correct"] = sum(1 for s in scores if s > 0.5)
         result["total"] = len(scores)
 
@@ -413,7 +413,7 @@ def format_accuracy_summary(metrics: Dict[str, Any]) -> str:
         >>> format_accuracy_summary({'exact_match': 0.85, 'correct': 850, 'total': 1000})
         'EM = 0.8500 (850/1000)'
     """
-    em = metrics.get("exact_match", 0.0)
+    em = metrics.get("acc", metrics.get("exact_match", 0.0))
     correct = metrics.get("correct", 0)
     total = metrics.get("total", 0)
     no_answer = metrics.get("no_answer", 0)

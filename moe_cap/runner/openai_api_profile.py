@@ -976,9 +976,9 @@ class OpenAIAPIMoEProfiler:
                     "acc": res_dict["arena_hard_win_rate"] / 100.0,
                     "total": res_dict.get("arena_hard_total", 0),
                 }
-            elif "exact_match" in res_dict:
+            elif "acc" in res_dict or "exact_match" in res_dict:
                 metrics_dict["quality"] = {
-                    "acc": res_dict["exact_match"],
+                    "acc": res_dict.get("acc", res_dict.get("exact_match", 0.0)),
                     "total": res_dict.get("total", 0),
                 }
 
