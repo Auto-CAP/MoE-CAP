@@ -186,7 +186,7 @@ async def async_request_openai_chat_completions(
                     choice = data["choices"][0]
                     # Handle both regular and reasoning model responses
                     msg = choice.get("message", {})
-                    generated_text = msg.get("content", "")
+                    generated_text = msg.get("content") or ""
                     latency = time.perf_counter() - st
                     output.generated_text = generated_text
                     output.success = True
