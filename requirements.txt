@@ -4,3 +4,6 @@ torch
 PyYAML
 GPUtil
 huggingface_hub
+rouge
+fuzzywuzzy
+python-Levenshtein
