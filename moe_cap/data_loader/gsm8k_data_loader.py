@@ -13,6 +13,12 @@ class GSM8KLoader(DataLoader):
         subset = config.dataset_subset or "main"
         self.dataset = load_dataset("openai/gsm8k", subset, split=config.dataset_split)
         self._process_targets()
+        gsm8k_system = (
+            "Solve the math problem. End your response with a line of the form "
+            "'#### <number>' containing only the final numeric answer (no units, "
+            "no commas, no currency symbols)."
+        )
+        self.system_prompts = [gsm8k_system] * len(self.dataset)
 
     def get_input(self) -> List:
         '''returns the list of questions'''
