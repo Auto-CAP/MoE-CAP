@@ -59,13 +59,10 @@ logger = init_logger(__name__)
 # This must be done early so it applies to all worker processes
 # Can be disabled via environment variable for incompatible models (e.g., Mixtral)
 # ============================================================================
-_SKIP_EXPERT_PATCHING = os.environ.get("MOE_CAP_SKIP_EXPERT_PATCHING", "0") == "1"
-_PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
-
-# In profiling-only mode, automatically skip expert patching as well
-if _PROFILING_ONLY:
-    _SKIP_EXPERT_PATCHING = True
-    logger.debug(f"Profiling-only mode: expert distribution recording disabled")
+# Expert patching is OFF by default; enable with MOE_CAP_ENABLE_EXPERT_PATCHING=1
+_ENABLE_EXPERT_PATCHING = os.environ.get("MOE_CAP_ENABLE_EXPERT_PATCHING", "0") == "1"
+_SKIP_EXPERT_PATCHING = not _ENABLE_EXPERT_PATCHING
+_PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1" or not _ENABLE_EXPERT_PATCHING
 
 if _SKIP_EXPERT_PATCHING:
     logger.debug(
