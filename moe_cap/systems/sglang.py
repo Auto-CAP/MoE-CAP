@@ -444,7 +444,8 @@ def forward_profiling_only(
             record_dict["per_req_info"] = _build_prefill_per_req_info(
                 forward_batch, self.server_args
             )
-        recorder.expert_record_list.append(record_dict)
+        if hasattr(recorder, "expert_record_list"):
+            recorder.expert_record_list.append(record_dict)
         logger.debug(
             f"[profiling-only] Forward pass {self.forward_pass_id} latency {latency:.4f}s"
         )
@@ -482,6 +483,20 @@ def _on_expert_hist(self, layer_idx: int, expt_hist: torch.Tensor):
 _SelectExpertsSinglePassGatherer.on_expert_hist = _on_expert_hist
 
 
+# --- Fix: fused_append_shared_experts appends shared-expert IDs starting at base N = num_routed_experts,
+# which can be >= num_physical_experts. scatter_add_ with an out-of-bounds index triggers a
+# CUDA device-side assert on DeepSeek-R1/V3. Mask them out so only routed experts are recorded. ---
+def _safe_on_select_experts(self, layer_idx, topk_ids):
+    num_experts = self._data.shape[1]
+    flat = topk_ids.flatten()
+    mask = (flat != -1) & (flat < num_experts) & (flat >= 0)
+    self._data[layer_idx, :].scatter_add_(
+        dim=0, index=flat.masked_fill(~mask, 0).long(), src=mask.int()
+    )
+_SelectExpertsSinglePassGatherer.on_select_experts = _safe_on_select_experts
+
+
+
 # --- Monkey-patch TopK.forward_cuda to call expert distribution recorder for TRITON_KERNEL path ---
 _original_topk_forward_cuda = TopK.forward_cuda
 
@@ -500,6 +515,27 @@ def _patched_topk_forward_cuda(
 
 
 TopK.forward_cuda = _patched_topk_forward_cuda
+
+
+# --- Kimi-K2.5 wraps DeepseekV3 as self.language_model but the outer class lacks
+#     get_model_config_for_expert_location, so expert-distribution recording fails
+#     with AssertionError. Add the classmethod by reading the text_config. ---
+try:
+    from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation as _MCFEL
+    if not hasattr(KimiK25ForConditionalGeneration, "get_model_config_for_expert_location"):
+        @classmethod
+        def _k25_expert_location(cls, config):
+            text_config = getattr(config, "text_config", config)
+            return _MCFEL(
+                num_layers=text_config.num_hidden_layers,
+                num_logical_experts=text_config.n_routed_experts,
+                num_groups=getattr(text_config, "n_group", None),
+            )
+        KimiK25ForConditionalGeneration.get_model_config_for_expert_location = _k25_expert_location
+except ImportError:
+    pass
+
 
 if __name__ == "__main__":
     from sglang.srt.entrypoints.http_server import launch_server
