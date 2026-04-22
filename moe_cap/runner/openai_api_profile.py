@@ -834,17 +834,28 @@ class OpenAIAPIMoEProfiler:
 
                     # Load baseline answers
                     if self.config.baseline_answers_path:
+                        if not os.path.exists(self.config.baseline_answers_path):
+                            raise FileNotFoundError(
+                                f"Arena-Hard baseline file not found: {self.config.baseline_answers_path}"
+                            )
                         baseline_dict = load_baseline_answers(
                             self.config.baseline_answers_path
                         )
+                        if not baseline_dict:
+                            raise ValueError(
+                                f"No baseline answers loaded from {self.config.baseline_answers_path}"
+                            )
                         # Match by uid if loader supports it, else fall back to index order
                         loader, _ = get_loader_for_task(dataset_name, self.config)
                         if hasattr(loader, "get_uids"):
                             uids = loader.get_uids()[: len(predictions)]
                             baseline_answers = [baseline_dict.get(uid, "") for uid in uids]
                             missing = sum(1 for a in baseline_answers if not a)
-                            if missing:
-                                print(f"Warning: {missing}/{len(baseline_answers)} baseline answers missing by uid")
+                            if missing > 0:
+                                raise ValueError(
+                                    f"Baseline missing for {missing}/{len(baseline_answers)} uids. "
+                                    "Ensure baseline file covers all dataset samples."
+                                )
                         else:
                             baseline_answers = list(baseline_dict.values())[: len(predictions)]
                     else:
