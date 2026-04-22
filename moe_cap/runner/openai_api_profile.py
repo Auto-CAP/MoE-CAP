@@ -837,10 +837,16 @@ class OpenAIAPIMoEProfiler:
                         baseline_dict = load_baseline_answers(
                             self.config.baseline_answers_path
                         )
-                        # Match by index (assume same order)
-                        baseline_answers = list(baseline_dict.values())[
-                            : len(predictions)
-                        ]
+                        # Match by uid if loader supports it, else fall back to index order
+                        loader, _ = get_loader_for_task(dataset_name, self.config)
+                        if hasattr(loader, "get_uids"):
+                            uids = loader.get_uids()[: len(predictions)]
+                            baseline_answers = [baseline_dict.get(uid, "") for uid in uids]
+                            missing = sum(1 for a in baseline_answers if not a)
+                            if missing:
+                                print(f"Warning: {missing}/{len(baseline_answers)} baseline answers missing by uid")
+                        else:
+                            baseline_answers = list(baseline_dict.values())[: len(predictions)]
                     else:
                         print(
                             "Warning: No baseline_answers_path configured for Arena-Hard judge evaluation"

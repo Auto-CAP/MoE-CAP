@@ -62,3 +62,11 @@ class ArenaHardLoader(DataLoader):
     def get_target(self) -> List:
         """No ground-truth answers for Arena-Hard (open-ended benchmark)."""
         return [""] * len(self.dataset)
+
+    def get_uids(self) -> List[str]:
+        """Return uids (or question_ids) for matching with baseline answers."""
+        if "uid" in self.dataset.column_names:
+            return list(self.dataset["uid"])
+        if "question_id" in self.dataset.column_names:
+            return list(self.dataset["question_id"])
+        return [str(i) for i in range(len(self.dataset))]
