@@ -438,11 +438,11 @@ class OpenAIAPIMoEProfiler:
         try:
             if self.backend_type == BackendType.SGLANG:
                 response = requests.post(
-                    f"{self.base_url}/start_expert_distribution_record", timeout=10
+                    f"{self.base_url}/start_expert_distribution_record", timeout=300
                 )
             else:
                 response = requests.post(
-                    f"{self.base_url}/start_batch_recording", timeout=10
+                    f"{self.base_url}/start_batch_recording", timeout=300
                 )
             response.raise_for_status()
             print(
@@ -460,11 +460,11 @@ class OpenAIAPIMoEProfiler:
         try:
             if self.backend_type == BackendType.SGLANG:
                 response = requests.post(
-                    f"{self.base_url}/stop_expert_distribution_record", timeout=10
+                    f"{self.base_url}/stop_expert_distribution_record", timeout=300
                 )
             else:
                 response = requests.post(
-                    f"{self.base_url}/stop_batch_recording", timeout=10
+                    f"{self.base_url}/stop_batch_recording", timeout=300
                 )
             response.raise_for_status()
             print(
@@ -483,7 +483,7 @@ class OpenAIAPIMoEProfiler:
             if self.backend_type == BackendType.SGLANG:
                 # SGLang dumps to file, need to trigger dump and then read from file
                 response = requests.post(
-                    f"{self.base_url}/dump_expert_distribution_record", timeout=10
+                    f"{self.base_url}/dump_expert_distribution_record", timeout=300
                 )
                 response.raise_for_status()
                 print("Expert distribution record dumped to file")
@@ -515,7 +515,7 @@ class OpenAIAPIMoEProfiler:
                     return []
             else:
                 response = requests.post(
-                    f"{self.base_url}/dump_batch_recording", timeout=10
+                    f"{self.base_url}/dump_batch_recording", timeout=300
                 )
                 response.raise_for_status()
                 data = response.json()

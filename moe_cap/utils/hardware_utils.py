@@ -319,6 +319,33 @@ def analyze_gpu_stats(stats_list):
 
 def get_gpu_details():
     gpus = GPUtil.getGPUs()
+    if not gpus:
+        # ROCm/AMD path: GPUtil only sees NVIDIA. Fallback via rocm-smi.
+        try:
+            r = subprocess.check_output(["rocminfo"], text=True, timeout=10)
+            mk = next(
+                (
+                    re.match(r"\s*Marketing Name:\s*(.+)", l).group(1).strip()
+                    for l in r.splitlines()
+                    if re.match(
+                        r"\s*Marketing Name:\s*(?:AMD Instinct|AMD Radeon)", l
+                    )
+                ),
+                "AMD-GPU",
+            )
+            mem = subprocess.check_output(
+                ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+                text=True,
+                timeout=10,
+            )
+            vram_b = next(
+                (int(x.split(",")[1]) for x in mem.splitlines() if x.startswith("card")),
+                0,
+            )
+            mem_gb = round(vram_b / (1024**3))
+            return f"{mk.replace(' ', '-')}-{mem_gb}GB"
+        except Exception:
+            return "AMD-GPU-Unknown"
     gpu = gpus[0]
     name = gpu.name.replace(" ", "-")
     memory_gb = round(gpu.memoryTotal / 1024)
