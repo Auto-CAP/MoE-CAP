@@ -8,54 +8,23 @@ import subprocess
 
 
 def _get_amd_gpu_type():
-    """Detect AMD GPU using rocm-smi. Returns formatted name like 'AMD-Instinct-MI355X-288GB'."""
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showproductname", "--csv"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        # Parse rocm-smi output, e.g.:
-        # device,Card series,Card model,Card vendor,Card SKU
-        # card0,Instinct MI355X,...,AMD,...
-        lines = result.stdout.strip().split("\n")
-        if len(lines) >= 2:
-            for line in lines[1:]:
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2 and parts[1]:
-                    series = parts[1].replace(" ", "-")
-                    name = f"AMD-{series}"
-
-                    # Get memory size
-                    mem_result = subprocess.run(
-                        ["rocm-smi", "--showmeminfo", "vram", "--csv"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    mem_lines = mem_result.stdout.strip().split("\n")
-                    if len(mem_lines) >= 2:
-                        mem_parts = [p.strip() for p in mem_lines[1].split(",")]
-                        # VRAM Total in bytes is usually in column 1
-                        for p in mem_parts[1:]:
-                            try:
-                                bytes_val = int(p)
-                                gb = round(bytes_val / 1024**3)
-                                return f"{name}-{gb}GB"
-                            except ValueError:
-                                continue
-                    return name
-    except Exception:
-        pass
-
-    # Fall back to torch
+    """Detect AMD GPU. Returns formatted name like 'AMD-Instinct-MI355X-288GB'."""
     try:
         import math
         import torch
 
-        name = torch.cuda.get_device_name(0).replace(" ", "-")
+        raw = torch.cuda.get_device_name(0)
         gb = math.ceil(torch.cuda.get_device_properties(0).total_memory / 1024**3)
+        # Normalize various torch.cuda names to MEM_BW_DICT key format
+        if "MI355" in raw:
+            return f"AMD-Instinct-MI355X-{gb}GB"
+        if "MI325" in raw:
+            return f"AMD-Instinct-MI325X-{gb}GB"
+        if "MI300" in raw:
+            return f"AMD-Instinct-MI300X-{gb}GB"
+        if "MI250" in raw:
+            return f"AMD-Instinct-MI250X-{gb}GB"
+        name = raw.replace(" ", "-")
         if not name.startswith("AMD"):
             name = f"AMD-{name}"
         return f"{name}-{gb}GB"
