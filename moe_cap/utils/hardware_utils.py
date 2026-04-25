@@ -40,6 +40,10 @@ MEM_BW_DICT = {
     "NVIDIA-H200-140GB": 4800e9,
     "NVIDIA-GH200-96GB": 4096e9,
     "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1597e9,
+    "AMD-Instinct-MI355X-288GB": 8000e9,
+    "AMD-Instinct-MI300X-192GB": 5300e9,
+    "AMD-Instinct-MI325X-256GB": 6000e9,
+    "AMD-Instinct-MI250X-128GB": 3276e9,
 }
 
 PEAK_FLOPS_DICT = {
@@ -56,6 +60,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 989e12,
         "NVIDIA-GH200-96GB": 989e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 500e12,
+        "AMD-Instinct-MI355X-288GB": 78.6e12,
+        "AMD-Instinct-MI300X-192GB": 81.7e12,
+        "AMD-Instinct-MI325X-256GB": 81.7e12,
+        "AMD-Instinct-MI250X-128GB": 47.9e12,
     },
     "float16": {
         "NVIDIA-A100-PCIe-80GB": 624e12,
@@ -70,6 +78,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 1979e12,
         "NVIDIA-GH200-96GB": 1979e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
+        "AMD-Instinct-MI355X-288GB": 2500e12,
+        "AMD-Instinct-MI300X-192GB": 1307e12,
+        "AMD-Instinct-MI325X-256GB": 1307e12,
+        "AMD-Instinct-MI250X-128GB": 383e12,
     },
     "bfloat16": {
         "NVIDIA-A100-PCIe-80GB": 624e12,
@@ -84,6 +96,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 1979e12,
         "NVIDIA-GH200-96GB": 1979e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
+        "AMD-Instinct-MI355X-288GB": 2500e12,
+        "AMD-Instinct-MI300X-192GB": 1307e12,
+        "AMD-Instinct-MI325X-256GB": 1307e12,
+        "AMD-Instinct-MI250X-128GB": 383e12,
     },
     "int8": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
@@ -98,6 +114,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 3958e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
+        "AMD-Instinct-MI355X-288GB": 5050e12,
+        "AMD-Instinct-MI300X-192GB": 2614e12,
+        "AMD-Instinct-MI325X-256GB": 2614e12,
+        "AMD-Instinct-MI250X-128GB": 383e12,
     },
     "fp8": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
@@ -112,6 +132,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 3958e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
+        "AMD-Instinct-MI355X-288GB": 5050e12,
+        "AMD-Instinct-MI300X-192GB": 2614e12,
+        "AMD-Instinct-MI325X-256GB": 2614e12,
+        "AMD-Instinct-MI250X-128GB": 0,
     },
     "fp4": {
         "NVIDIA-A100-PCIe-80GB": 1248e12,
@@ -125,6 +149,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 3958e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
+        "AMD-Instinct-MI355X-288GB": 10100e12,
+        "AMD-Instinct-MI300X-192GB": 0,
+        "AMD-Instinct-MI325X-256GB": 0,
+        "AMD-Instinct-MI250X-128GB": 0,
     },
     "int4": {
         "NVIDIA-A100-PCIe-80GB": 2496e12,
@@ -139,6 +167,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-H200-140GB": 3958e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
+        "AMD-Instinct-MI355X-288GB": 10100e12,
+        "AMD-Instinct-MI300X-192GB": 0,
+        "AMD-Instinct-MI325X-256GB": 0,
+        "AMD-Instinct-MI250X-128GB": 383e12,
     },
 }
 
