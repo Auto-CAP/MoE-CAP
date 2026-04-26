@@ -955,23 +955,31 @@ class OpenAIAPIMoEProfiler:
             # Compute average expert activation for prefill and decode from server records
             prefill_activations = []
             decode_activations = []
+            prefill_latencies = []
+            decode_latencies = []
             if server_records:
                 for sr in server_records:
+                    fm = sr.get("forward_mode")
                     ea = sr.get("expert_activation")
-                    if ea is None or ea < 0:
-                        continue
-                    if sr.get("forward_mode") == "prefill":
-                        prefill_activations.append(ea)
-                    else:
-                        decode_activations.append(ea)
+                    if ea is not None and ea >= 0:
+                        if fm == "prefill":
+                            prefill_activations.append(ea)
+                        else:
+                            decode_activations.append(ea)
+                    lat = sr.get("latency")
+                    if lat is not None and lat >= 0:
+                        if fm == "prefill":
+                            prefill_latencies.append(lat)
+                        else:
+                            decode_latencies.append(lat)
 
             metrics_dict = {
                 "performance": {
                     "e2e_s": res_dict.get(
                         "e2e_s", round(total_time / max(len(prompts), 1), 2)
                     ),
-                    "ttft": res_dict.get("ttft", 0),
-                    "tpot": res_dict.get("tpot", 0),
+                    "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else res_dict.get("ttft", 0),
+                    "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else res_dict.get("tpot", 0),
                 },
                 "expert_activation": {
                     "avg_expert_activation_prefill": (
