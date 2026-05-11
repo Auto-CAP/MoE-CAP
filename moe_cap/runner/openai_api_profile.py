@@ -880,10 +880,23 @@ class OpenAIAPIMoEProfiler:
                             judge_model=judge_model,
                             api_key=api_key,
                         )
+                        per_question = arena_metrics.pop("arena_hard_per_question", [])
                         res_dict.update(arena_metrics)
                         print(
                             f"Arena-Hard win rate: {arena_metrics['arena_hard_win_rate']}%"
                         )
+                        if per_question:
+                            judge_dir = os.path.join(self.output_dir, self.get_model_simple_name())
+                            os.makedirs(judge_dir, exist_ok=True)
+                            judge_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            judge_log_path = os.path.join(
+                                judge_dir,
+                                f"arena_hard_judge_{dataset_name}_{judge_ts}.jsonl",
+                            )
+                            with open(judge_log_path, "w", encoding="utf-8") as f:
+                                for rec in per_question:
+                                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            print(f"Arena-Hard judge log written to {judge_log_path}")
                     else:
                         print(
                             "Warning: Not enough baseline answers for Arena-Hard evaluation"

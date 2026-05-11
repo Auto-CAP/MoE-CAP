@@ -232,17 +232,28 @@ async def evaluate_arena_hard(
     losses = 0
     ties = 0
     errors = 0
+    per_question = []
 
-    for r in results:
+    for idx, (r, q, m, b) in enumerate(zip(results, questions, model_answers, baseline_answers)):
+        record = {
+            "index": idx,
+            "question": q[:500],
+            "model_answer": m[:500],
+            "baseline_answer": b[:500],
+        }
         if isinstance(r, BaseException):
             scores.append(0.5)
             errors += 1
+            record.update({"error": str(r), "score": 0.5})
+            per_question.append(record)
             continue
         if isinstance(r, dict):
             s = float(r.get("score", 0.5))
+            record.update(r)
         else:
             s = 0.5
             errors += 1
+            record["score"] = 0.5
         scores.append(s)
         if s > 0.5:
             wins += 1
@@ -250,6 +261,7 @@ async def evaluate_arena_hard(
             losses += 1
         else:
             ties += 1
+        per_question.append(record)
 
     win_rate = sum(scores) / len(scores) * 100 if scores else 0
 
@@ -261,6 +273,7 @@ async def evaluate_arena_hard(
         "arena_hard_errors": errors,
         "arena_hard_total": len(questions),
         "arena_hard_judge_model": judge_model,
+        "arena_hard_per_question": per_question,
     }
 
 
