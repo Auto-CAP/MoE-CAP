@@ -170,6 +170,7 @@ async def async_request_openai_chat_completions(
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": False,
+            "ignore_eos": request_func_input.ignore_eos,  # Force fixed-length chat outputs when requested
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -709,7 +710,10 @@ class OpenAIAPIMoEProfiler:
                     active_tasks[task] = idx
 
                 current_batch_size = batch_end_idx - batch_start_idx
-                threshold = current_batch_size // 2  # 50% of current batch
+                # Wait for at least one request from the current batch. The old
+                # `current_batch_size // 2` becomes 0 for batch_size=1, which floods
+                # all 256 requests despite --server-batch-size 1.
+                threshold = max(1, current_batch_size // 2)  # 50% overlap, but sequential for batch_size=1
                 completed_in_batch = 0
 
                 # Wait until 50% of current batch is complete before launching next batch

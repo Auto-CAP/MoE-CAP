@@ -497,7 +497,7 @@ _SelectExpertsSinglePassGatherer.on_select_experts = _safe_on_select_experts
 
 
 
-# --- Monkey-patch TopK.forward_cuda to call expert distribution recorder for TRITON_KERNEL path ---
+# --- Monkey-patch TopK.forward_cuda to record GPT-OSS/FlashInfer BYPASSED routing ---
 _original_topk_forward_cuda = TopK.forward_cuda
 
 
@@ -505,12 +505,60 @@ def _patched_topk_forward_cuda(
     self, hidden_states, router_logits, **kwargs
 ) -> TopKOutput:
     result = _original_topk_forward_cuda(self, hidden_states, router_logits, **kwargs)
-    # If the result is a TritonKernelTopKOutput, the original code skips on_select_experts.
-    # We use the expt_hist from routing_data to record expert distribution.
+    recorder = get_global_expert_distribution_recorder()
+    is_capturing = torch.cuda.is_current_stream_capturing()
+    should_record = getattr(recorder, "recording", False) or is_capturing
+    if not should_record:
+        return result
+
+    def _record_from_logits(reason: str) -> bool:
+        """Record routed expert ids from router logits when no usable histogram exists.
+
+        GPT-OSS on Blackwell commonly returns ``BypassedTopKOutput`` for the
+        FlashInfer MXFP4 path. In that case the fused MoE kernel consumes
+        routing internally and no ``routing_data.expt_hist`` is exposed, so the
+        standard SGLang expert-distribution recorder sees an all-zero logical
+        count. Recomputing only the top-k expert ids is enough for MoE-CAP's
+        activation-count metrics and avoids changing the inference result.
+        """
+        try:
+            topk_config = getattr(result, "topk_config", None) or getattr(
+                self, "topk_config", None
+            )
+            top_k = int(
+                getattr(topk_config, "top_k", 0) or getattr(self, "top_k", 0) or 0
+            )
+            logits = getattr(result, "router_logits", None)
+            if logits is None:
+                logits = router_logits
+            if top_k > 0 and logits is not None and hasattr(
+                recorder, "on_select_experts"
+            ):
+                topk_ids = torch.topk(logits, k=top_k, dim=-1).indices
+                recorder.on_select_experts(topk_ids=topk_ids)
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to record fallback TopK expert ids ({reason}): {e}")
+        return False
+
+    # Triton-kernels path may expose a routing histogram. On GPT-OSS/B200
+    # fixed-length runs this object can exist but be all-zero, which suppresses
+    # the router-logits fallback and silently produces expert_activation=0. Do
+    # not perform host synchronization while CUDA graph capture is active.
     if hasattr(result, "routing_data") and hasattr(result.routing_data, "expt_hist"):
-        recorder = get_global_expert_distribution_recorder()
-        if hasattr(recorder, "on_expert_hist"):
-            recorder.on_expert_hist(expt_hist=result.routing_data.expt_hist)
+        expt_hist = result.routing_data.expt_hist
+        hist_nonzero = False
+        if not is_capturing:
+            try:
+                hist_nonzero = bool(torch.as_tensor(expt_hist).sum().item() > 0)
+            except Exception:
+                hist_nonzero = False
+        if hist_nonzero and hasattr(recorder, "on_expert_hist"):
+            recorder.on_expert_hist(expt_hist=expt_hist)
+        else:
+            _record_from_logits("zero-or-invalid-expt_hist")
+    else:
+        _record_from_logits("missing-expt_hist")
     return result
 
 
