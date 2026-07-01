@@ -1015,21 +1015,42 @@ class OpenAIAPIMoEProfiler:
             decode_activations = []
             prefill_latencies = []
             decode_latencies = []
+            prefill_batch_sizes = []
+            decode_batch_sizes = []
             if server_records:
                 for sr in server_records:
                     fm = sr.get("forward_mode")
+                    is_prefill = fm == "prefill"
+                    is_decode = fm in ("decode", "decoding")
                     ea = sr.get("expert_activation")
                     if ea is not None and ea >= 0:
-                        if fm == "prefill":
+                        if is_prefill:
                             prefill_activations.append(ea)
-                        else:
+                        elif is_decode:
                             decode_activations.append(ea)
                     lat = sr.get("latency")
                     if lat is not None and lat >= 0:
-                        if fm == "prefill":
+                        if is_prefill:
                             prefill_latencies.append(lat)
-                        else:
+                        elif is_decode:
                             decode_latencies.append(lat)
+                    bs = sr.get("batch_size")
+                    if bs is not None and bs >= 0:
+                        if is_prefill:
+                            prefill_batch_sizes.append(bs)
+                        elif is_decode:
+                            decode_batch_sizes.append(bs)
+
+            avg_batch_size_prefill = (
+                sum(prefill_batch_sizes) / len(prefill_batch_sizes)
+                if prefill_batch_sizes
+                else 0
+            )
+            avg_batch_size_decode = (
+                sum(decode_batch_sizes) / len(decode_batch_sizes)
+                if decode_batch_sizes
+                else 0
+            )
 
             successful_for_simple = [r for r in results if getattr(r, "success", False)]
             simple_ttft = (
@@ -1116,6 +1137,8 @@ class OpenAIAPIMoEProfiler:
                     "inference_engine": engine_name,
                     "inference_engine_version": engine_ver,
                     "batch_size": self.server_batch_size,
+                    "avg_batch_size_prefill": avg_batch_size_prefill,
+                    "avg_batch_size_decode": avg_batch_size_decode,
                 },
             }
 
