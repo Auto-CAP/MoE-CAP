@@ -15,7 +15,11 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
-from moe_cap.utils.acc_metrics import compute_accuracy_metrics, format_accuracy_summary
+from moe_cap.utils.acc_metrics import (
+    compute_accuracy_metrics,
+    extract_answer,
+    format_accuracy_summary,
+)
 from moe_cap.utils.cost_utils import calculate_cost
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
@@ -43,6 +47,7 @@ class RequestFuncInput:
     output_len: int
     model: str
     extra_request_body: Dict[str, Any]
+    prompt_len: int = 0  # Tokenized input length for per-request raw records
     ignore_eos: bool = False  # Whether to ignore EOS token for fixed-length generation
 
 
@@ -94,8 +99,10 @@ async def async_request_openai_completions(
         headers = get_auth_headers()
 
         output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
         generated_text = ""
         output_len = 0
+        usage = None
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -116,6 +123,8 @@ async def async_request_openai_completions(
 
                         try:
                             data = json.loads(chunk)
+                            if data.get("usage"):
+                                usage = data["usage"]
 
                             # Check if token was generated
                             if data["choices"][0].get("text"):
@@ -139,7 +148,11 @@ async def async_request_openai_completions(
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    if usage:
+                        output.prompt_len = usage.get("prompt_tokens", output.prompt_len) or output.prompt_len
+                        output.output_len = usage.get("completion_tokens", output_len) or output_len
+                    else:
+                        output.output_len = output_len
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -192,9 +205,9 @@ async def async_request_openai_chat_completions(
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
-                    output.output_len = data.get("usage", {}).get(
-                        "completion_tokens", 0
-                    )
+                    usage = data.get("usage", {})
+                    output.prompt_len = usage.get("prompt_tokens", request_func_input.prompt_len) or request_func_input.prompt_len
+                    output.output_len = usage.get("completion_tokens", 0)
                 else:
                     error_body = await response.text()
                     output.error = f"{response.status}: {error_body[:200]}"
@@ -645,6 +658,7 @@ class OpenAIAPIMoEProfiler:
         prompts: List[str],
         max_output_len: int,
         batch_size: Optional[int] = None,
+        prompt_lengths: Optional[List[int]] = None,
     ) -> Tuple[List[RequestFuncOutput], float]:
         """
         Send all prompts to the API and collect results.
@@ -653,6 +667,7 @@ class OpenAIAPIMoEProfiler:
             prompts: List of prompts to send
             max_output_len: Maximum number of tokens to generate
             batch_size: Number of requests per batch. If None, send all at once.
+            prompt_lengths: Optional tokenized input length per request for raw records.
 
         Returns:
             Tuple of (results, total_time)
@@ -662,13 +677,14 @@ class OpenAIAPIMoEProfiler:
             tasks = []
             pbar = async_tqdm(total=len(prompts), desc="Processing requests")
 
-            for prompt in prompts:
+            for idx, prompt in enumerate(prompts):
                 request_input = RequestFuncInput(
                     prompt=prompt,
                     api_url=self.api_url,
                     output_len=max_output_len,
                     model=self.hf_model_name,
                     extra_request_body={},
+                    prompt_len=prompt_lengths[idx] if prompt_lengths and idx < len(prompt_lengths) else 0,
                     ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                 )
                 tasks.append(self.request_fn(request_input, pbar))
@@ -704,6 +720,7 @@ class OpenAIAPIMoEProfiler:
                         output_len=max_output_len,
                         model=self.hf_model_name,
                         extra_request_body={},
+                        prompt_len=prompt_lengths[idx] if prompt_lengths and idx < len(prompt_lengths) else 0,
                         ignore_eos=self.ignore_eos,  # Pass ignore_eos setting
                     )
                     task = asyncio.create_task(self.request_fn(request_input, pbar))
@@ -773,8 +790,14 @@ class OpenAIAPIMoEProfiler:
                 print(f"Warning: Could not load ground truth for {dataset_name}: {e}")
                 ground_truth = None
 
-            # Start batch recording on server
-            self._start_batch_recording()
+            # Start batch recording on server unless profiling-only is requested.
+            # Dense models have no expert recorder; calling SGLang expert endpoints
+            # without ServerArgs.expert_distribution_recorder_mode can crash the
+            # scheduler, so profiling-only must be a hard skip.
+            if self.profiling_only:
+                server_records = []
+            else:
+                self._start_batch_recording()
 
             # Run benchmark
             print(f"Sending {len(prompts)} requests to {self.api_url}")
@@ -782,11 +805,13 @@ class OpenAIAPIMoEProfiler:
                 prompts=prompts,
                 max_output_len=max_output_len,
                 batch_size=self.server_batch_size,
+                prompt_lengths=prompt_lengths,
             )
 
             # Stop batch recording and retrieve records
-            self._stop_batch_recording()
-            server_records = self._dump_batch_recording()
+            if not self.profiling_only:
+                self._stop_batch_recording()
+                server_records = self._dump_batch_recording()
 
             num_gpus = 1
             if server_records and len(server_records) > 0:
@@ -833,7 +858,11 @@ class OpenAIAPIMoEProfiler:
                         load_baseline_answers,
                     )
 
-                    predictions = [r.generated_text for r in results if r.success]
+                    predictions = [
+                        extract_answer(r.generated_text, dataset_name)
+                        for r in results
+                        if r.success
+                    ]
                     questions = all_input_raw[: len(predictions)]
 
                     # Load baseline answers
@@ -949,24 +978,36 @@ class OpenAIAPIMoEProfiler:
             os.makedirs(dest_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # === 1. Output Data (Conditional: only when accuracy measurement is needed) ===
-            if ground_truth is not None:
-                output_data_path = os.path.join(
-                    dest_dir, f"output_data_{dataset_name}_{timestamp}.jsonl"
-                )
-                with open(output_data_path, "w", encoding="utf-8") as f:
-                    for i, result in enumerate(results):
-                        record = {
-                            "index": i,
-                            "input_tokens": prompt_lengths[i]
-                            if i < len(prompt_lengths)
-                            else 0,
-                            "output_tokens": result.generated_text
-                            if result.success
-                            else "",
-                        }
-                        f.write(json.dumps(record) + "\n")
-                print(f"Output data written to {output_data_path}")
+            # === 1. Output Data (always write per-request raw records) ===
+            output_data_path = os.path.join(
+                dest_dir, f"output_data_{dataset_name}_{timestamp}.jsonl"
+            )
+            with open(output_data_path, "w", encoding="utf-8") as f:
+                for i, result in enumerate(results):
+                    fallback_input_tokens = prompt_lengths[i] if i < len(prompt_lengths) else 0
+                    input_token_count = result.prompt_len or fallback_input_tokens
+                    if result.success and result.output_len:
+                        output_token_count = result.output_len
+                    elif result.success and result.generated_text:
+                        output_token_count = len(self.tokenizer.encode(result.generated_text))
+                    else:
+                        output_token_count = 0
+                    record = {
+                        "index": i,
+                        # Historical fields kept for compatibility: input_tokens is a count,
+                        # output_tokens is the generated text consumed by existing evaluators.
+                        "input_tokens": fallback_input_tokens,
+                        "output_tokens": result.generated_text if result.success else "",
+                        # Explicit numeric per-request token counts for raw TEAS/MoE-CAP records.
+                        "input_token_count": input_token_count,
+                        "output_token_count": output_token_count,
+                        "requested_output_tokens": max_output_len,
+                        "success": result.success,
+                    }
+                    if result.error:
+                        record["error"] = result.error[:500]
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(f"Output data written to {output_data_path}")
 
             # === 2. Metrics File (Always required) ===
             # Compute average expert activation for prefill and decode from server records
@@ -990,13 +1031,28 @@ class OpenAIAPIMoEProfiler:
                         else:
                             decode_latencies.append(lat)
 
+            successful_for_simple = [r for r in results if getattr(r, "success", False)]
+            simple_ttft = (
+                sum(getattr(r, "ttft", 0) for r in successful_for_simple) / len(successful_for_simple)
+                if successful_for_simple
+                else 0
+            )
+            simple_tpots = []
+            for r in successful_for_simple:
+                out_len = getattr(r, "output_len", 0) or 0
+                latency = getattr(r, "latency", 0) or 0
+                ttft = getattr(r, "ttft", 0) or 0
+                if out_len > 0 and latency >= ttft:
+                    simple_tpots.append((latency - ttft) / out_len)
+            simple_tpot = sum(simple_tpots) / len(simple_tpots) if simple_tpots else 0
+
             metrics_dict = {
                 "performance": {
                     "e2e_s": res_dict.get(
                         "e2e_s", round(total_time / max(len(prompts), 1), 2)
                     ),
-                    "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else res_dict.get("ttft", 0),
-                    "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else res_dict.get("tpot", 0),
+                    "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
+                    "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
                 },
                 "expert_activation": {
                     "avg_expert_activation_prefill": (
