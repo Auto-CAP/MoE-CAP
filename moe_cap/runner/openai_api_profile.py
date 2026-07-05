@@ -982,6 +982,8 @@ class OpenAIAPIMoEProfiler:
             output_data_path = os.path.join(
                 dest_dir, f"output_data_{dataset_name}_{timestamp}.jsonl"
             )
+            prefill_tokens_total = 0
+            decode_generated_tokens_total = 0
             with open(output_data_path, "w", encoding="utf-8") as f:
                 for i, result in enumerate(results):
                     fallback_input_tokens = prompt_lengths[i] if i < len(prompt_lengths) else 0
@@ -992,6 +994,8 @@ class OpenAIAPIMoEProfiler:
                         output_token_count = len(self.tokenizer.encode(result.generated_text))
                     else:
                         output_token_count = 0
+                    prefill_tokens_total += input_token_count or 0
+                    decode_generated_tokens_total += output_token_count or 0
                     record = {
                         "index": i,
                         # Historical fields kept for compatibility: input_tokens is a count,
@@ -1086,6 +1090,14 @@ class OpenAIAPIMoEProfiler:
                         if decode_activations
                         else 0
                     ),
+                },
+                "batch_token_profile": {
+                    "prefill_tokens": prefill_tokens_total,
+                    "prefill_tokens_per_request": prefill_tokens_total / max(num_requests, 1),
+                    "prefill_avg_batch_size": avg_batch_size_prefill,
+                    "decode_generated_tokens": decode_generated_tokens_total,
+                    "decode_generated_tokens_per_request": decode_generated_tokens_total / max(num_requests, 1),
+                    "decode_avg_batch_size": avg_batch_size_decode,
                 },
             }
 
