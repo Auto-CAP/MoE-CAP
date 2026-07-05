@@ -408,20 +408,86 @@ def execute_model_custom(
     end_time = time.perf_counter()
     latency = end_time - start_time
 
-    # Determine batch info from scheduler_output and input_batch
-    num_reqs = getattr(getattr(self, "input_batch", None), "num_reqs", 0)
-    batch_size = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+    # Determine batch info from vLLM v1 SchedulerOutput.
+    # scheduler_output.total_num_scheduled_tokens is a token workload size, not
+    # a request batch size. The true scheduled request count is the number of
+    # req_ids in scheduler_output.num_scheduled_tokens. Split mixed steps into
+    # context/prefill vs decode counts using scheduler metadata.
+    scheduled_token_map = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if not isinstance(scheduled_token_map, dict):
+        scheduled_token_map = {}
+    total_scheduled_tokens = getattr(
+        scheduler_output, "total_num_scheduled_tokens", sum(scheduled_token_map.values())
+    )
 
-    tokens_per_req = []
-    if hasattr(self, "input_batch") and hasattr(self.input_batch, "req_ids"):
-        for rid in self.input_batch.req_ids:
-            tokens_per_req.append(scheduler_output.num_scheduled_tokens.get(rid, 1))
-    is_decode = num_reqs > 0 and all(t == 1 for t in tokens_per_req)
-    forward_mode = "decode" if is_decode else "prefill"
-    sum_seq_len = batch_size
+    prefill_req_ids = set()
+    decode_req_ids = set()
+    prefill_scheduled_tokens = 0
+    decode_scheduled_tokens = 0
+
+    def _mark_req(req_id, num_tokens, is_prefill):
+        nonlocal prefill_scheduled_tokens, decode_scheduled_tokens
+        req_id = str(req_id)
+        num_tokens = _safe_int(num_tokens, default=0)
+        if is_prefill:
+            prefill_req_ids.add(req_id)
+            prefill_scheduled_tokens += num_tokens
+        else:
+            decode_req_ids.add(req_id)
+            decode_scheduled_tokens += num_tokens
+
+    for req in getattr(scheduler_output, "scheduled_new_reqs", None) or []:
+        req_id = getattr(req, "req_id", None)
+        if req_id is None:
+            continue
+        num_tokens = scheduled_token_map.get(req_id, scheduled_token_map.get(str(req_id), 0))
+        prompt_len = len(getattr(req, "prompt_token_ids", None) or [])
+        num_computed = _safe_int(getattr(req, "num_computed_tokens", 0), default=0)
+        # New/resumed requests are in context phase until their prompt is fully computed.
+        _mark_req(req_id, num_tokens, num_computed < prompt_len)
+
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached_reqs is not None:
+        req_ids = getattr(cached_reqs, "req_ids", None) or []
+        num_output_tokens = getattr(cached_reqs, "num_output_tokens", None) or []
+        for idx, req_id in enumerate(req_ids):
+            num_tokens = scheduled_token_map.get(req_id, scheduled_token_map.get(str(req_id), 0))
+            if num_tokens <= 0:
+                continue
+            out_tokens = num_output_tokens[idx] if idx < len(num_output_tokens) else None
+            # vLLM marks cached context/prefill requests with num_output_tokens == 0.
+            is_prefill = _safe_int(out_tokens, default=1) == 0
+            _mark_req(req_id, num_tokens, is_prefill)
+
+    # Fallback for older/changed SchedulerOutput shapes: decode if every request
+    # schedules exactly one token; otherwise treat as prefill/context.
+    accounted_req_ids = prefill_req_ids | decode_req_ids
+    for req_id, num_tokens in scheduled_token_map.items():
+        req_id_str = str(req_id)
+        if req_id_str in accounted_req_ids:
+            continue
+        is_decode = _safe_int(num_tokens, default=0) == 1
+        _mark_req(req_id_str, num_tokens, not is_decode)
+
+    if prefill_req_ids and not decode_req_ids:
+        forward_mode = "prefill"
+        batch_size = len(prefill_req_ids)
+        sum_seq_len = prefill_scheduled_tokens
+    elif decode_req_ids and not prefill_req_ids:
+        forward_mode = "decode"
+        batch_size = len(decode_req_ids)
+        sum_seq_len = decode_scheduled_tokens
+    elif prefill_req_ids and decode_req_ids:
+        forward_mode = "mixed"
+        batch_size = len(prefill_req_ids | decode_req_ids)
+        sum_seq_len = total_scheduled_tokens
+    else:
+        forward_mode = "unknown"
+        batch_size = len(scheduled_token_map)
+        sum_seq_len = total_scheduled_tokens
 
     per_req_info = []
-    if forward_mode == "prefill":
+    if prefill_req_ids:
         per_req_info = _build_prefill_per_req_info_vllm(scheduler_output)
 
     # Track forward pass ID
@@ -472,18 +538,44 @@ def execute_model_custom(
 
     # Record batch statistics if recording is enabled
     if recording_state.is_recording():
-        rec_dict = {
-            "batch_size": batch_size,
-            "latency": latency,
-            "seq_lens_sum": sum_seq_len,
-            "forward_mode": forward_mode,
-            "expert_activation": expert_activation,
-            "gpu_num": world_size,
-            "gpu_raw_type": gpu_raw_type,
-        }
-        if forward_mode == "prefill" and per_req_info:
-            rec_dict["per_req_info"] = per_req_info
-        recording_state.add_record(rec_dict)
+        records_to_add = []
+        if forward_mode == "mixed":
+            if prefill_req_ids:
+                records_to_add.append({
+                    "batch_size": len(prefill_req_ids),
+                    "latency": latency,
+                    "seq_lens_sum": prefill_scheduled_tokens,
+                    "forward_mode": "prefill",
+                    "expert_activation": expert_activation,
+                    "gpu_num": world_size,
+                    "gpu_raw_type": gpu_raw_type,
+                })
+                if per_req_info:
+                    records_to_add[-1]["per_req_info"] = per_req_info
+            if decode_req_ids:
+                records_to_add.append({
+                    "batch_size": len(decode_req_ids),
+                    "latency": latency,
+                    "seq_lens_sum": decode_scheduled_tokens,
+                    "forward_mode": "decode",
+                    "expert_activation": expert_activation,
+                    "gpu_num": world_size,
+                    "gpu_raw_type": gpu_raw_type,
+                })
+        else:
+            records_to_add.append({
+                "batch_size": batch_size,
+                "latency": latency,
+                "seq_lens_sum": sum_seq_len,
+                "forward_mode": forward_mode,
+                "expert_activation": expert_activation,
+                "gpu_num": world_size,
+                "gpu_raw_type": gpu_raw_type,
+            })
+            if forward_mode == "prefill" and per_req_info:
+                records_to_add[-1]["per_req_info"] = per_req_info
+        for rec_dict in records_to_add:
+            recording_state.add_record(rec_dict)
 
     # Automatic expert distribution recording
     if expert_distribution_recording_state.enabled:
@@ -494,19 +586,47 @@ def execute_model_custom(
             tp_rank = tp_group.rank if tp_group is not None else 0
 
             if tp_rank == 0:
-                record_dict = {
-                    "forward_pass_id": forward_pass_id,
-                    "batch_size": batch_size,
-                    "latency": latency,
-                    "seq_lens_sum": sum_seq_len,
-                    "forward_mode": forward_mode,
-                    "expert_activation": expert_activation,
-                    "gpu_num": world_size,
-                    "gpu_raw_type": gpu_raw_type,
-                }
-                if forward_mode == "prefill" and per_req_info:
-                    record_dict["per_req_info"] = per_req_info
-                expert_distribution_recording_state.add_record(record_dict)
+                records_to_add = []
+                if forward_mode == "mixed":
+                    if prefill_req_ids:
+                        records_to_add.append({
+                            "forward_pass_id": forward_pass_id,
+                            "batch_size": len(prefill_req_ids),
+                            "latency": latency,
+                            "seq_lens_sum": prefill_scheduled_tokens,
+                            "forward_mode": "prefill",
+                            "expert_activation": expert_activation,
+                            "gpu_num": world_size,
+                            "gpu_raw_type": gpu_raw_type,
+                        })
+                        if per_req_info:
+                            records_to_add[-1]["per_req_info"] = per_req_info
+                    if decode_req_ids:
+                        records_to_add.append({
+                            "forward_pass_id": forward_pass_id,
+                            "batch_size": len(decode_req_ids),
+                            "latency": latency,
+                            "seq_lens_sum": decode_scheduled_tokens,
+                            "forward_mode": "decode",
+                            "expert_activation": expert_activation,
+                            "gpu_num": world_size,
+                            "gpu_raw_type": gpu_raw_type,
+                        })
+                else:
+                    records_to_add.append({
+                        "forward_pass_id": forward_pass_id,
+                        "batch_size": batch_size,
+                        "latency": latency,
+                        "seq_lens_sum": sum_seq_len,
+                        "forward_mode": forward_mode,
+                        "expert_activation": expert_activation,
+                        "gpu_num": world_size,
+                        "gpu_raw_type": gpu_raw_type,
+                    })
+                    if forward_mode == "prefill" and per_req_info:
+                        records_to_add[-1]["per_req_info"] = per_req_info
+                for record_dict in records_to_add:
+                    expert_distribution_recording_state.add_record(record_dict)
                 logger.debug(
                     f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}"
                 )
