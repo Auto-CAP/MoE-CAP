@@ -958,20 +958,7 @@ class OpenAIAPIMoEProfiler:
             )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             num_requests = len(prompts)
-            # e2e_s = mean per-request latency (each request's own send->finish), when available.
-            # Falls back to total_time/N if per-request timings are missing (backward-compatible default).
-            # Previously this was always total_time/N (inverse throughput), so its meaning flipped between
-            # serial (bs=1) and burst (default) submission and could not be compared across modes.
-            _latencies = [
-                getattr(r, "latency", 0) or 0
-                for r in results
-                if r is not None and getattr(r, "success", False)
-            ]
-            _latencies = [x for x in _latencies if x > 0]
-            if _latencies:
-                res_dict["e2e_s"] = round(sum(_latencies) / len(_latencies), 2)
-            else:
-                res_dict["e2e_s"] = 0
+            res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
