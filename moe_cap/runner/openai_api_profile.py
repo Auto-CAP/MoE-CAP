@@ -969,11 +969,10 @@ class OpenAIAPIMoEProfiler:
                 if r is not None and getattr(r, "success", False)
             ]
             _latencies = [x for x in _latencies if x > 0]
-            res_dict["e2e_s"] = (
-                round(sum(_latencies) / len(_latencies), 2)
-                if _latencies
-                else round(total_time / max(num_requests, 1), 2)
-            )
+            if _latencies:
+                res_dict["e2e_s"] = round(sum(_latencies) / len(_latencies), 2)
+            else:
+                res_dict["e2e_s"] = 0
             res_dict["total_wall_s"] = round(total_time, 2)
             res_dict["throughput_req_s"] = (
                 round(num_requests / total_time, 4) if total_time > 0 else 0
