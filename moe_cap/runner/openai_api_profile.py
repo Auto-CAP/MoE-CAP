@@ -958,7 +958,25 @@ class OpenAIAPIMoEProfiler:
             )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             num_requests = len(prompts)
-            res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
+            # e2e_s = mean per-request latency (each request's own send->finish), when available.
+            # Falls back to total_time/N if per-request timings are missing (backward-compatible default).
+            # Previously this was always total_time/N (inverse throughput), so its meaning flipped between
+            # serial (bs=1) and burst (default) submission and could not be compared across modes.
+            # Wall time and request throughput are reported separately below.
+            _latencies = [
+                getattr(r, "latency", 0) or 0
+                for r in results
+                if r is not None and getattr(r, "success", False)
+            ]
+            _latencies = [x for x in _latencies if x > 0]
+            if _latencies:
+                res_dict["e2e_s"] = round(sum(_latencies) / len(_latencies), 2)
+            else:
+                res_dict["e2e_s"] = 0
+            res_dict["total_wall_s"] = round(total_time, 2)
+            res_dict["throughput_req_s"] = (
+                round(num_requests / total_time, 4) if total_time > 0 else 0
+            )
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
@@ -1007,6 +1025,11 @@ class OpenAIAPIMoEProfiler:
                         "output_token_count": output_token_count,
                         "requested_output_tokens": max_output_len,
                         "success": result.success,
+                        # Per-request timing so latency stats can always be
+                        # recomputed from raw records (was missing historically
+                        # -> old runs' per-request latency is unrecoverable).
+                        "latency_s": getattr(result, "latency", 0) or 0,
+                        "ttft_s": getattr(result, "ttft", 0) or 0,
                     }
                     if result.error:
                         record["error"] = result.error[:500]
@@ -1076,6 +1099,8 @@ class OpenAIAPIMoEProfiler:
                     "e2e_s": res_dict.get(
                         "e2e_s", round(total_time / max(len(prompts), 1), 2)
                     ),
+                    "total_wall_s": res_dict.get("total_wall_s", round(total_time, 2)),
+                    "throughput_req_s": res_dict.get("throughput_req_s", 0),
                     "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
                     "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
                 },
