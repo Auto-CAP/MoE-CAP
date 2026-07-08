@@ -1026,6 +1026,11 @@ class OpenAIAPIMoEProfiler:
                         "output_token_count": output_token_count,
                         "requested_output_tokens": max_output_len,
                         "success": result.success,
+                        # Per-request timing so latency stats can always be
+                        # recomputed from raw records (was missing historically
+                        # -> old runs' per-request latency is unrecoverable).
+                        "latency_s": getattr(result, "latency", 0) or 0,
+                        "ttft_s": getattr(result, "ttft", 0) or 0,
                     }
                     if result.error:
                         record["error"] = result.error[:500]
