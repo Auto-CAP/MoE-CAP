@@ -170,7 +170,13 @@ async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[async_tqdm] = None,
 ) -> RequestFuncOutput:
-    """Send async request to OpenAI-compatible chat completions API."""
+    """Send async request to OpenAI-compatible chat completions API.
+
+    Non-streaming: TTFT/TPOT are measured server-side from ModelRunner forward
+    records (sparse: expert recorder; dense/profiling-only: the profile-only
+    timing recorder). Client stream timing is intentionally not used because it
+    includes scheduler/request queueing, which is invalid at high concurrency.
+    """
     api_url = request_func_input.api_url
     messages = json.loads(
         request_func_input.prompt
@@ -604,30 +610,41 @@ class OpenAIAPIMoEProfiler:
                         }
                     )
 
-        # Use continuous batching metrics calculation
-        try:
-            gpu_raw_type = output_data[0].get("gpu_raw_type", None)
-            res_dict = _calculate_continuous_metrics(
-                n_layers=self.n_layers,
-                d_model=self.d_model,
-                gpu_raw_type=gpu_raw_type,
-                n_attn_heads=self.n_attn_heads,
-                d_head=self.d_head,
-                n_kv_heads=self.n_kv_heads,
-                d_ff=self.d_ff,
-                hf_config=getattr(self.model_info, "hf_config", None),
-                num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
-                model_name=self.hf_model_name,
-                used_dtype=self.used_dtype,
-                precision=self.precision,
-                output_data=output_data,
-            )
-        except Exception as e:
-            print(f"Warning: Could not calculate continuous batching metrics: {e}")
-            import traceback
-
-            traceback.print_exc()
+        # Profiling-only (dense) runs still get authoritative TTFT/TPOT from the
+        # server-side prefill/decode forward-latency records, but the MoE
+        # hardware-utilization formulas in _calculate_continuous_metrics assume
+        # sparse/expert structure and are not valid for dense models. Skip them
+        # and only carry gpu_raw_type through (for cost/GPU labeling).
+        if self.profiling_only:
             res_dict = {}
+            if server_records:
+                gpu_raw_type = server_records[0].get("gpu_raw_type")
+                if gpu_raw_type is not None:
+                    res_dict["gpu_raw_type"] = gpu_raw_type
+        else:
+            try:
+                gpu_raw_type = output_data[0].get("gpu_raw_type", None)
+                res_dict = _calculate_continuous_metrics(
+                    n_layers=self.n_layers,
+                    d_model=self.d_model,
+                    gpu_raw_type=gpu_raw_type,
+                    n_attn_heads=self.n_attn_heads,
+                    d_head=self.d_head,
+                    n_kv_heads=self.n_kv_heads,
+                    d_ff=self.d_ff,
+                    hf_config=getattr(self.model_info, "hf_config", None),
+                    num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
+                    model_name=self.hf_model_name,
+                    used_dtype=self.used_dtype,
+                    precision=self.precision,
+                    output_data=output_data,
+                )
+            except Exception as e:
+                print(f"Warning: Could not calculate continuous batching metrics: {e}")
+                import traceback
+
+                traceback.print_exc()
+                res_dict = {}
 
         res_dict.update(
             {
@@ -790,14 +807,13 @@ class OpenAIAPIMoEProfiler:
                 print(f"Warning: Could not load ground truth for {dataset_name}: {e}")
                 ground_truth = None
 
-            # Start batch recording on server unless profiling-only is requested.
-            # Dense models have no expert recorder; calling SGLang expert endpoints
-            # without ServerArgs.expert_distribution_recorder_mode can crash the
-            # scheduler, so profiling-only must be a hard skip.
-            if self.profiling_only:
-                server_records = []
-            else:
-                self._start_batch_recording()
+            # Both sparse and dense/profiling-only runs collect authoritative
+            # TTFT/TPOT from server-side ModelRunner forward records via the same
+            # control endpoints. In profiling-only mode the server installs a
+            # dense-safe timing recorder (MOE_CAP_PROFILING_ONLY=1), so
+            # start/stop/dump work without ExpertLocationMetadata. Client stream
+            # timing is intentionally not used (it includes request queueing).
+            self._start_batch_recording()
 
             # Run benchmark
             print(f"Sending {len(prompts)} requests to {self.api_url}")
@@ -808,10 +824,9 @@ class OpenAIAPIMoEProfiler:
                 prompt_lengths=prompt_lengths,
             )
 
-            # Stop batch recording and retrieve records
-            if not self.profiling_only:
-                self._stop_batch_recording()
-                server_records = self._dump_batch_recording()
+            # Stop recording and retrieve server-side forward records.
+            self._stop_batch_recording()
+            server_records = self._dump_batch_recording()
 
             num_gpus = 1
             if server_records and len(server_records) > 0:
