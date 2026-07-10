@@ -845,15 +845,22 @@ class OpenAIAPIMoEProfiler:
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
                 try:
-                    # Extract predictions from results
-                    predictions = [r.generated_text for r in results if r.success]
+                    # Successful-only evaluation, but each prediction must stay
+                    # paired with the ground truth at its ORIGINAL index. Zipping
+                    # successes against ground_truth[:len(predictions)] silently
+                    # shifts every target after the first failure, corrupting acc.
+                    paired = [
+                        (r.generated_text, ground_truth[i])
+                        for i, r in enumerate(results)
+                        if r.success and i < len(ground_truth)
+                    ]
+                    predictions = [p for p, _ in paired]
+                    targets = [t for _, t in paired]
 
                     # Compute accuracy using utility function
                     accuracy_metrics = compute_accuracy_metrics(
                         predictions=predictions,
-                        targets=ground_truth[
-                            : len(predictions)
-                        ],  # Match length in case some failed
+                        targets=targets,
                         dataset_name=dataset_name,
                         extract_answers=True,
                     )
@@ -873,12 +880,21 @@ class OpenAIAPIMoEProfiler:
                         load_baseline_answers,
                     )
 
+                    # Successful-only evaluation, keeping every prediction paired
+                    # with the question / UID / baseline at its ORIGINAL result
+                    # index. Slicing the aligned lists to [:len(predictions)]
+                    # shifts every entry after the first failure (same root cause
+                    # as the accuracy block above).
+                    success_indices = [i for i, r in enumerate(results) if r.success]
                     predictions = [
-                        extract_answer(r.generated_text, dataset_name)
-                        for r in results
-                        if r.success
+                        extract_answer(results[i].generated_text, dataset_name)
+                        for i in success_indices
                     ]
-                    questions = all_input_raw[: len(predictions)]
+                    questions = [
+                        all_input_raw[i]
+                        for i in success_indices
+                        if i < len(all_input_raw)
+                    ]
 
                     # Load baseline answers
                     if self.config.baseline_answers_path:
@@ -896,7 +912,12 @@ class OpenAIAPIMoEProfiler:
                         # Match by uid if loader supports it, else fall back to index order
                         loader, _ = get_loader_for_task(dataset_name, self.config)
                         if hasattr(loader, "get_uids"):
-                            uids = loader.get_uids()[: len(predictions)]
+                            all_uids = loader.get_uids()
+                            uids = [
+                                all_uids[i]
+                                for i in success_indices
+                                if i < len(all_uids)
+                            ]
                             baseline_answers = [baseline_dict.get(uid, "") for uid in uids]
                             missing = sum(1 for a in baseline_answers if not a)
                             if missing > 0:
@@ -905,7 +926,25 @@ class OpenAIAPIMoEProfiler:
                                     "Ensure baseline file covers all dataset samples."
                                 )
                         else:
-                            baseline_answers = list(baseline_dict.values())[: len(predictions)]
+                            # No UIDs: baseline can only be aligned positionally, so
+                            # index it by the SAME original result indices. If any
+                            # successful index falls outside the baseline list we
+                            # cannot align safely -> fail loudly instead of shifting.
+                            baseline_values = list(baseline_dict.values())
+                            out_of_range = [
+                                i for i in success_indices if i >= len(baseline_values)
+                            ]
+                            if out_of_range:
+                                raise ValueError(
+                                    "Arena-Hard baseline has "
+                                    f"{len(baseline_values)} positional entries but "
+                                    f"successful result indices reach {max(success_indices)}; "
+                                    "cannot align baselines without UIDs. Provide a "
+                                    "UID-keyed baseline covering all samples."
+                                )
+                            baseline_answers = [
+                                baseline_values[i] for i in success_indices
+                            ]
                     else:
                         print(
                             "Warning: No baseline_answers_path configured for Arena-Hard judge evaluation"
