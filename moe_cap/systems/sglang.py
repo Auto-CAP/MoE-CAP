@@ -391,6 +391,86 @@ def forward_expert_record(
 
 
 # ---------------------------------------------------------------------------
+# Profiling-only recorder: a dense-safe timing recorder
+# ---------------------------------------------------------------------------
+# Dense models expose no ExpertLocationMetadata, so SGLang's
+# ``ExpertDistributionRecorder.init_new`` installs ``_ExpertDistributionRecorderNoop``
+# whose ``start_record``/``stop_record``/``dump_record`` raise. That makes the
+# existing HTTP control endpoints (dispatched to the process-global recorder by
+# the scheduler) unusable for dense profiling.
+#
+# ``_ProfilingOnlyRecorder`` collects the per-forward-pass timing records that
+# ``forward_profiling_only`` produces and dumps them through the same file path
+# and control protocol the sparse recorder uses -- but it requires no expert
+# metadata or recorder mode, so a dense server can start. Expert-distribution
+# hooks inherit the base-class no-ops and are never exercised on dense models.
+class _ProfilingOnlyRecorder(ExpertDistributionRecorder):
+    def __init__(self, server_args: ServerArgs, rank: int = 0):
+        self._server_args = server_args
+        self._rank = rank
+        self.expert_record_list: List[dict] = []
+        self._recording = False
+        self._disable_all = False
+
+    @contextmanager
+    def disable_this_region(self):
+        """Temporarily disable (no-op) expert hooks, mirroring the real recorder."""
+        previous_disable_all = self._disable_all
+        self._disable_all = True
+        try:
+            yield
+        finally:
+            self._disable_all = previous_disable_all
+
+    def start_record(self):
+        """Begin a timing window; clear any records from a previous window."""
+        if self._recording:
+            logger.warning(
+                "[profiling-only] start_record called while already recording; "
+                "resetting the timing buffer."
+            )
+        self.expert_record_list = []
+        self._recording = True
+
+    def stop_record(self):
+        """End the timing window."""
+        if not self._recording:
+            logger.warning(
+                "[profiling-only] stop_record called while not recording."
+            )
+        self._recording = False
+
+    def dump_record(self, output_mode: _OutputMode = "file"):
+        """Dump collected forward timing records.
+
+        In ``file`` mode (used by the /dump_expert_distribution_record endpoint)
+        write one JSON record per line to the same location the sparse recorder
+        uses, so the runner's existing file-reading dump path works unchanged.
+        """
+        records = list(self.expert_record_list)
+        if output_mode == "file":
+            save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
+            path_output = os.path.join(
+                save_dir,
+                f"{self._server_args.model_path}/expert_distribution_record.jsonl",
+            )
+            out_dir = os.path.dirname(path_output)
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            logger.debug(
+                f"[profiling-only] Write {len(records)} timing records to {path_output}"
+            )
+            with open(path_output, "w", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(record) + "\n")
+        return records
+
+    @property
+    def recording(self):
+        return self._recording
+
+
+# ---------------------------------------------------------------------------
 # Profiling-only forward: skip expert distribution hooks, only measure timing
 # ---------------------------------------------------------------------------
 def forward_profiling_only(
@@ -429,7 +509,11 @@ def forward_profiling_only(
     else:
         raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode.name}")
 
-    if self.tp_rank == 0:
+    # Only collect while a recording window is active (between the
+    # /start_expert_distribution_record and /stop_expert_distribution_record
+    # endpoints). This excludes warmup / CUDA-graph-capture passes and matches
+    # the start/stop/dump semantics of the sparse recorder.
+    if self.tp_rank == 0 and getattr(recorder, "recording", False):
         record_dict = {
             "forward_pass_id": self.forward_pass_id,
             "batch_size": forward_batch.batch_size,
@@ -456,8 +540,24 @@ def forward_profiling_only(
     return output
 
 
+def _profiling_only_init_new(server_args, expert_location_metadata, rank):
+    """Install the dense-safe timing recorder regardless of expert metadata.
+
+    ``model_runner`` calls ``ExpertDistributionRecorder.init_new`` to build the
+    process-global recorder before serving. In profiling-only mode we bypass the
+    metadata/recorder-mode requirement (which dense models cannot satisfy) and
+    return a ``_ProfilingOnlyRecorder`` so the server starts and the control
+    endpoints can collect/dump forward timing records.
+    """
+    return _ProfilingOnlyRecorder(server_args, rank)
+
+
 if _PROFILING_ONLY:
     ModelRunner.forward = forward_profiling_only
+    # Replace the recorder factory so model_runner installs the dense-safe
+    # timing recorder as the process-global recorder (the scheduler dispatches
+    # start/stop/dump endpoint calls to it).
+    ExpertDistributionRecorder.init_new = staticmethod(_profiling_only_init_new)
     # print(
     #     f"[PID {os.getpid()}] Using profiling-only forward (no expert hooks)",
     #     flush=True,

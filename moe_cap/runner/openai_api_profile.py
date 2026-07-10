@@ -170,7 +170,13 @@ async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[async_tqdm] = None,
 ) -> RequestFuncOutput:
-    """Send async request to OpenAI-compatible chat completions API."""
+    """Send async request to OpenAI-compatible chat completions API.
+
+    Non-streaming: TTFT/TPOT are measured server-side from ModelRunner forward
+    records (sparse: expert recorder; dense/profiling-only: the profile-only
+    timing recorder). Client stream timing is intentionally not used because it
+    includes scheduler/request queueing, which is invalid at high concurrency.
+    """
     api_url = request_func_input.api_url
     messages = json.loads(
         request_func_input.prompt
@@ -604,30 +610,41 @@ class OpenAIAPIMoEProfiler:
                         }
                     )
 
-        # Use continuous batching metrics calculation
-        try:
-            gpu_raw_type = output_data[0].get("gpu_raw_type", None)
-            res_dict = _calculate_continuous_metrics(
-                n_layers=self.n_layers,
-                d_model=self.d_model,
-                gpu_raw_type=gpu_raw_type,
-                n_attn_heads=self.n_attn_heads,
-                d_head=self.d_head,
-                n_kv_heads=self.n_kv_heads,
-                d_ff=self.d_ff,
-                hf_config=getattr(self.model_info, "hf_config", None),
-                num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
-                model_name=self.hf_model_name,
-                used_dtype=self.used_dtype,
-                precision=self.precision,
-                output_data=output_data,
-            )
-        except Exception as e:
-            print(f"Warning: Could not calculate continuous batching metrics: {e}")
-            import traceback
-
-            traceback.print_exc()
+        # Profiling-only (dense) runs still get authoritative TTFT/TPOT from the
+        # server-side prefill/decode forward-latency records, but the MoE
+        # hardware-utilization formulas in _calculate_continuous_metrics assume
+        # sparse/expert structure and are not valid for dense models. Skip them
+        # and only carry gpu_raw_type through (for cost/GPU labeling).
+        if self.profiling_only:
             res_dict = {}
+            if server_records:
+                gpu_raw_type = server_records[0].get("gpu_raw_type")
+                if gpu_raw_type is not None:
+                    res_dict["gpu_raw_type"] = gpu_raw_type
+        else:
+            try:
+                gpu_raw_type = output_data[0].get("gpu_raw_type", None)
+                res_dict = _calculate_continuous_metrics(
+                    n_layers=self.n_layers,
+                    d_model=self.d_model,
+                    gpu_raw_type=gpu_raw_type,
+                    n_attn_heads=self.n_attn_heads,
+                    d_head=self.d_head,
+                    n_kv_heads=self.n_kv_heads,
+                    d_ff=self.d_ff,
+                    hf_config=getattr(self.model_info, "hf_config", None),
+                    num_gpus=output_data[0].get("gpu_num", 1) if output_data else 1,
+                    model_name=self.hf_model_name,
+                    used_dtype=self.used_dtype,
+                    precision=self.precision,
+                    output_data=output_data,
+                )
+            except Exception as e:
+                print(f"Warning: Could not calculate continuous batching metrics: {e}")
+                import traceback
+
+                traceback.print_exc()
+                res_dict = {}
 
         res_dict.update(
             {
@@ -790,14 +807,13 @@ class OpenAIAPIMoEProfiler:
                 print(f"Warning: Could not load ground truth for {dataset_name}: {e}")
                 ground_truth = None
 
-            # Start batch recording on server unless profiling-only is requested.
-            # Dense models have no expert recorder; calling SGLang expert endpoints
-            # without ServerArgs.expert_distribution_recorder_mode can crash the
-            # scheduler, so profiling-only must be a hard skip.
-            if self.profiling_only:
-                server_records = []
-            else:
-                self._start_batch_recording()
+            # Both sparse and dense/profiling-only runs collect authoritative
+            # TTFT/TPOT from server-side ModelRunner forward records via the same
+            # control endpoints. In profiling-only mode the server installs a
+            # dense-safe timing recorder (MOE_CAP_PROFILING_ONLY=1), so
+            # start/stop/dump work without ExpertLocationMetadata. Client stream
+            # timing is intentionally not used (it includes request queueing).
+            self._start_batch_recording()
 
             # Run benchmark
             print(f"Sending {len(prompts)} requests to {self.api_url}")
@@ -808,10 +824,9 @@ class OpenAIAPIMoEProfiler:
                 prompt_lengths=prompt_lengths,
             )
 
-            # Stop batch recording and retrieve records
-            if not self.profiling_only:
-                self._stop_batch_recording()
-                server_records = self._dump_batch_recording()
+            # Stop recording and retrieve server-side forward records.
+            self._stop_batch_recording()
+            server_records = self._dump_batch_recording()
 
             num_gpus = 1
             if server_records and len(server_records) > 0:
@@ -830,15 +845,22 @@ class OpenAIAPIMoEProfiler:
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
                 try:
-                    # Extract predictions from results
-                    predictions = [r.generated_text for r in results if r.success]
+                    # Successful-only evaluation, but each prediction must stay
+                    # paired with the ground truth at its ORIGINAL index. Zipping
+                    # successes against ground_truth[:len(predictions)] silently
+                    # shifts every target after the first failure, corrupting acc.
+                    paired = [
+                        (r.generated_text, ground_truth[i])
+                        for i, r in enumerate(results)
+                        if r.success and i < len(ground_truth)
+                    ]
+                    predictions = [p for p, _ in paired]
+                    targets = [t for _, t in paired]
 
                     # Compute accuracy using utility function
                     accuracy_metrics = compute_accuracy_metrics(
                         predictions=predictions,
-                        targets=ground_truth[
-                            : len(predictions)
-                        ],  # Match length in case some failed
+                        targets=targets,
                         dataset_name=dataset_name,
                         extract_answers=True,
                     )
@@ -858,12 +880,21 @@ class OpenAIAPIMoEProfiler:
                         load_baseline_answers,
                     )
 
+                    # Successful-only evaluation, keeping every prediction paired
+                    # with the question / UID / baseline at its ORIGINAL result
+                    # index. Slicing the aligned lists to [:len(predictions)]
+                    # shifts every entry after the first failure (same root cause
+                    # as the accuracy block above).
+                    success_indices = [i for i, r in enumerate(results) if r.success]
                     predictions = [
-                        extract_answer(r.generated_text, dataset_name)
-                        for r in results
-                        if r.success
+                        extract_answer(results[i].generated_text, dataset_name)
+                        for i in success_indices
                     ]
-                    questions = all_input_raw[: len(predictions)]
+                    questions = [
+                        all_input_raw[i]
+                        for i in success_indices
+                        if i < len(all_input_raw)
+                    ]
 
                     # Load baseline answers
                     if self.config.baseline_answers_path:
@@ -881,7 +912,12 @@ class OpenAIAPIMoEProfiler:
                         # Match by uid if loader supports it, else fall back to index order
                         loader, _ = get_loader_for_task(dataset_name, self.config)
                         if hasattr(loader, "get_uids"):
-                            uids = loader.get_uids()[: len(predictions)]
+                            all_uids = loader.get_uids()
+                            uids = [
+                                all_uids[i]
+                                for i in success_indices
+                                if i < len(all_uids)
+                            ]
                             baseline_answers = [baseline_dict.get(uid, "") for uid in uids]
                             missing = sum(1 for a in baseline_answers if not a)
                             if missing > 0:
@@ -890,7 +926,25 @@ class OpenAIAPIMoEProfiler:
                                     "Ensure baseline file covers all dataset samples."
                                 )
                         else:
-                            baseline_answers = list(baseline_dict.values())[: len(predictions)]
+                            # No UIDs: baseline can only be aligned positionally, so
+                            # index it by the SAME original result indices. If any
+                            # successful index falls outside the baseline list we
+                            # cannot align safely -> fail loudly instead of shifting.
+                            baseline_values = list(baseline_dict.values())
+                            out_of_range = [
+                                i for i in success_indices if i >= len(baseline_values)
+                            ]
+                            if out_of_range:
+                                raise ValueError(
+                                    "Arena-Hard baseline has "
+                                    f"{len(baseline_values)} positional entries but "
+                                    f"successful result indices reach {max(success_indices)}; "
+                                    "cannot align baselines without UIDs. Provide a "
+                                    "UID-keyed baseline covering all samples."
+                                )
+                            baseline_answers = [
+                                baseline_values[i] for i in success_indices
+                            ]
                     else:
                         print(
                             "Warning: No baseline_answers_path configured for Arena-Hard judge evaluation"
