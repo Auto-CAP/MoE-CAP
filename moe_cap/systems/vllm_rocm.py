@@ -7,6 +7,12 @@ GPU detection uses rocm-smi instead of nvidia-smi/GPUtil.
 import os
 import subprocess
 
+# GPU detection below calls torch.cuda before vLLM starts its EngineCore process.
+# ROCm cannot safely re-initialize the accelerator after a fork, so make the
+# AMD-specific entry point use multiprocessing spawn unless the operator has
+# explicitly selected another method.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 
 def _get_amd_gpu_type():
     """Detect AMD GPU. Returns formatted name like 'AMD-Instinct-MI355X-288GB'."""
