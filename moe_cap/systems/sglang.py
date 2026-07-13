@@ -23,6 +23,8 @@ import sglang.srt.managers.io_struct as iostruct
 from sglang.srt.managers.io_struct import BaseReq, ExpertDistributionReqType
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, TopKOutput
 import dataclasses
+import inspect
+from functools import lru_cache
 
 from typing import Optional, Tuple, Union, List, Literal, Dict, Any
 import time
@@ -316,6 +318,60 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
     return per_req_info
 
 
+@lru_cache(maxsize=None)
+def _forward_raw_accepts_skip_attn(func) -> bool:
+    """Whether ``ModelRunner._forward_raw`` still takes ``skip_attn_backend_init``.
+
+    Cached on the underlying function object (one ModelRunner class per process).
+    """
+    try:
+        return "skip_attn_backend_init" in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        # Introspection failed; assume the legacy signature (its extra arg is the
+        # historical default and matches the older SGLang builds we target).
+        return True
+
+
+def _call_forward_raw(
+    model_runner,
+    forward_batch,
+    skip_attn_backend_init,
+    pp_proxy_tensors,
+    reinit_attn_backend,
+    split_forward_count,
+):
+    """Invoke ``ModelRunner._forward_raw`` across SGLang versions.
+
+    Newer SGLang (e.g. 0.5.14) dropped the ``skip_attn_backend_init`` positional
+    parameter from ``_forward_raw``. Its ``forward`` now folds that flag onto the
+    batch via ``forward_batch.apply_deprecated_skip_attn_backend_init(...)`` and
+    calls ``_forward_raw(forward_batch, pp_proxy_tensors, reinit_attn_backend,
+    split_forward_count)``. Older builds kept ``skip_attn_backend_init`` as the
+    second positional argument. Dispatch on the live signature so this recorder
+    works against both.
+    """
+    if _forward_raw_accepts_skip_attn(type(model_runner)._forward_raw):
+        return model_runner._forward_raw(
+            forward_batch,
+            skip_attn_backend_init,
+            pp_proxy_tensors,
+            reinit_attn_backend,
+            split_forward_count,
+        )
+
+    apply_skip = getattr(
+        forward_batch, "apply_deprecated_skip_attn_backend_init", None
+    )
+    if apply_skip is not None:
+        apply_skip(skip_attn_backend_init)
+    return model_runner._forward_raw(
+        forward_batch,
+        pp_proxy_tensors,
+        reinit_attn_backend,
+        split_forward_count,
+    )
+
+
 def forward_expert_record(
     self,
     forward_batch: ForwardBatch,
@@ -334,7 +390,8 @@ def forward_expert_record(
     ):
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        output = self._forward_raw(
+        output = _call_forward_raw(
+            self,
             forward_batch,
             skip_attn_backend_init,
             pp_proxy_tensors,
@@ -513,7 +570,8 @@ def forward_profiling_only(
     with recorder.disable_this_region():
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        output = self._forward_raw(
+        output = _call_forward_raw(
+            self,
             forward_batch,
             skip_attn_backend_init,
             pp_proxy_tensors,
