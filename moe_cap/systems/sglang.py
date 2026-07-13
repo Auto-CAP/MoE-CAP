@@ -41,12 +41,35 @@ if _PROFILING_ONLY:
 _OutputMode = Literal["file", "object"]
 
 
-@dataclasses.dataclass
-class ExpertDistributionReq2(BaseReq):
-    action: ExpertDistributionReqType
+# `BaseReq` changed shape across SGLang releases. In newer builds (e.g. 0.5.14)
+# it is a `msgspec.Struct` (`class BaseReq(msgspec.Struct, tag=True, kw_only=True,
+# array_like=True)`), whose classes cannot be re-decorated with
+# `@dataclasses.dataclass` (doing so raises `AttributeError: readonly attribute`).
+# Older builds define `BaseReq` as a plain dataclass. Build `ExpertDistributionReq2`
+# with whichever mechanism matches the installed `BaseReq`.
+def _base_req_is_msgspec_struct(base) -> bool:
+    try:
+        import msgspec
+    except ImportError:
+        return False
+    return isinstance(base, type) and issubclass(base, msgspec.Struct)
 
 
-# Fix the module and qualname so pickle can find it correctly
+if _base_req_is_msgspec_struct(BaseReq):
+    # msgspec.Struct path: mirror upstream `ExpertDistributionReq`, i.e.
+    # `class ExpertDistributionReq(BaseReq, kw_only=True): action: ...`.
+    class ExpertDistributionReq2(BaseReq, kw_only=True):
+        action: ExpertDistributionReqType
+
+else:
+    # Legacy dataclass path.
+    @dataclasses.dataclass
+    class ExpertDistributionReq2(BaseReq):
+        action: ExpertDistributionReqType
+
+
+# Fix the module and qualname so pickle can find it correctly. These type dunders
+# are writable on both dataclass and msgspec.Struct subclasses.
 ExpertDistributionReq2.__module__ = iostruct.ExpertDistributionReq.__module__
 ExpertDistributionReq2.__qualname__ = iostruct.ExpertDistributionReq.__qualname__
 ExpertDistributionReq2.__name__ = iostruct.ExpertDistributionReq.__name__
