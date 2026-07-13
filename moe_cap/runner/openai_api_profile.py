@@ -228,6 +228,51 @@ async def async_request_openai_chat_completions(
     return output
 
 
+def build_failure_zero_predictions(
+    results: List[RequestFuncOutput],
+    ground_truth: List[Any],
+) -> Tuple[List[str], List[Any]]:
+    """Failure-as-zero prediction/target pairing aligned to every sample.
+
+    Evaluate EVERY ground-truth sample while preserving original index
+    alignment. At index ``i`` the model's generated text is used only if result
+    ``i`` exists and succeeded; otherwise an empty prediction is emitted, which
+    naturally scores zero. Missing result objects (``results`` shorter than the
+    ground truth) also count as zero. Failed requests are never silently
+    excluded, so the returned lists always have ``len(ground_truth)`` entries and
+    the reported total equals the full requested/evaluable sample count.
+    """
+    predictions: List[str] = []
+    targets: List[Any] = list(ground_truth)
+    for i in range(len(ground_truth)):
+        if i < len(results) and results[i].success:
+            predictions.append(results[i].generated_text)
+        else:
+            predictions.append("")
+    return predictions, targets
+
+
+def arena_hard_success_failure_indices(
+    results: List[RequestFuncOutput],
+    n_eval: int,
+) -> Tuple[List[int], List[int]]:
+    """Split ``n_eval`` evaluable samples into successful and failed indices.
+
+    A sample is successful only if result ``i`` exists and succeeded; every other
+    evaluable index (failed request or missing result object) is a failure that
+    must still contribute a zero to the Arena-Hard aggregate. Indices are
+    original dataset indices, so downstream question/UID/baseline alignment is
+    preserved.
+    """
+    success_indices = [
+        i for i in range(n_eval) if i < len(results) and results[i].success
+    ]
+    failed_indices = [
+        i for i in range(n_eval) if not (i < len(results) and results[i].success)
+    ]
+    return success_indices, failed_indices
+
+
 class OpenAIAPIMoEProfiler:
     def __init__(
         self,
@@ -845,17 +890,16 @@ class OpenAIAPIMoEProfiler:
             # Compute accuracy metrics if ground truth is available
             if ground_truth is not None:
                 try:
-                    # Successful-only evaluation, but each prediction must stay
-                    # paired with the ground truth at its ORIGINAL index. Zipping
-                    # successes against ground_truth[:len(predictions)] silently
-                    # shifts every target after the first failure, corrupting acc.
-                    paired = [
-                        (r.generated_text, ground_truth[i])
-                        for i, r in enumerate(results)
-                        if r.success and i < len(ground_truth)
-                    ]
-                    predictions = [p for p, _ in paired]
-                    targets = [t for _, t in paired]
+                    # Failure-as-zero policy: evaluate EVERY ground-truth sample.
+                    # At index i use the generated text only if result i exists
+                    # and succeeded; otherwise score an empty prediction (which
+                    # naturally scores zero). Missing result objects also count
+                    # zero. This keeps original index alignment intact and makes
+                    # the reported total equal the full evaluable sample count --
+                    # failed requests are never silently excluded.
+                    predictions, targets = build_failure_zero_predictions(
+                        results, ground_truth
+                    )
 
                     # Compute accuracy using utility function
                     accuracy_metrics = compute_accuracy_metrics(
@@ -878,25 +922,32 @@ class OpenAIAPIMoEProfiler:
                     from moe_cap.utils.arena_hard_judge import (
                         evaluate_arena_hard,
                         load_baseline_answers,
+                        merge_failures_as_zero,
                     )
 
-                    # Successful-only evaluation, keeping every prediction paired
-                    # with the question / UID / baseline at its ORIGINAL result
-                    # index. Slicing the aligned lists to [:len(predictions)]
-                    # shifts every entry after the first failure (same root cause
-                    # as the accuracy block above).
-                    success_indices = [i for i, r in enumerate(results) if r.success]
+                    # Failure-as-zero policy: every evaluable Arena-Hard sample
+                    # must contribute to the final aggregate. Successful
+                    # generations are sent to the judge; failed/missing
+                    # generations are scored zero (counted as losses) and merged
+                    # back so the reported total stays the full evaluable sample
+                    # count. Everything is indexed off the ORIGINAL dataset index
+                    # so question / UID / baseline alignment is preserved.
+                    n_eval = len(all_input_raw)
+                    success_indices, failed_indices = (
+                        arena_hard_success_failure_indices(results, n_eval)
+                    )
                     predictions = [
                         extract_answer(results[i].generated_text, dataset_name)
                         for i in success_indices
                     ]
-                    questions = [
-                        all_input_raw[i]
-                        for i in success_indices
-                        if i < len(all_input_raw)
-                    ]
+                    questions = [all_input_raw[i] for i in success_indices]
 
-                    # Load baseline answers
+                    # Resolve baselines and UIDs for EVERY evaluable sample so
+                    # both successful and failed indices stay aligned. Baselines
+                    # for failed samples are still required (they are evaluable);
+                    # a failed generation just scores zero without a judge call.
+                    all_uids: Optional[List[str]] = None
+                    baseline_by_index: Optional[Dict[int, str]] = None
                     if self.config.baseline_answers_path:
                         if not os.path.exists(self.config.baseline_answers_path):
                             raise FileNotFoundError(
@@ -913,45 +964,53 @@ class OpenAIAPIMoEProfiler:
                         loader, _ = get_loader_for_task(dataset_name, self.config)
                         if hasattr(loader, "get_uids"):
                             all_uids = loader.get_uids()
-                            uids = [
-                                all_uids[i]
-                                for i in success_indices
-                                if i < len(all_uids)
+                            eval_uids = [
+                                all_uids[i] for i in range(n_eval) if i < len(all_uids)
                             ]
-                            baseline_answers = [baseline_dict.get(uid, "") for uid in uids]
-                            missing = sum(1 for a in baseline_answers if not a)
-                            if missing > 0:
+                            missing = sum(1 for uid in eval_uids if not baseline_dict.get(uid))
+                            if missing > 0 or len(eval_uids) < n_eval:
                                 raise ValueError(
-                                    f"Baseline missing for {missing}/{len(baseline_answers)} uids. "
-                                    "Ensure baseline file covers all dataset samples."
+                                    f"Baseline missing for {missing + (n_eval - len(eval_uids))}"
+                                    f"/{n_eval} evaluable uids. Ensure baseline file and "
+                                    "UIDs cover all dataset samples."
                                 )
+                            baseline_by_index = {
+                                i: baseline_dict.get(all_uids[i], "")
+                                for i in range(n_eval)
+                            }
                         else:
                             # No UIDs: baseline can only be aligned positionally, so
                             # index it by the SAME original result indices. If any
-                            # successful index falls outside the baseline list we
+                            # evaluable index falls outside the baseline list we
                             # cannot align safely -> fail loudly instead of shifting.
                             baseline_values = list(baseline_dict.values())
                             out_of_range = [
-                                i for i in success_indices if i >= len(baseline_values)
+                                i for i in range(n_eval) if i >= len(baseline_values)
                             ]
                             if out_of_range:
                                 raise ValueError(
                                     "Arena-Hard baseline has "
                                     f"{len(baseline_values)} positional entries but "
-                                    f"successful result indices reach {max(success_indices)}; "
-                                    "cannot align baselines without UIDs. Provide a "
-                                    "UID-keyed baseline covering all samples."
+                                    f"{n_eval} evaluable samples; cannot align "
+                                    "baselines without UIDs. Provide a UID-keyed "
+                                    "baseline covering all samples."
                                 )
-                            baseline_answers = [
-                                baseline_values[i] for i in success_indices
-                            ]
+                            baseline_by_index = {
+                                i: baseline_values[i] for i in range(n_eval)
+                            }
                     else:
                         print(
                             "Warning: No baseline_answers_path configured for Arena-Hard judge evaluation"
                         )
-                        baseline_answers = None
+                        baseline_by_index = None
 
-                    if baseline_answers and len(baseline_answers) >= len(predictions):
+                    if baseline_by_index is not None:
+                        # Baselines aligned to the successful generations sent to
+                        # the judge, and to the full evaluable set for merging.
+                        baseline_answers = [
+                            baseline_by_index[i] for i in success_indices
+                        ]
+
                         # Build judge API URL with auth
                         judge_api_url = self.config.judge_api_url
                         judge_model = self.config.judge_model or "gpt-4.1"
@@ -959,18 +1018,46 @@ class OpenAIAPIMoEProfiler:
                             "OPENAI_API_KEY"
                         )
 
-                        arena_metrics = await evaluate_arena_hard(
+                        judge_result = await evaluate_arena_hard(
                             questions=questions,
                             model_answers=predictions,
-                            baseline_answers=baseline_answers[: len(predictions)],
+                            baseline_answers=baseline_answers,
                             judge_api_url=judge_api_url,
                             judge_model=judge_model,
                             api_key=api_key,
                         )
+
+                        # Explicit zero records for failed/missing generations,
+                        # aligned to their original dataset index.
+                        failed_records = [
+                            {
+                                "index": i,
+                                "question": all_input_raw[i][:500],
+                                "uid": all_uids[i] if all_uids is not None else None,
+                                "model_answer": "",
+                                "baseline_answer": baseline_by_index[i][:500],
+                                "generation_error": (
+                                    results[i].error[:500]
+                                    if i < len(results)
+                                    else "missing result"
+                                ),
+                            }
+                            for i in failed_indices
+                        ]
+
+                        arena_metrics = merge_failures_as_zero(
+                            judge_result=judge_result,
+                            success_indices=success_indices,
+                            failed_records=failed_records,
+                            total=n_eval,
+                        )
                         per_question = arena_metrics.pop("arena_hard_per_question", [])
                         res_dict.update(arena_metrics)
                         print(
-                            f"Arena-Hard win rate: {arena_metrics['arena_hard_win_rate']}%"
+                            f"Arena-Hard win rate: {arena_metrics['arena_hard_win_rate']}% "
+                            f"(total={arena_metrics['arena_hard_total']}, "
+                            f"{arena_metrics['arena_hard_failed_generations']} failed "
+                            "generations scored 0)"
                         )
                         if per_question:
                             judge_dir = os.path.join(self.output_dir, self.get_model_simple_name())

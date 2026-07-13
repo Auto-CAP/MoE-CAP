@@ -277,6 +277,90 @@ async def evaluate_arena_hard(
     }
 
 
+def merge_failures_as_zero(
+    judge_result: Dict,
+    success_indices: List[int],
+    failed_records: List[Dict],
+    total: int,
+) -> Dict:
+    """Merge judged scores for successful generations with explicit zeroes for
+    failed/missing generations, producing a full-population aggregate.
+
+    Failure-as-zero policy: every failed or missing model generation counts as a
+    zero-quality prediction (a loss), so the reported Arena-Hard total equals the
+    full evaluable sample count instead of the successful-only subset. Failed
+    generations are never silently excluded.
+
+    Judge/API failures are a separate concern and are left untouched: they are
+    handled inside ``evaluate_arena_hard`` (parse/API failures already score 0.5)
+    and their ``arena_hard_errors`` count is carried through unchanged.
+
+    Args:
+        judge_result: the dict returned by ``evaluate_arena_hard`` over the
+            SUCCESSFUL generations only. Its ``arena_hard_per_question`` records
+            must be in the same order as ``success_indices``.
+        success_indices: original dataset indices of the judged (successful)
+            generations, in the order they were sent to the judge.
+        failed_records: per-question records for failed/missing generations. Each
+            must carry an ``index``; ``score`` is forced to 0.0 and the record is
+            flagged ``generation_failed``.
+        total: full evaluable sample count (== len(success) + len(failed)).
+
+    Returns:
+        Aggregate dict mirroring ``evaluate_arena_hard`` but computed over the
+        FULL evaluable population, with ``arena_hard_per_question`` sorted by
+        original index and of length ``total``.
+    """
+    judged = judge_result.get("arena_hard_per_question", [])
+    if len(judged) != len(success_indices):
+        raise ValueError(
+            f"judged records ({len(judged)}) do not match success indices "
+            f"({len(success_indices)})"
+        )
+
+    per_index: Dict[int, Dict] = {}
+    for orig_idx, record in zip(success_indices, judged):
+        rec = dict(record)
+        rec["index"] = orig_idx
+        rec["generation_failed"] = False
+        per_index[orig_idx] = rec
+
+    for record in failed_records:
+        rec = dict(record)
+        idx = rec["index"]
+        rec["generation_failed"] = True
+        rec["score"] = 0.0  # a failed generation is a loss (zero quality)
+        per_index[idx] = rec
+
+    if len(per_index) != total:
+        raise ValueError(
+            f"combined record count ({len(per_index)}) != evaluable total ({total}); "
+            "check that success and failed indices are disjoint and cover every sample"
+        )
+
+    per_question = [per_index[i] for i in sorted(per_index)]
+    scores = [float(rec.get("score", 0.0)) for rec in per_question]
+
+    wins = sum(1 for s in scores if s > 0.5)
+    losses = sum(1 for s in scores if s < 0.5)
+    ties = sum(1 for s in scores if s == 0.5)
+    win_rate = sum(scores) / len(scores) * 100 if scores else 0
+
+    result = dict(judge_result)  # carries arena_hard_errors / judge_model through
+    result.update(
+        {
+            "arena_hard_win_rate": round(win_rate, 2),
+            "arena_hard_wins": wins,
+            "arena_hard_losses": losses,
+            "arena_hard_ties": ties,
+            "arena_hard_total": total,
+            "arena_hard_failed_generations": len(failed_records),
+            "arena_hard_per_question": per_question,
+        }
+    )
+    return result
+
+
 def load_baseline_answers(path: str) -> Dict[str, str]:
     """Load baseline answers from a JSONL file.
 
