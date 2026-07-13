@@ -699,8 +699,6 @@ class OpenAIAPIMoEProfiler:
                 # "avg_context_len": avg_context_len,
                 # "decode_throughput_tokens_per_sec": total_output_tokens / total_decode_time if total_decode_time > 0 else 0,
                 "total_requests": len(results),
-                "successful_requests": len(successful_results),
-                "failed_requests": len(results) - len(successful_results),
             }
         )
 
