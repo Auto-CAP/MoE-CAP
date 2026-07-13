@@ -54,6 +54,89 @@ from moe_cap.utils.hardware_utils import get_gpu_details
 
 logger = init_logger(__name__)
 
+
+# ============================================================================
+# vLLM 0.21 / FastAPI >= 0.137 compatibility shim
+# ============================================================================
+def _install_prometheus_routing_compat():
+    """Tolerate FastAPI >= 0.137 with prometheus-fastapi-instrumentator route naming.
+
+    FastAPI 0.137 introduced ``fastapi.routing._IncludedRouter`` route objects,
+    which do not expose the ``.path`` attribute that the bundled
+    ``prometheus_fastapi_instrumentator.routing`` helper assumes on every route.
+    Under this version combination (observed with vllm 0.21.0, fastapi 0.137.1,
+    prometheus-fastapi-instrumentator 8.0.0) every metrics-instrumented request
+    to a stock vLLM route (e.g. ``/health``, ``/v1/models``) raises
+    ``AttributeError: '_IncludedRouter' object has no attribute 'path'`` and the
+    server returns HTTP 500.
+
+    We wrap ``get_route_name`` so that normal route naming is completely
+    unchanged and only this specific ``AttributeError`` falls back to the request
+    scope path. Any unrelated exception (including unrelated ``AttributeError``s)
+    is propagated untouched, and no files under site-packages are modified. The
+    shim is a no-op when the instrumentator is not installed and is idempotent.
+    """
+    import sys as _sys
+
+    try:
+        from prometheus_fastapi_instrumentator import routing as _prom_routing
+    except ImportError:
+        # Instrumentation is optional; nothing to shim if it is not installed.
+        # Only absence (ImportError) is tolerated here — any other import-time
+        # failure is a real problem and must surface.
+        return
+
+    current = getattr(_prom_routing, "get_route_name", None)
+    if current is None:
+        return
+
+    if getattr(current, "_moe_cap_route_name_shim", False):
+        # Already wrapped; reuse the existing shim but still (re)sync any
+        # submodule that imported the original by value after the first install.
+        shim = current
+        original = shim._moe_cap_wrapped
+    else:
+        original = current
+
+        def _safe_get_route_name(request, *args, **kwargs):
+            try:
+                return original(request, *args, **kwargs)
+            except AttributeError as exc:
+                # Scope strictly to the observed incompatibility: a route object
+                # (e.g. fastapi.routing._IncludedRouter) that lacks ``.path``.
+                # The message is CPython's canonical
+                # "'<Type>' object has no attribute 'path'". Any other
+                # AttributeError (including ones that merely mention a path, such
+                # as a missing ``path_params``/``path_regex``) keeps propagating.
+                if "has no attribute 'path'" not in str(exc):
+                    raise
+                scope = getattr(request, "scope", None) or {}
+                return scope.get("path")
+
+        _safe_get_route_name._moe_cap_route_name_shim = True
+        _safe_get_route_name._moe_cap_wrapped = original
+        shim = _safe_get_route_name
+        _prom_routing.get_route_name = shim
+
+    # Some submodules bind ``get_route_name`` by value at import time
+    # (e.g. ``from .routing import get_route_name`` inside the middleware). Sync
+    # any that still reference the original so the shim also covers the live
+    # request path regardless of import ordering.
+    for module in list(_sys.modules.values()):
+        if module is None:
+            continue
+        if not getattr(module, "__name__", "").startswith(
+            "prometheus_fastapi_instrumentator"
+        ):
+            continue
+        if getattr(module, "get_route_name", None) is original:
+            module.get_route_name = shim
+
+
+# Install early so the shim is in place before the metrics middleware is built.
+_install_prometheus_routing_compat()
+
+
 # ============================================================================
 # CRITICAL: Apply expert distribution monkey patching BEFORE any other vLLM imports
 # This must be done early so it applies to all worker processes
@@ -1716,6 +1799,10 @@ def main():
     def patched_build_app(args, *extra_args, **extra_kwargs):
         """Patched build_app that adds custom endpoints."""
         app = original_build_app(args, *extra_args, **extra_kwargs)
+
+        # Re-sync the prometheus route-naming shim: building the app imports the
+        # instrumentator middleware, which may bind get_route_name by value.
+        _install_prometheus_routing_compat()
 
         # vLLM stores the engine in app.state, but we need to access it correctly
         # The engine is typically set by vLLM's build_app function
