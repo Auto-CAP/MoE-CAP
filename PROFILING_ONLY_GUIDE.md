@@ -151,7 +151,6 @@ outputs/profile_only/
 | `gpu_type` | Detected GPU type and count |
 | `profiling_only` | `true` — confirms expert recording was skipped |
 | `total_requests` | Total requests sent |
-| `successful_requests` | Requests that completed successfully |
 
 ---
 
