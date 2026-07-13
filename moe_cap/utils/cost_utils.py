@@ -16,6 +16,8 @@ GPU_COST_DICT = {
     "NVIDIA-RTX-A6000-48GB": 4500,  # ~$4,500 - High-end workstation GPU
     # RTX PRO Blackwell Series
     "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 8000,  # ~$8,000 - Blackwell architecture, 96GB
+    "NVIDIA-GB10-UnknownGB": 3999,  # DGX Spark launch MSRP; curated release prices may override this
+    "NVIDIA-GB10-128GB": 3999,
 }
 
 GPU_TDP_DICT = {
@@ -34,6 +36,8 @@ GPU_TDP_DICT = {
     "NVIDIA-RTX-A6000-48GB": 300,  # 300W TDP - High-end workstation
     # RTX PRO Blackwell Series
     "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 600,  # 600W TDP
+    "NVIDIA-GB10-UnknownGB": 140,  # GB10 chip TDP, including CPU and GPU
+    "NVIDIA-GB10-128GB": 140,
 }
 
 CPU_COST = 7214.00

@@ -3,6 +3,7 @@ from huggingface_hub import snapshot_download
 import subprocess
 import re
 import os
+import math
 import GPUtil
 
 GPU_TEMP = "Temp(C)"
@@ -41,6 +42,10 @@ MEM_BW_DICT = {
     "NVIDIA-B200-183GB": 8000e9,  # HBM3e 8 TB/s (Blackwell)
     "NVIDIA-GH200-96GB": 4096e9,
     "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1597e9,
+    # DGX Spark / GB10 Grace Blackwell: 128 GB LPDDR5x unified memory,
+    # 273 GB/s bandwidth (NVIDIA DGX Spark hardware specifications).
+    "NVIDIA-GB10-UnknownGB": 273e9,
+    "NVIDIA-GB10-128GB": 273e9,
     "AMD-Instinct-MI355X-288GB": 8000e9,
     "AMD-Instinct-MI300X-192GB": 5300e9,
     "AMD-Instinct-MI325X-256GB": 6000e9,
@@ -62,6 +67,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 80e12,
         "NVIDIA-GH200-96GB": 989e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 500e12,
+        # DGX Spark only publishes FP4 sparse peak. FP32 is estimated from
+        # 6,144 Blackwell CUDA cores to keep utilization metrics non-zero.
+        "NVIDIA-GB10-UnknownGB": 31e12,
+        "NVIDIA-GB10-128GB": 31e12,
         "AMD-Instinct-MI355X-288GB": 78.6e12,
         "AMD-Instinct-MI300X-192GB": 81.7e12,
         "AMD-Instinct-MI325X-256GB": 81.7e12,
@@ -81,6 +90,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 2250e12,
         "NVIDIA-GH200-96GB": 1979e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
+        # Derived from NVIDIA published 1 PFLOP sparse FP4 peak using
+        # Blackwell tensor-core precision ratios (FP16/BF16 ~= FP4 / 4).
+        "NVIDIA-GB10-UnknownGB": 250e12,
+        "NVIDIA-GB10-128GB": 250e12,
         "AMD-Instinct-MI355X-288GB": 2500e12,
         "AMD-Instinct-MI300X-192GB": 1307e12,
         "AMD-Instinct-MI325X-256GB": 1307e12,
@@ -100,6 +113,10 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 2250e12,
         "NVIDIA-GH200-96GB": 1979e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 1000e12,
+        # Derived from NVIDIA published 1 PFLOP sparse FP4 peak using
+        # Blackwell tensor-core precision ratios (FP16/BF16 ~= FP4 / 4).
+        "NVIDIA-GB10-UnknownGB": 250e12,
+        "NVIDIA-GB10-128GB": 250e12,
         "AMD-Instinct-MI355X-288GB": 2500e12,
         "AMD-Instinct-MI300X-192GB": 1307e12,
         "AMD-Instinct-MI325X-256GB": 1307e12,
@@ -119,6 +136,8 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 4500e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
+        "NVIDIA-GB10-UnknownGB": 500e12,
+        "NVIDIA-GB10-128GB": 500e12,
         "AMD-Instinct-MI355X-288GB": 5050e12,
         "AMD-Instinct-MI300X-192GB": 2614e12,
         "AMD-Instinct-MI325X-256GB": 2614e12,
@@ -138,6 +157,8 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 4500e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 2000e12,
+        "NVIDIA-GB10-UnknownGB": 500e12,
+        "NVIDIA-GB10-128GB": 500e12,
         "AMD-Instinct-MI355X-288GB": 5050e12,
         "AMD-Instinct-MI300X-192GB": 2614e12,
         "AMD-Instinct-MI325X-256GB": 2614e12,
@@ -156,6 +177,9 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 9000e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
+        # NVIDIA DGX Spark publishes up to 1 PFLOP FP4 with sparsity.
+        "NVIDIA-GB10-UnknownGB": 1000e12,
+        "NVIDIA-GB10-128GB": 1000e12,
         "AMD-Instinct-MI355X-288GB": 10100e12,
         "AMD-Instinct-MI300X-192GB": 0,
         "AMD-Instinct-MI325X-256GB": 0,
@@ -175,6 +199,8 @@ PEAK_FLOPS_DICT = {
         "NVIDIA-B200-183GB": 9000e12,
         "NVIDIA-GH200-96GB": 3958e12,
         "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition-96GB": 4000e12,
+        "NVIDIA-GB10-UnknownGB": 1000e12,
+        "NVIDIA-GB10-128GB": 1000e12,
         "AMD-Instinct-MI355X-288GB": 10100e12,
         "AMD-Instinct-MI300X-192GB": 0,
         "AMD-Instinct-MI325X-256GB": 0,
@@ -356,8 +382,17 @@ def get_gpu_details():
             return "AMD-GPU-Unknown"
     gpu = gpus[0]
     name = gpu.name.replace(" ", "-")
-    memory_gb = round(gpu.memoryTotal / 1024)
-    memory = f"{memory_gb}GB"
+    try:
+        memory_total = float(gpu.memoryTotal)
+        if math.isnan(memory_total) or memory_total <= 0:
+            raise ValueError(f"invalid GPU memoryTotal: {gpu.memoryTotal!r}")
+        memory_gb = round(memory_total / 1024)
+        memory = f"{memory_gb}GB"
+    except (TypeError, ValueError):
+        # DGX Spark / GB10 reports GPU memory as N/A through nvidia-smi/GPUtil.
+        # Keep hardware detection non-fatal; hardware specs include an explicit
+        # NVIDIA-GB10-UnknownGB entry for post-processing.
+        memory = "UnknownGB"
 
     for part in name.split("-"):
         if part.endswith("GB") and part[:-2].isdigit():
