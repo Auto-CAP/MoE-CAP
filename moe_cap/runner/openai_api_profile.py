@@ -21,6 +21,7 @@ from moe_cap.utils.acc_metrics import (
     format_accuracy_summary,
 )
 from moe_cap.utils.cost_utils import calculate_cost
+from moe_cap.utils.report_metrics import calculate_wall_time_metrics
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
 
@@ -1097,7 +1098,8 @@ class OpenAIAPIMoEProfiler:
             )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             num_requests = len(prompts)
-            res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
+            wall_time_metrics = calculate_wall_time_metrics(total_time, num_requests)
+            res_dict.update(wall_time_metrics)
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
@@ -1217,9 +1219,7 @@ class OpenAIAPIMoEProfiler:
 
             metrics_dict = {
                 "performance": {
-                    "e2e_s": res_dict.get(
-                        "e2e_s", round(total_time / max(len(prompts), 1), 2)
-                    ),
+                    **wall_time_metrics,
                     "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
                     "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
                 },
