@@ -146,7 +146,8 @@ outputs/profile_only/
 |-------|-------------|
 | `prefill_tpot_ms` | Average prefill time per token (ms) |
 | `decode_tpot_ms` | Average decode time per output token (ms) |
-| `e2e_s` | Total wall-clock time (seconds) |
+| `unnormalized_e2e` | Total wall-clock time in seconds; not divided by request count |
+| `request/s` | Attempted requests per second: `total_requests / unnormalized_e2e` |
 | `cost` | Estimated GPU cost |
 | `gpu_type` | Detected GPU type and count |
 | `profiling_only` | `true` — confirms expert recording was skipped |
