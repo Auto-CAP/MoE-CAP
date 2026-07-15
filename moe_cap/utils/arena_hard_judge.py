@@ -43,6 +43,20 @@ VERDICT_TO_SCORE_A = {
 SIGNIFICANT_WEIGHT = 3
 
 
+def is_degenerate_generation(text: str, minimum_run: int = 512) -> bool:
+    """Return whether an Arena generation is empty or pathologically repetitive.
+
+    Whitespace-only responses are generation failures even when the HTTP request
+    itself succeeded. Long repeated punctuation tails are a known numerical
+    degeneration mode and must likewise score zero without being sent to the
+    judge.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    return re.search(rf"([^\w\s])\1{{{minimum_run - 1},}}$", stripped) is not None
+
+
 def parse_verdict(judge_output: str) -> Optional[str]:
     """Extract verdict like 'A>>B' from judge output containing [[A>>B]]."""
     match = re.search(r"\[\[([AB][>=<]+[AB])\]\]", judge_output)

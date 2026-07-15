@@ -35,65 +35,94 @@ def extract_answer(text: str, dataset_name: str) -> str:
         return ""
 
     if dataset_name.lower() in ["gsm8k", "math", "numinamath"]:
-        # Priority 1: Look for explicit answer markers (high confidence patterns)
-        # These are the primary patterns that indicate a deliberate final answer
-        high_confidence_patterns = [
-            r"####\s*(-?\d[\d,]*)",  # GSM8K style: #### 42
-            r"\\boxed\{(-?\d[\d,]*)\}",  # LaTeX boxed: \boxed{42}
-            r"\*\*Final Answer:\*\*\s*\$?(-?\d[\d,]*)",  # **Final Answer:** 42 or **Final Answer:** $42
-            r"\*\*Answer:\*\*\s*\$?(-?\d[\d,]*)",  # **Answer:** 42 or **Answer:** $42
-            r"\*\*\$?(-?\d[\d,]*)\$?\*\*\s*\.?\s*$",  # **42** or **$42** at end of text
-            r"(?:final\s+)?answer\s*(?:is|:)\s*\$?(-?\d[\d,]*)\$?(?:\s*\.)?$",  # "answer is 42" at end
-            r"(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)\s*\$?(-?\d[\d,]*)\$?",  # "the final answer is 42"
-            r"=\s*\*?\*?\$?(-?\d[\d,]*)\$?\*?\*?\s*\.?\s*$",  # "= 42" or "= **42**" at the very end
+        number = r"(?<![\d.])(-?\d[\d,]*)"
+
+        def normalize_number(value: str) -> str:
+            return value.replace(",", "").strip()
+
+        # Explicit final-answer signals are strongest. Search every supported
+        # format and select the latest numeric answer in the text instead of
+        # returning the first regex family that happens to match an earlier
+        # intermediate calculation.
+        explicit_patterns = [
+            rf"####\s*\$?\s*{number}",
+            rf"\\boxed\{{\s*\\?\$?\s*{number}(?:\s*\\?%)?[^}}]*\}}",
+            rf"(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)[^\n\d-]{{0,100}}?\\?\$?\s*{number}",
+            rf"=\s*\*?\*?\\?\$?\s*{number}(?:\.\d+)?\$?\*?\*?"
+            rf"(?:\s*(?:\\?%|[A-Za-z][A-Za-z /-]{{0,40}}))?\s*\.?\s*$",
         ]
-
-        for pattern in high_confidence_patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                return match.group(1).replace(",", "").strip()
-
-        # Priority 2: Look for boxed content (common in math)
-        boxed_match = re.search(r"\\boxed\{([^}]+)\}", text)
-        if boxed_match:
-            content = boxed_match.group(1).strip()
-            # Extract number from boxed content
-            num_match = re.search(r"(-?\d[\d,]*)", content)
-            if num_match:
-                return num_match.group(1).replace(",", "").strip()
-
-        # Priority 3: Look for bold numbers anywhere (** **) - common in markdown output
-        bold_patterns = [
-            r"\*\*\$?(-?\d[\d,]*)\$?\*\*",  # **42** or **$42**
-        ]
-        for pattern in bold_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                # Return the last bold number (most likely the final answer)
-                return matches[-1].replace(",", "").strip()
-
-        # Priority 4: Check last line for a standalone number or answer pattern
-        lines = text.strip().split("\n")
-        for line in reversed(lines[-3:]):  # Check last 3 lines
-            line = line.strip()
-            # Skip empty lines
-            if not line:
-                continue
-            # Look for "So the answer is X" or similar concluding statements
-            conclude_match = re.search(
-                r"(?:so|thus|therefore|hence)[\s,]+(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*\$?(-?\d[\d,]*)",
-                line,
+        candidates = []
+        for pattern in explicit_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+                candidates.append((match.end(1), normalize_number(match.group(1))))
+        # Markdown answers often include a unit inside the same bold span, e.g.
+        # ``**2 boxes of pizza**``. Add these to the same candidate pool so a
+        # later final bold answer outranks an earlier ``= intermediate`` line.
+        bold_matches = list(
+            re.finditer(
+                rf"\*\*\s*\\?\$?\s*{number}(?:\s+[^*\n]{{1,80}})?\*\*",
+                text,
                 re.IGNORECASE,
             )
-            if conclude_match:
-                return conclude_match.group(1).replace(",", "").strip()
-            # Check if the line is just a number (possibly with $ signs for formatting)
-            standalone_match = re.match(r"^\$?(-?\d[\d,]*)\$?\.?$", line)
-            if standalone_match:
-                return standalone_match.group(1).replace(",", "").strip()
+        )
+        for match in bold_matches:
+            candidates.append((match.end(1), normalize_number(match.group(1))))
 
-        # NOTE: We do NOT use fallback "last number in text" as it's too unreliable
-        # and leads to false positives when the model hasn't actually answered
+        # Natural-language conclusions such as ``profit of $70,000`` are valid
+        # GSM8K answers. Restrict this to the final three non-empty lines and
+        # require a conclusion cue; never use an arbitrary global "last number"
+        # fallback because that promotes unfinished arithmetic.
+        line_matches = [
+            match for match in re.finditer(r"[^\n]+", text) if match.group().strip()
+        ]
+        tail_start = max(0, len(line_matches) - 3)
+        for line_index in range(tail_start, len(line_matches)):
+            line_match = line_matches[line_index]
+            line = line_match.group().strip()
+
+            # Handle a terminal ``Final Answer:`` label whose numeric answer is
+            # placed on the immediately following line. Do not scan beyond one
+            # line or outside the final three non-empty lines.
+            cleaned_label = re.sub(r"[*#✅>]+", " ", line).strip()
+            if (
+                re.fullmatch(r"(?:final\s+)?answer\s*:?", cleaned_label, re.IGNORECASE)
+                and line_index + 1 < len(line_matches)
+            ):
+                next_line = line_matches[line_index + 1]
+                next_numbers = list(re.finditer(number, next_line.group()))
+                if next_numbers:
+                    match = next_numbers[-1]
+                    candidates.append(
+                        (
+                            next_line.start() + match.end(1),
+                            normalize_number(match.group(1)),
+                        )
+                    )
+
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+
+        # Only when no explicit, boxed, bold, or answer-label candidate exists,
+        # inspect natural-language conclusions. This prevents a later contextual
+        # number (for example "buying 18 flowers") from overriding an explicit
+        # boxed answer on the preceding line.
+        conclusion_cue = re.compile(
+            r"\b(?:answer|result|total|profit|earnings?|salary|cost|price|value|"
+            r"amount|time|distance|speed|rate|age|percentage|percent|remaining|"
+            r"left|required|needed)\b",
+            re.IGNORECASE,
+        )
+        for line_match in reversed(line_matches[-3:]):
+            line = line_match.group().strip()
+            if conclusion_cue.search(line):
+                matches = list(re.finditer(number, line))
+                if matches:
+                    return normalize_number(matches[-1].group(1))
+            standalone = re.fullmatch(
+                rf"\$?\s*{number}\s*\$?\s*\.?", line
+            )
+            if standalone:
+                return normalize_number(standalone.group(1))
         return ""
 
     if dataset_name.lower() in ["longbench_v2"]:
