@@ -167,6 +167,18 @@ async def async_request_openai_completions(
     return output
 
 
+def _extract_chat_generated_text(message: Dict[str, Any]) -> str:
+    """Return content, falling back to reasoning fields when content is empty."""
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        return content
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[async_tqdm] = None,
@@ -207,7 +219,7 @@ async def async_request_openai_chat_completions(
                     choice = data["choices"][0]
                     # Handle both regular and reasoning model responses
                     msg = choice.get("message", {})
-                    generated_text = msg.get("content") or ""
+                    generated_text = _extract_chat_generated_text(msg)
                     latency = time.perf_counter() - st
                     output.generated_text = generated_text
                     output.success = True
