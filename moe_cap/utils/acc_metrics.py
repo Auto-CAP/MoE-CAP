@@ -48,7 +48,8 @@ def extract_answer(text: str, dataset_name: str) -> str:
             rf"####\s*\$?\s*{number}",
             rf"\\boxed\{{\s*\\?\$?\s*{number}(?:\s*\\?%)?[^}}]*\}}",
             rf"(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)[^\n\d-]{{0,100}}?\\?\$?\s*{number}",
-            rf"=\s*\*?\*?\\?\$?\s*{number}\$?\*?\*?\s*\.?\s*$",
+            rf"=\s*\*?\*?\\?\$?\s*{number}(?:\.\d+)?\$?\*?\*?"
+            rf"(?:\s*(?:\\?%|[A-Za-z][A-Za-z /-]{{0,40}}))?\s*\.?\s*$",
         ]
         candidates = []
         for pattern in explicit_patterns:

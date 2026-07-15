@@ -15,6 +15,7 @@ from moe_cap.utils.acc_metrics import extract_answer
         ("#### 42", "42"),
         ("#### 106.12", "106"),
         ("Answer: $26.00", "26"),
+        ("She makes $2 * 16 = $32 per day.", "32"),
     ],
 )
 def test_gsm8k_extracts_natural_final_answer_formats(text, expected):
