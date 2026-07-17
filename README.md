@@ -135,6 +135,8 @@ To enable verbose debug logging for troubleshooting:
 | `MOE_CAP_SKIP_EXPERT_PATCHING` | `0` | Set to `1` to skip expert distribution monkey patching on the vLLM server. Useful for models with incompatible MoE implementations (e.g., Mixtral). Automatically set when `MOE_CAP_PROFILING_ONLY=1`. |
 | `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` | `~/expert_records` | Directory where SGLang writes expert distribution JSONL records. |
 
+For reproduced AMD MI355X serving failures and upstream reproduction requests, see [AMD MI355X Runtime Issue Reproduction Notes](docs/amd-mi355x-runtime-issues/README.md).
+
 ### Example: Quiet Run (default)
 
 ```bash
