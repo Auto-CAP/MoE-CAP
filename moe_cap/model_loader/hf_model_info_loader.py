@@ -2,6 +2,7 @@ from .base_model_info_loader import BaseModelInfoRetriever
 from typing import Any, Dict
 from transformers import AutoConfig
 from moe_cap.configs import CAPConfig
+from .precision_utils import resolve_precision, normalize_model_id
 
 
 def _pick(d: Dict[str, Any], *keys, default=None):
@@ -59,7 +60,7 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
         valid_precisions = [
             "float32", "float16", "bfloat16",
             "int8", "int4", "awq", "gptq",
-            "fp8", "fp4"
+            "fp8", "fp4", "mxfp4", "nvfp4",
         ]
         if self.config.precision and self.config.precision not in valid_precisions:
             raise ValueError(
@@ -74,10 +75,21 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
         )
         self.cfg = self.hf_config.to_dict()
 
-        self.model_name = self.config.model_id
+        # Effective precision = what was actually served. An explicit non-bf16
+        # --precision wins; otherwise resolve from the checkpoint's
+        # quantization_config (config.precision defaults to bf16 even for
+        # quantized checkpoints, which is the bug this fixes).
+        explicit = (self.config.precision or "").lower()
+        resolved = resolve_precision(self.cfg)
+        if explicit and explicit not in ("bfloat16", "bf16"):
+            self.effective_precision = self.config.precision
+        else:
+            self.effective_precision = resolved or self.config.precision or "bfloat16"
+
+        self.model_name = normalize_model_id(self.config.model_id)
 
     def get_model_precision_bytes(self) -> float:
-        p = (self.config.precision or "").lower()
+        p = (self.effective_precision or self.config.precision or "").lower()
         if p in ("float32", "fp32"):
             return 4.0
         if p in ("float16", "fp16"):
@@ -86,9 +98,9 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
             return 2.0
         if p in ("int8", "fp8"):
             return 1.0
-        if p in ("int4", "fp4", "awq", "gptq"):
+        if p in ("int4", "fp4", "mxfp4", "nvfp4", "awq", "gptq"):
             return 0.5
-        return 2.0  
+        return 2.0
 
 
     
