@@ -22,6 +22,25 @@ def test_compressed_tensors_int4():
     assert resolve_precision(cfg) == "int4"
 
 
+def test_kimi_nested_text_config_no_quant_method():
+    # Real kimi-k2.5 shape: quant lives in text_config, uses `dtype` (not
+    # torch_dtype) at top, and the qc has NO quant_method key (identified by
+    # config_groups + pack-quantized format). Must still resolve to int4.
+    cfg = {"dtype": "bfloat16", "quantization_config": None, "text_config": {
+        "dtype": "bfloat16",
+        "quantization_config": {
+            "format": "pack-quantized",
+            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "int"}}},
+        },
+    }}
+    assert resolve_precision(cfg) == "int4"
+
+
+def test_dtype_key_alias():
+    # Newer HF configs use `dtype` instead of `torch_dtype`.
+    assert resolve_precision({"dtype": "bfloat16"}) == "bfloat16"
+
+
 def test_compressed_tensors_fp8():
     # deepseek-r1 style: compressed-tensors, 8-bit float weights -> fp8
     cfg = {"torch_dtype": "bfloat16", "quantization_config": {
