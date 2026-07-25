@@ -355,14 +355,16 @@ class OpenAIAPIMoEProfiler:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Build HF model info retriever using the CAPConfig API
-        self.hf_model_name = config.model_id
         self.model_info = HFModelInfoRetriever(config=config)
+        # Record the HF id (org/model), not a bare local path.
+        self.hf_model_name = self.model_info.model_name
         moe_info = self.model_info.get_moe_info()
         attn_info = self.model_info.get_attention_info()
 
-        # precision and dtype
+        # precision and dtype — resolved from the checkpoint's quantization_config
+        # (config.precision defaults to bf16 even for quantized checkpoints).
         self.precision = self.model_info.get_model_precision_bytes()
-        self.used_dtype = config.precision or "bfloat16"
+        self.used_dtype = self.model_info.effective_precision or config.precision or "bfloat16"
 
         # architecture info
         arch = self.model_info.get_architecture_info()
