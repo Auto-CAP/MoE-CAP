@@ -1,24 +1,21 @@
-"""Pure helpers for reporting wall-clock timing metrics."""
+"""Pure helpers for reporting per-request timing / throughput metrics."""
 
 from typing import Dict
 
 
-def calculate_wall_time_metrics(total_time: float, num_requests: int) -> Dict[str, float]:
-    """Report raw wall-clock timing without normalizing by request count.
+def calculate_request_metrics(total_time: float, num_requests: int) -> Dict[str, float]:
+    """Report normalized (per-request) end-to-end latency and throughput.
 
     Args:
-        total_time: Raw total wall-clock time for the run (not divided by N).
+        total_time: Total wall-clock time for the run.
         num_requests: Number of attempted requests (N), including failures.
 
     Returns:
         A dict with exactly two keys:
-        - "unnormalized_e2e": the raw total wall-clock time.
+        - "e2e_s": total_time / N, the mean per-request end-to-end latency
+          (0.0 when N <= 0).
         - "request/s": N / total_time, or 0.0 when total_time <= 0.
     """
-    if total_time <= 0:
-        return {"unnormalized_e2e": total_time, "request/s": 0.0}
-
-    return {
-        "unnormalized_e2e": total_time,
-        "request/s": num_requests / total_time,
-    }
+    e2e_s = round(total_time / num_requests, 2) if num_requests > 0 else 0.0
+    request_s = round(num_requests / total_time, 4) if total_time > 0 else 0.0
+    return {"e2e_s": e2e_s, "request/s": request_s}
