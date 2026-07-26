@@ -1100,6 +1100,7 @@ class OpenAIAPIMoEProfiler:
             res_dict["precision"] = self.used_dtype
             num_requests = len(prompts)
             res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
+            res_dict["request/s"] = round(num_requests / total_time, 4) if total_time > 0 else 0.0
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
@@ -1221,6 +1222,10 @@ class OpenAIAPIMoEProfiler:
                 "performance": {
                     "e2e_s": res_dict.get(
                         "e2e_s", round(total_time / max(len(prompts), 1), 2)
+                    ),
+                    "request/s": res_dict.get(
+                        "request/s",
+                        round(len(prompts) / total_time, 4) if total_time > 0 else 0.0,
                     ),
                     "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
                     "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
