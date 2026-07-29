@@ -51,6 +51,7 @@ from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.logger import init_logger
 
 from moe_cap.utils.hardware_utils import get_gpu_details
+from moe_cap.utils.server_timing_utils import build_vllm_prefill_per_req_info
 
 logger = init_logger(__name__)
 
@@ -350,102 +351,21 @@ def _safe_int(value, default=0):
         return default
 
 
-def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
-    per_req_info = []
+_vllm_prompt_lengths_by_req_id = {}
 
+
+def _build_prefill_per_req_info_vllm(
+    scheduler_output: "SchedulerOutput", prefill_req_ids
+):
     try:
-        scheduled_token_map = getattr(scheduler_output, "num_scheduled_tokens", None)
-        if not isinstance(scheduled_token_map, dict):
-            scheduled_token_map = {}
-
-        scheduled_reqs = []
-        for attr_name in (
-            "scheduled_new_reqs",
-            "scheduled_resumed_reqs",
-            "scheduled_cached_reqs",
-        ):
-            reqs = getattr(scheduler_output, attr_name, None) or []
-            scheduled_reqs.extend(reqs)
-
-        seen_req_ids = set()
-        for req in scheduled_reqs:
-            req_id = getattr(req, "req_id", None)
-            if req_id is None:
-                req_id = getattr(req, "request_id", None)
-            req_id_str = str(req_id) if req_id is not None else "unknown"
-
-            dedupe_key = req_id_str
-            if dedupe_key in seen_req_ids:
-                continue
-            seen_req_ids.add(dedupe_key)
-
-            extend_len = None
-            if req_id is not None:
-                if req_id in scheduled_token_map:
-                    extend_len = scheduled_token_map[req_id]
-                elif req_id_str in scheduled_token_map:
-                    extend_len = scheduled_token_map[req_id_str]
-
-            if extend_len is None:
-                extend_len = getattr(req, "num_tokens", None)
-            if extend_len is None:
-                extend_len = getattr(req, "num_scheduled_tokens", None)
-            if extend_len is None:
-                extend_len = getattr(req, "num_new_tokens", None)
-
-            num_computed = getattr(req, "num_computed_tokens", 0)
-
-            explicit_total_len = None
-            for total_attr_name in (
-                "total_prompt_tokens",
-                "num_prompt_tokens",
-                "prompt_len",
-                "prompt_length",
-            ):
-                total_candidate = getattr(req, total_attr_name, None)
-                if total_candidate is not None:
-                    explicit_total_len = total_candidate
-                    break
-
-            extend_len_int = _safe_int(extend_len, default=0)
-            num_computed_int = _safe_int(num_computed, default=0)
-            if explicit_total_len is None:
-                total_len_int = num_computed_int + extend_len_int
-            else:
-                total_len_int = _safe_int(
-                    explicit_total_len, default=num_computed_int + extend_len_int
-                )
-
-            is_last_chunk = True
-            if explicit_total_len is not None:
-                is_last_chunk = (num_computed_int + extend_len_int) >= total_len_int
-
-            per_req_info.append(
-                {
-                    "req_id": req_id_str,
-                    "extend_len": extend_len_int,
-                    "total_len": total_len_int,
-                    "is_last_chunk": is_last_chunk,
-                }
-            )
-
-        if not per_req_info and scheduled_token_map:
-            for req_id, extend_len in scheduled_token_map.items():
-                extend_len_int = _safe_int(extend_len, default=0)
-                per_req_info.append(
-                    {
-                        "req_id": str(req_id),
-                        "extend_len": extend_len_int,
-                        "total_len": extend_len_int,
-                        "is_last_chunk": True,
-                    }
-                )
-
+        return build_vllm_prefill_per_req_info(
+            scheduler_output,
+            {str(req_id) for req_id in prefill_req_ids},
+            _vllm_prompt_lengths_by_req_id,
+        )
     except Exception as e:
         logger.debug(f"Could not build prefill per-request info: {e}")
         return []
-
-    return per_req_info
 
 
 # ============================================================================
@@ -571,7 +491,15 @@ def execute_model_custom(
 
     per_req_info = []
     if prefill_req_ids:
-        per_req_info = _build_prefill_per_req_info_vllm(scheduler_output)
+        per_req_info = _build_prefill_per_req_info_vllm(
+            scheduler_output, prefill_req_ids
+        )
+    # Prompt lengths are only needed through the final context chunk. Once a
+    # request enters decode, finishes, or is cancelled, release its process-local
+    # state so reused request IDs cannot inherit stale prompt lengths.
+    finished_req_ids = getattr(scheduler_output, "finished_req_ids", None) or set()
+    for req_id in decode_req_ids | {str(req_id) for req_id in finished_req_ids}:
+        _vllm_prompt_lengths_by_req_id.pop(str(req_id), None)
 
     # Track forward pass ID
     global _forward_pass_id_counter

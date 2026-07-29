@@ -15,6 +15,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 from moe_cap.model_loader import HFModelInfoRetriever
 from moe_cap.utils.continuous_batching_utils import _calculate_continuous_metrics
+from moe_cap.utils.server_timing_utils import resolve_performance_timings
 from moe_cap.utils.acc_metrics import (
     compute_accuracy_metrics,
     extract_answer,
@@ -1164,8 +1165,6 @@ class OpenAIAPIMoEProfiler:
             # Compute average expert activation for prefill and decode from server records
             prefill_activations = []
             decode_activations = []
-            prefill_latencies = []
-            decode_latencies = []
             prefill_batch_sizes = []
             decode_batch_sizes = []
             if server_records:
@@ -1179,12 +1178,6 @@ class OpenAIAPIMoEProfiler:
                             prefill_activations.append(ea)
                         elif is_decode:
                             decode_activations.append(ea)
-                    lat = sr.get("latency")
-                    if lat is not None and lat >= 0:
-                        if is_prefill:
-                            prefill_latencies.append(lat)
-                        elif is_decode:
-                            decode_latencies.append(lat)
                     bs = sr.get("batch_size")
                     if bs is not None and bs >= 0:
                         if is_prefill:
@@ -1218,6 +1211,18 @@ class OpenAIAPIMoEProfiler:
                     simple_tpots.append((latency - ttft) / out_len)
             simple_tpot = sum(simple_tpots) / len(simple_tpots) if simple_tpots else 0
 
+            # Keep request-level TTFT separate from prefill-forward latency.
+            # With chunked prefill, one request spans multiple server records;
+            # publishing mean(record.latency) as TTFT under-counts the request's
+            # server-side time to first token. The resolver also refuses to
+            # silently relabel pass latency when request provenance is missing.
+            performance_timings = resolve_performance_timings(
+                server_records or [],
+                res_dict=res_dict,
+                simple_ttft=simple_ttft,
+                simple_tpot=simple_tpot,
+            )
+
             metrics_dict = {
                 "performance": {
                     "e2e_s": res_dict.get(
@@ -1227,8 +1232,7 @@ class OpenAIAPIMoEProfiler:
                         "request/s",
                         round(len(prompts) / total_time, 4) if total_time > 0 else 0.0,
                     ),
-                    "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
-                    "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
+                    **performance_timings,
                 },
                 "expert_activation": {
                     "avg_expert_activation_prefill": (
