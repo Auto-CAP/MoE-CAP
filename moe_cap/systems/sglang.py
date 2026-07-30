@@ -460,6 +460,12 @@ def forward_expert_record(
             record_dict["per_req_info"] = _build_prefill_per_req_info(
                 forward_batch, self.server_args
             )
+        else:
+            # Same ids per_req_info uses (req_pool_idx): client retries become
+            # distinct pool entries, so retry pollution is diagnosable per trace.
+            _rids = _to_cpu_list(forward_batch.req_pool_indices)
+            if _rids:
+                record_dict["req_ids"] = [int(x) for x in _rids]
         get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
         logger.debug(
             f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}"
@@ -609,6 +615,12 @@ def forward_profiling_only(
             record_dict["per_req_info"] = _build_prefill_per_req_info(
                 forward_batch, self.server_args
             )
+        else:
+            # Same ids per_req_info uses (req_pool_idx): client retries become
+            # distinct pool entries, so retry pollution is diagnosable per trace.
+            _rids = _to_cpu_list(forward_batch.req_pool_indices)
+            if _rids:
+                record_dict["req_ids"] = [int(x) for x in _rids]
         if hasattr(recorder, "expert_record_list"):
             recorder.expert_record_list.append(record_dict)
         logger.debug(

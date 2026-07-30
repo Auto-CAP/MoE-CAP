@@ -664,6 +664,9 @@ def execute_model_custom(
                     "latency": latency,
                     "seq_lens_sum": decode_scheduled_tokens,
                     "forward_mode": "decode",
+                    # Request ids make client retries diagnosable from the trace alone:
+                    # each HTTP attempt arrives as a distinct scheduler request.
+                    "req_ids": sorted(decode_req_ids),
                     "expert_activation": expert_activation,
                     "gpu_num": world_size,
                     "gpu_raw_type": gpu_raw_type,
@@ -678,6 +681,8 @@ def execute_model_custom(
                 "gpu_num": world_size,
                 "gpu_raw_type": gpu_raw_type,
             })
+            if forward_mode != "prefill" and decode_req_ids:
+                records_to_add[-1]["req_ids"] = sorted(decode_req_ids)
             if forward_mode == "prefill" and per_req_info:
                 records_to_add[-1]["per_req_info"] = per_req_info
         for rec_dict in records_to_add:
