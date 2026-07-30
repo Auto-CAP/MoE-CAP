@@ -1136,8 +1136,12 @@ class OpenAIAPIMoEProfiler:
                         output_token_count = len(self.tokenizer.encode(result.generated_text))
                     else:
                         output_token_count = 0
-                    prefill_tokens_total += input_token_count or 0
-                    decode_generated_tokens_total += output_token_count or 0
+                    # Both totals count successful requests only. A failed request contributed its
+                    # input tokens here while its output contributed nothing, so any run with
+                    # generation failures overstated prefill against decode.
+                    if result.success:
+                        prefill_tokens_total += input_token_count or 0
+                        decode_generated_tokens_total += output_token_count or 0
                     record = {
                         "index": i,
                         # Historical fields kept for compatibility: input_tokens is a count,
@@ -1172,7 +1176,11 @@ class OpenAIAPIMoEProfiler:
                 for sr in server_records:
                     fm = sr.get("forward_mode")
                     is_prefill = fm == "prefill"
-                    is_decode = fm in ("decode", "decoding")
+                    # A "mixed" step carries both prefill and decode work. vLLM emits them and
+                    # continuous_batching_utils treats anything that is not prefill as decode, so
+                    # excluding them here made the two aggregation paths disagree by construction
+                    # on tpot, decode_avg_batch_size and decode expert activation.
+                    is_decode = fm in ("decode", "decoding", "mixed")
                     ea = sr.get("expert_activation")
                     if ea is not None and ea >= 0:
                         if is_prefill:
@@ -1227,7 +1235,21 @@ class OpenAIAPIMoEProfiler:
                         "request/s",
                         round(len(prompts) / total_time, 4) if total_time > 0 else 0.0,
                     ),
-                    "ttft": (sum(prefill_latencies)/len(prefill_latencies)) if prefill_latencies else (res_dict.get("ttft") or simple_ttft),
+                    # Time until a request's first token. res_dict['ttft'] accumulates each
+                    # request's own prefill chunks and skips the warm-up probes; the mean over raw
+                    # prefill records is the time to run ONE CHUNK, which under chunked prefill is
+                    # a different quantity and stops growing with prompt length -- only the chunk
+                    # count grows. Preferring the record mean made this column report per-chunk on
+                    # some runs and per-request on others.
+                    "ttft": res_dict.get("ttft") or simple_ttft,
+                    # The per-chunk mean, under a name that says what it is. The bandwidth
+                    # calculation needs a per-pass duration, so both are published; one field
+                    # cannot serve both readings.
+                    "prefill_pass_latency_s": (
+                        (sum(prefill_latencies) / len(prefill_latencies))
+                        if prefill_latencies
+                        else None
+                    ),
                     "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
                 },
                 "expert_activation": {

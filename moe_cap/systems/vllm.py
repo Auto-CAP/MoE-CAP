@@ -350,6 +350,17 @@ def _safe_int(value, default=0):
         return default
 
 
+def _get_tp_rank():
+    """Current TP rank; 0 when parallel state is unavailable (single GPU)."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        return tp_group.rank if tp_group is not None else 0
+    except Exception:
+        return 0
+
+
 def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
     per_req_info = []
 
@@ -406,6 +417,14 @@ def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
                 if total_candidate is not None:
                     explicit_total_len = total_candidate
                     break
+            if explicit_total_len is None:
+                # vLLM v1 request objects carry none of the four attributes above, so the prompt
+                # length was never recovered, is_last_chunk defaulted to True and every chunk of a
+                # chunked prefill looked like a completed request. prompt_token_ids is what the
+                # decode-side bookkeeping in this file already uses for the same purpose.
+                prompt_ids = getattr(req, "prompt_token_ids", None)
+                if prompt_ids is not None:
+                    explicit_total_len = len(prompt_ids)
 
             extend_len_int = _safe_int(extend_len, default=0)
             num_computed_int = _safe_int(num_computed, default=0)
@@ -619,8 +638,12 @@ def execute_model_custom(
             logger.debug(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}")
             logger.debug(f"Could not collect expert distribution data: {e}")
 
-    # Record batch statistics if recording is enabled
-    if recording_state.is_recording():
+    # Record batch statistics if recording is enabled. Only TP rank 0 records:
+    # execute_model runs on every TP worker for the same scheduled pass, and the
+    # data file is shared node-wide, so an un-gated append wrote every forward
+    # pass world_size times on multi-GPU runs (the expert-distribution branch
+    # below already carries this gate).
+    if recording_state.is_recording() and _get_tp_rank() == 0:
         records_to_add = []
         if forward_mode == "mixed":
             if prefill_req_ids:
