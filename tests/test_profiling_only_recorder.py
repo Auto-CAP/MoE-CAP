@@ -25,6 +25,26 @@ def _source_blocks(*names):
     return blocks
 
 
+def _source_method(class_name, method_name):
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method_node = next(
+        node
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    module = ast.Module(body=[method_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"logger": logging.getLogger(__name__)}
+    exec(compile(module, str(SOURCE_PATH), "exec"), namespace)
+    return namespace[method_name]
+
+
 class _RecorderBase:
     @contextmanager
     def disable_this_region(self):
@@ -109,6 +129,27 @@ class ProfilingOnlyRecorderTest(unittest.TestCase):
             recorder.stop_record()
             recorder.start_record()
             self.assertEqual(recorder.expert_record_list, [])
+
+    def test_sparse_new_recording_window_clears_stale_rows(self):
+        start_record = _source_method(
+            "_ExpertDistributionRecorderReal2", "start_record"
+        )
+
+        class _SparseRecorderHarness:
+            def __init__(self):
+                self._recording = False
+                self.expert_record_list = [{"task": "previous"}]
+                self.reset_count = 0
+
+            def _reset(self):
+                self.reset_count += 1
+
+        recorder = _SparseRecorderHarness()
+        start_record(recorder)
+
+        self.assertEqual(recorder.expert_record_list, [])
+        self.assertEqual(recorder.reset_count, 1)
+        self.assertTrue(recorder._recording)
 
     def test_profile_only_patch_is_guarded(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")

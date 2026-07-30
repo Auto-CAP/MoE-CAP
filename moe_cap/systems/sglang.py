@@ -224,6 +224,11 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
+        # ``expert_record_list`` spans forward passes within one recording
+        # window, whereas ``_reset`` only clears the per-forward accumulator.
+        # A server can serve multiple benchmark tasks, so discard rows from the
+        # previous window before collecting the next task.
+        self.expert_record_list.clear()
         self._reset()
         self._recording = True
 
