@@ -32,6 +32,45 @@ import re
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
 
 
+def _mean_server_request_ttft(
+    server_records: Optional[List[Dict[str, Any]]],
+) -> Optional[float]:
+    """Aggregate server-side prefill passes into per-request TTFT.
+
+    A chunked prefill request can span several forward passes. Each request
+    experiences the full latency of every pass containing one of its chunks,
+    so its TTFT is the sum of those pass latencies. SGLang may reuse a request
+    pool slot after completion; removing completed slots keeps later requests
+    separate.
+    """
+    active: Dict[Tuple[str, Any], float] = {}
+    completed: List[float] = []
+
+    for record in server_records or []:
+        if record.get("forward_mode") != "prefill":
+            continue
+        per_req_info = record.get("per_req_info") or []
+        if not per_req_info:
+            continue
+
+        latency = float(record.get("latency") or 0.0)
+        for request in per_req_info:
+            if request.get("req_pool_idx") is not None:
+                key = ("pool", request["req_pool_idx"])
+            elif request.get("req_id") is not None:
+                key = ("id", request["req_id"])
+            else:
+                continue
+
+            active[key] = active.get(key, 0.0) + latency
+            if request.get("is_last_chunk"):
+                completed.append(active.pop(key))
+
+    if not completed:
+        return None
+    return sum(completed) / len(completed)
+
+
 class BackendType(Enum):
     """Backend server type for API calls."""
 
@@ -1217,6 +1256,7 @@ class OpenAIAPIMoEProfiler:
                 if successful_for_simple
                 else 0
             )
+            server_request_ttft = _mean_server_request_ttft(server_records)
             simple_tpots = []
             for r in successful_for_simple:
                 out_len = getattr(r, "output_len", 0) or 0
@@ -1241,7 +1281,11 @@ class OpenAIAPIMoEProfiler:
                     # a different quantity and stops growing with prompt length -- only the chunk
                     # count grows. Preferring the record mean made this column report per-chunk on
                     # some runs and per-request on others.
-                    "ttft": res_dict.get("ttft") or simple_ttft,
+                    "ttft": (
+                        server_request_ttft
+                        if server_request_ttft is not None
+                        else (res_dict.get("ttft") or simple_ttft)
+                    ),
                     # The per-chunk mean, under a name that says what it is. The bandwidth
                     # calculation needs a per-pass duration, so both are published; one field
                     # cannot serve both readings.
@@ -1352,6 +1396,10 @@ class OpenAIAPIMoEProfiler:
                             record["ttft"] = sr.get("latency", 0)
                         else:
                             record["tpot"] = sr.get("latency", 0)
+                        if sr.get("per_req_info"):
+                            record["per_req_info"] = sr["per_req_info"]
+                        if sr.get("req_ids"):
+                            record["req_ids"] = sr["req_ids"]
                         f.write(json.dumps(record) + "\n")
                 else:
                     print("Warning: No server records available for detailed results")
