@@ -98,7 +98,14 @@ def _mean_server_request_ttft(
         if not per_req_info:
             continue
 
-        latency = float(record.get("latency") or 0.0)
+        # File-shape traces carry a prefill record's pass duration as `ttft`
+        # rather than `latency`. A record with neither field contributes no
+        # duration: skip it (its requests stay incomplete and drop out) rather
+        # than accumulate zeros into a fabricated per-request mean.
+        lat = record.get("latency", record.get("ttft"))
+        if not isinstance(lat, (int, float)):
+            continue
+        latency = float(lat)
         for request in per_req_info:
             if request.get("req_id") is not None:
                 key = ("id", request["req_id"])
