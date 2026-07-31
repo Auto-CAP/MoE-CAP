@@ -361,108 +361,142 @@ def _get_tp_rank():
         return 0
 
 
+# Prompt length at admission for requests currently mid-prefill.
+# req_id -> prompt_len. Retired via finished_req_ids (covers aborts).
+_prefill_prompt_len_by_req_id = {}
+_prefill_info_warned = set()
+
+
+def _warn_once(key, msg):
+    if key not in _prefill_info_warned:
+        _prefill_info_warned.add(key)
+        logger.warning(msg)
+
+
 def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
     per_req_info = []
 
-    try:
-        scheduled_token_map = getattr(scheduler_output, "num_scheduled_tokens", None)
-        if not isinstance(scheduled_token_map, dict):
-            scheduled_token_map = {}
+    scheduled_token_map = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if not isinstance(scheduled_token_map, dict):
+        scheduled_token_map = {}
 
-        scheduled_reqs = []
-        for attr_name in (
-            "scheduled_new_reqs",
-            "scheduled_resumed_reqs",
-            "scheduled_cached_reqs",
-        ):
-            reqs = getattr(scheduler_output, attr_name, None) or []
-            scheduled_reqs.extend(reqs)
+    # (req_id, extend_len, num_computed, prompt_len_or_None)
+    candidates = []
 
-        seen_req_ids = set()
-        for req in scheduled_reqs:
+    for req in getattr(scheduler_output, "scheduled_new_reqs", None) or []:
+        req_id = getattr(req, "req_id", None)
+        if req_id is None:
+            continue
+        prompt_ids = getattr(req, "prompt_token_ids", None)
+        prompt_len = len(prompt_ids) if prompt_ids is not None else None
+        if prompt_len is not None:
+            _prefill_prompt_len_by_req_id[req_id] = prompt_len
+        num_computed = _safe_int(getattr(req, "num_computed_tokens", 0), default=0)
+        extend_len = _safe_int(scheduled_token_map.get(req_id, 0), default=0)
+        candidates.append((req_id, extend_len, num_computed, prompt_len))
+
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached is not None and hasattr(cached, "req_ids"):
+        # vLLM v1 structure-of-arrays CachedRequestData: one object per step,
+        # non-iterable — read its parallel arrays by index.
+        req_ids = getattr(cached, "req_ids", None) or []
+        num_computed_list = getattr(cached, "num_computed_tokens", None) or []
+        num_output_list = getattr(cached, "num_output_tokens", None) or []
+        for idx, req_id in enumerate(req_ids):
+            out_tokens = (
+                _safe_int(num_output_list[idx], default=1)
+                if idx < len(num_output_list)
+                else 1
+            )
+            if out_tokens != 0:
+                # Decode-phase request: never part of a prefill chunk.
+                continue
+            num_computed = (
+                _safe_int(num_computed_list[idx], default=0)
+                if idx < len(num_computed_list)
+                else 0
+            )
+            extend_len = _safe_int(scheduled_token_map.get(req_id, 0), default=0)
+            candidates.append(
+                (
+                    req_id,
+                    extend_len,
+                    num_computed,
+                    _prefill_prompt_len_by_req_id.get(req_id),
+                )
+            )
+    elif cached:
+        # Pre-SoA shape (list of per-request objects); none of the benchmark's
+        # vLLM versions use it, kept as a guarded compatibility path.
+        for req in cached:
             req_id = getattr(req, "req_id", None)
             if req_id is None:
-                req_id = getattr(req, "request_id", None)
-            req_id_str = str(req_id) if req_id is not None else "unknown"
-
-            dedupe_key = req_id_str
-            if dedupe_key in seen_req_ids:
                 continue
-            seen_req_ids.add(dedupe_key)
-
-            extend_len = None
-            if req_id is not None:
-                if req_id in scheduled_token_map:
-                    extend_len = scheduled_token_map[req_id]
-                elif req_id_str in scheduled_token_map:
-                    extend_len = scheduled_token_map[req_id_str]
-
-            if extend_len is None:
-                extend_len = getattr(req, "num_tokens", None)
-            if extend_len is None:
-                extend_len = getattr(req, "num_scheduled_tokens", None)
-            if extend_len is None:
-                extend_len = getattr(req, "num_new_tokens", None)
-
-            num_computed = getattr(req, "num_computed_tokens", 0)
-
-            explicit_total_len = None
-            for total_attr_name in (
-                "total_prompt_tokens",
-                "num_prompt_tokens",
-                "prompt_len",
-                "prompt_length",
-            ):
-                total_candidate = getattr(req, total_attr_name, None)
-                if total_candidate is not None:
-                    explicit_total_len = total_candidate
-                    break
-            if explicit_total_len is None:
-                # vLLM v1 request objects carry none of the four attributes above, so the prompt
-                # length was never recovered, is_last_chunk defaulted to True and every chunk of a
-                # chunked prefill looked like a completed request. prompt_token_ids is what the
-                # decode-side bookkeeping in this file already uses for the same purpose.
-                prompt_ids = getattr(req, "prompt_token_ids", None)
-                if prompt_ids is not None:
-                    explicit_total_len = len(prompt_ids)
-
-            extend_len_int = _safe_int(extend_len, default=0)
-            num_computed_int = _safe_int(num_computed, default=0)
-            if explicit_total_len is None:
-                total_len_int = num_computed_int + extend_len_int
-            else:
-                total_len_int = _safe_int(
-                    explicit_total_len, default=num_computed_int + extend_len_int
-                )
-
-            is_last_chunk = True
-            if explicit_total_len is not None:
-                is_last_chunk = (num_computed_int + extend_len_int) >= total_len_int
-
-            per_req_info.append(
-                {
-                    "req_id": req_id_str,
-                    "extend_len": extend_len_int,
-                    "total_len": total_len_int,
-                    "is_last_chunk": is_last_chunk,
-                }
+            num_computed = _safe_int(
+                getattr(req, "num_computed_tokens", 0), default=0
             )
+            extend_len = _safe_int(scheduled_token_map.get(req_id, 0), default=0)
+            prompt_len = _prefill_prompt_len_by_req_id.get(req_id)
+            if prompt_len is None or num_computed >= prompt_len:
+                # Unknown admission length or decode phase: skip, never guess.
+                if prompt_len is None:
+                    _warn_once(
+                        "cached_no_prompt_len",
+                        "per-request prefill info: cached request with unknown "
+                        "admission prompt length; skipping (recording may have "
+                        "started mid-request)",
+                    )
+                continue
+            candidates.append((req_id, extend_len, num_computed, prompt_len))
 
-        if not per_req_info and scheduled_token_map:
-            for req_id, extend_len in scheduled_token_map.items():
-                extend_len_int = _safe_int(extend_len, default=0)
-                per_req_info.append(
-                    {
-                        "req_id": str(req_id),
-                        "extend_len": extend_len_int,
-                        "total_len": extend_len_int,
-                        "is_last_chunk": True,
-                    }
-                )
+    seen_req_ids = set()
+    for req_id, extend_len, num_computed, prompt_len in candidates:
+        req_id_str = str(req_id)
+        if req_id_str in seen_req_ids:
+            continue
+        seen_req_ids.add(req_id_str)
+        if extend_len <= 0:
+            continue
+        if prompt_len is None:
+            # Either prompt_embeds (no token ids) or recording started after
+            # this request's admission. A fabricated is_last_chunk here is how
+            # per-request TTFT gets split or invented, so emit nothing and say
+            # so once.
+            _warn_once(
+                "no_prompt_len",
+                "per-request prefill info: request %s has no recoverable "
+                "prompt length; omitting from per-request TTFT (per-pass "
+                "fallback applies)" % req_id_str,
+            )
+            continue
+        is_last_chunk = (num_computed + extend_len) >= prompt_len
+        if is_last_chunk:
+            # The map is only needed while a prefill is in flight.
+            _prefill_prompt_len_by_req_id.pop(req_id, None)
+        per_req_info.append(
+            {
+                "req_id": req_id_str,
+                "extend_len": extend_len,
+                "total_len": _safe_int(prompt_len, default=0),
+                "is_last_chunk": is_last_chunk,
+            }
+        )
 
-    except Exception as e:
-        logger.debug(f"Could not build prefill per-request info: {e}")
-        return []
+    # Best-effort sweep of requests that finished without a last chunk
+    # (aborted mid-prefill) so the map cannot grow across a long run.
+    for req_id in getattr(scheduler_output, "finished_req_ids", None) or ():
+        _prefill_prompt_len_by_req_id.pop(req_id, None)
+
+    if not per_req_info and not candidates and scheduled_token_map:
+        # Scheduled tokens but no readable request objects: emit nothing and
+        # say so once — records without per_req_info fall back to the
+        # per-pass proxy downstream, never to a fabricated completion.
+        _warn_once(
+            "no_candidates",
+            "per-request prefill info: scheduler output carried scheduled "
+            "tokens but no readable request objects; emitting no per-request "
+            "info (per-pass fallback applies)",
+        )
 
     return per_req_info
 
