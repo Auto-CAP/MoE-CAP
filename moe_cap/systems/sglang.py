@@ -278,11 +278,16 @@ def _to_cpu_list(value):
     return list(value)
 
 
-_prefill_req_counter = 0
+# Per-pool-slot request counters: a slot's counter advances when the request
+# occupying it finishes prefill, so successive requests reusing the slot get
+# distinct req_ids without one request's completion renaming another's chunks.
+_prefill_pool_counters: Dict[int, int] = {}
+_prefill_empty_reads_warned = False
+_prefill_no_orig_lens_warned = False
 
 
 def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: ServerArgs):
-    global _prefill_req_counter
+    global _prefill_empty_reads_warned, _prefill_no_orig_lens_warned
     req_indices = _to_cpu_list(forward_batch.req_pool_indices) or []
 
     extend_lens = _to_cpu_list(forward_batch.extend_seq_lens_cpu)
@@ -293,27 +298,68 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
     if total_lens is None:
         total_lens = _to_cpu_list(forward_batch.seq_lens) or []
 
+    if not req_indices or not extend_lens or not total_lens:
+        if not _prefill_empty_reads_warned:
+            logger.warning(
+                "per_req_info: ForwardBatch length reads came back empty on a "
+                "prefill batch (req_pool_indices=%d, extend_seq_lens=%d, "
+                "seq_lens=%d entries); per-request TTFT cannot be reconstructed "
+                "from this trace",
+                len(req_indices),
+                len(extend_lens),
+                len(total_lens),
+            )
+            _prefill_empty_reads_warned = True
+
+    orig_lens = _to_cpu_list(getattr(forward_batch, "orig_seq_lens", None))
+
     chunk_size = getattr(server_args, "chunked_prefill_size", None)
     chunk_size_int = int(chunk_size) if chunk_size is not None else None
     chunking_enabled = chunk_size_int is not None and chunk_size_int > 0
 
     per_req_info = []
-    for req_idx, extend_len, total_len in zip(req_indices, extend_lens, total_lens):
-        is_last_chunk = True
-        if chunking_enabled:
-            assert chunk_size_int is not None
-            is_last_chunk = int(extend_len) < chunk_size_int
-        per_req_info.append(
-            {
-                "req_pool_idx": int(req_idx),
-                "req_id": f"{int(req_idx)}_{_prefill_req_counter}",
-                "extend_len": int(extend_len),
-                "total_len": int(total_len),
-                "is_last_chunk": is_last_chunk,
-            }
+    for pos, (req_idx, extend_len, total_len) in enumerate(
+        zip(req_indices, extend_lens, total_lens)
+    ):
+        orig_len = (
+            orig_lens[pos] if orig_lens is not None and pos < len(orig_lens) else None
         )
+        if orig_len is not None:
+            # Completion by accounting: seq_lens is the tokens computed for the
+            # request so far (cached prefix + every extend including this one),
+            # orig_seq_lens the full prompt length; the last chunk is the one
+            # that reaches it. Independent of chunked_prefill_size and of
+            # extend_seq_lens semantics.
+            is_last_chunk = int(total_len) >= int(orig_len)
+        elif chunking_enabled:
+            # Builds without orig_seq_lens: fall back to the chunk-size
+            # heuristic (a final chunk is the only one shorter than the chunk
+            # size; a full-size final chunk is misclassified).
+            if not _prefill_no_orig_lens_warned:
+                logger.warning(
+                    "per_req_info: ForwardBatch has no orig_seq_lens; falling "
+                    "back to the chunked_prefill_size heuristic for last-chunk "
+                    "detection"
+                )
+                _prefill_no_orig_lens_warned = True
+            is_last_chunk = int(extend_len) < chunk_size_int
+        else:
+            is_last_chunk = True
+
+        pool_idx = int(req_idx)
+        counter = _prefill_pool_counters.setdefault(pool_idx, 0)
+        info = {
+            "req_pool_idx": pool_idx,
+            "req_id": f"{pool_idx}_{counter}",
+            "extend_len": int(extend_len),
+            "total_len": int(total_len),
+            "is_last_chunk": is_last_chunk,
+        }
+        if orig_len is not None:
+            info["orig_len"] = int(orig_len)
+        per_req_info.append(info)
         if is_last_chunk:
-            _prefill_req_counter += 1
+            _prefill_pool_counters[pool_idx] = counter + 1
 
     return per_req_info
 

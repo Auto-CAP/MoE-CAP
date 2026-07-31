@@ -1322,10 +1322,13 @@ class OpenAIAPIMoEProfiler:
                     # a different quantity and stops growing with prompt length -- only the chunk
                     # count grows. Preferring the record mean made this column report per-chunk on
                     # some runs and per-request on others.
+                    # `or None` tail: with a non-streaming client simple_ttft is 0.0,
+                    # so when every aggregation comes up empty publish null, never a
+                    # fabricated 0.0.
                     "ttft": (
                         server_request_ttft
                         if server_request_ttft is not None
-                        else (res_dict.get("ttft") or simple_ttft)
+                        else (res_dict.get("ttft") or simple_ttft or None)
                     ),
                     # The per-chunk mean, under a name that says what it is. The bandwidth
                     # calculation needs a per-pass duration, so both are published; one field
