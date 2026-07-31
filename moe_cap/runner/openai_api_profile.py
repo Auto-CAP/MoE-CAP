@@ -1149,6 +1149,12 @@ class OpenAIAPIMoEProfiler:
                             total=n_eval,
                         )
                         per_question = arena_metrics.pop("arena_hard_per_question", [])
+                        # The score is a win rate AGAINST this baseline, so runs judged
+                        # against different baselines are not comparable: publish which
+                        # one was used alongside the judge model.
+                        arena_metrics["arena_hard_baseline_model"] = os.path.splitext(
+                            os.path.basename(self.config.baseline_answers_path)
+                        )[0]
                         res_dict.update(arena_metrics)
                         print(
                             f"Arena-Hard win rate: {arena_metrics['arena_hard_win_rate']}% "
