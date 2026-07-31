@@ -567,7 +567,9 @@ def apply_vllm_monkey_patching():
 
                             import torch
                             import os
-                            import tempfile
+                            from moe_cap.utils.recorder_paths import (
+                                get_vllm_recording_path,
+                            )
 
                             rank = (
                                 torch.distributed.get_rank()
@@ -576,9 +578,10 @@ def apply_vllm_monkey_patching():
                             )
 
                             # Check for auto-start flag (similar to sglang.py's enable_expert_distribution_metrics)
-                            EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(
-                                tempfile.gettempdir(),
-                                "vllm_expert_distribution_auto_start.flag",
+                            EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = (
+                                get_vllm_recording_path(
+                                    "vllm_expert_distribution_auto_start.flag"
+                                )
                             )
                             auto_start_enabled = os.path.exists(
                                 EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE
@@ -1095,11 +1098,14 @@ def apply_vllm_monkey_patching():
 
                 # Auto-configure and start expert distribution recording if flag is set (similar to sglang.py)
                 try:
-                    import tempfile
+                    from moe_cap.utils.recorder_paths import (
+                        get_vllm_recording_path,
+                    )
 
-                    EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(
-                        tempfile.gettempdir(),
-                        "vllm_expert_distribution_auto_start.flag",
+                    EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = (
+                        get_vllm_recording_path(
+                            "vllm_expert_distribution_auto_start.flag"
+                        )
                     )
                     auto_start_enabled = os.path.exists(
                         EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE

@@ -176,22 +176,38 @@ else:
 # ============================================================================
 # Global recording state - using file-based flags for multiprocessing safety
 # ============================================================================
-import tempfile
 import threading
 from pathlib import Path
 
-RECORDING_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_batch_recording.flag")
-RECORDING_DATA_FILE = os.path.join(tempfile.gettempdir(), "vllm_batch_records.jsonl")
+from moe_cap.utils.recorder_paths import (
+    RECORDER_DIR_ENV,
+    get_vllm_recording_dir,
+    get_vllm_recording_path,
+)
+
+VLLM_RECORDING_DIR = get_vllm_recording_dir()
+os.makedirs(VLLM_RECORDING_DIR, exist_ok=True)
+
+RECORDING_FLAG_FILE = get_vllm_recording_path("vllm_batch_recording.flag")
+RECORDING_DATA_FILE = get_vllm_recording_path("vllm_batch_records.jsonl")
 _record_lock = threading.Lock()
 
 # Expert distribution recording state
-EXPERT_DISTRIBUTION_RECORDING_FLAG_FILE = os.path.join(
-    tempfile.gettempdir(), "vllm_expert_distribution_recording.flag"
+EXPERT_DISTRIBUTION_RECORDING_FLAG_FILE = get_vllm_recording_path(
+    "vllm_expert_distribution_recording.flag"
 )
-EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(
-    tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag"
+EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = get_vllm_recording_path(
+    "vllm_expert_distribution_auto_start.flag"
 )
-EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(os.getcwd(), "logs/expert_distribution")
+if os.environ.get(RECORDER_DIR_ENV):
+    EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(
+        VLLM_RECORDING_DIR, "logs", "expert_distribution"
+    )
+else:
+    # Preserve the legacy output location when no per-run namespace is set.
+    EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(
+        os.getcwd(), "logs", "expert_distribution"
+    )
 _expert_record_lock = threading.Lock()
 
 _forward_pass_id_counter = 0
