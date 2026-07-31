@@ -281,7 +281,10 @@ def _to_cpu_list(value):
 # Per-pool-slot request counters: a slot's counter advances when the request
 # occupying it finishes prefill, so successive requests reusing the slot get
 # distinct req_ids without one request's completion renaming another's chunks.
+# _prefill_pool_last_seq tracks each slot's running length so a slot restart
+# (occupant aborted or retracted mid-prefill) also retires the stale req_id.
 _prefill_pool_counters: Dict[int, int] = {}
+_prefill_pool_last_seq: Dict[int, int] = {}
 _prefill_empty_reads_warned = False
 _prefill_no_orig_lens_warned = False
 
@@ -348,6 +351,19 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
 
         pool_idx = int(req_idx)
         counter = _prefill_pool_counters.setdefault(pool_idx, 0)
+        last_seq = _prefill_pool_last_seq.get(pool_idx)
+        if last_seq is not None and int(total_len) <= last_seq:
+            # An occupant's running total strictly grows across its chunks, so
+            # a non-growing total means the slot restarted: the occupant left
+            # without completing — abort or retraction — and its req_id must be
+            # retired or the new occupant inherits its accumulated chunks.
+            # (Deliberately judged on seq_lens alone — extend_seq_lens is the
+            # field that drifted on eIDF. A successor whose first chunk already
+            # exceeds the orphan's progress, e.g. via a radix-cache hit, is
+            # missed and merges with the orphan; a same-prompt retry that
+            # merges this way publishes the wait the client actually saw.)
+            counter += 1
+            _prefill_pool_counters[pool_idx] = counter
         info = {
             "req_pool_idx": pool_idx,
             "req_id": f"{pool_idx}_{counter}",
@@ -360,6 +376,9 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
         per_req_info.append(info)
         if is_last_chunk:
             _prefill_pool_counters[pool_idx] = counter + 1
+            _prefill_pool_last_seq.pop(pool_idx, None)
+        else:
+            _prefill_pool_last_seq[pool_idx] = int(total_len)
 
     return per_req_info
 

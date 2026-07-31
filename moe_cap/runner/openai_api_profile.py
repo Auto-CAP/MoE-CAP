@@ -77,9 +77,9 @@ def _mean_server_request_ttft(
 
     A chunked prefill request can span several forward passes. Each request
     experiences the full latency of every pass containing one of its chunks,
-    so its TTFT is the sum of those pass latencies. SGLang may reuse a request
-    pool slot after completion; removing completed slots keeps later requests
-    separate.
+    so its TTFT is the sum of those pass latencies. Keyed by req_id (unique
+    per slot occupant; the recorder retires a slot's id when its occupant
+    vanishes mid-prefill), falling back to the pool slot for older traces.
     """
     active: Dict[Tuple[str, Any], float] = {}
     completed: List[float] = []
@@ -87,16 +87,23 @@ def _mean_server_request_ttft(
     for record in server_records or []:
         if record.get("forward_mode") != "prefill":
             continue
+        # Warm-up/health-check probes (tiny prefills at server startup) carry
+        # first-pass latencies far above any real request. The accumulation
+        # path skips them, so skip them here too, or short-prompt runs publish
+        # a mean that is not comparable with the accumulation-era cells.
+        seq_lens_sum = record.get("seq_lens_sum")
+        if seq_lens_sum is not None and seq_lens_sum <= 10:
+            continue
         per_req_info = record.get("per_req_info") or []
         if not per_req_info:
             continue
 
         latency = float(record.get("latency") or 0.0)
         for request in per_req_info:
-            if request.get("req_pool_idx") is not None:
-                key = ("pool", request["req_pool_idx"])
-            elif request.get("req_id") is not None:
+            if request.get("req_id") is not None:
                 key = ("id", request["req_id"])
+            elif request.get("req_pool_idx") is not None:
+                key = ("pool", request["req_pool_idx"])
             else:
                 continue
 
