@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional, Literal, cast
+from typing import List, Dict, Any, Tuple, Optional, Literal, Callable, cast
 from dataclasses import dataclass, field
 from enum import Enum
 from tqdm.asyncio import tqdm as async_tqdm
@@ -30,6 +30,44 @@ import re
 
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
+
+
+def _tokenized_input_length(tokenized: Any) -> int:
+    """Return one prompt's token count across tokenizer return conventions."""
+
+    if hasattr(tokenized, "get"):
+        input_ids = tokenized.get("input_ids")
+        if input_ids is None:
+            raise ValueError("chat template tokenization did not return input_ids")
+    else:
+        input_ids = tokenized
+    if input_ids and isinstance(input_ids[0], list):
+        if len(input_ids) != 1:
+            raise ValueError("expected exactly one tokenized chat prompt")
+        input_ids = input_ids[0]
+    return len(input_ids)
+
+
+def _request_token_counts(
+    result: Any,
+    fallback_input_tokens: int,
+    encode_output: Callable[[str], List[int]],
+) -> Tuple[int, int]:
+    """Return actual input tokens and generated tokens for one request.
+
+    Every attempted prompt contributes to prefill accounting, including a
+    request rejected before generation. Decode accounting remains physical:
+    failed requests generated no tokens and therefore contribute zero.
+    """
+
+    input_token_count = int(result.prompt_len or fallback_input_tokens or 0)
+    if result.success and result.output_len:
+        output_token_count = int(result.output_len)
+    elif result.success and result.generated_text:
+        output_token_count = len(encode_output(result.generated_text))
+    else:
+        output_token_count = 0
+    return input_token_count, output_token_count
 
 
 def _mean_server_request_ttft(
@@ -490,6 +528,7 @@ class OpenAIAPIMoEProfiler:
 
         if self.use_chat_api:
             prompts = []
+            prompt_lengths = []
             for i, q in enumerate(all_input_raw):
                 sys_msg = system_prompts[i] if system_prompts else default_system
                 messages = [
@@ -497,7 +536,12 @@ class OpenAIAPIMoEProfiler:
                     {"role": "user", "content": q},
                 ]
                 prompts.append(json.dumps(messages))
-            prompt_lengths = [len(self.tokenizer.encode(q)) for q in all_input_raw]
+                tokenized = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+                prompt_lengths.append(_tokenized_input_length(tokenized))
             return prompts, prompt_lengths, max_new_tokens
         else:
             chat_prompts = []
@@ -1168,19 +1212,16 @@ class OpenAIAPIMoEProfiler:
             with open(output_data_path, "w", encoding="utf-8") as f:
                 for i, result in enumerate(results):
                     fallback_input_tokens = prompt_lengths[i] if i < len(prompt_lengths) else 0
-                    input_token_count = result.prompt_len or fallback_input_tokens
-                    if result.success and result.output_len:
-                        output_token_count = result.output_len
-                    elif result.success and result.generated_text:
-                        output_token_count = len(self.tokenizer.encode(result.generated_text))
-                    else:
-                        output_token_count = 0
-                    # Both totals count successful requests only. A failed request contributed its
-                    # input tokens here while its output contributed nothing, so any run with
-                    # generation failures overstated prefill against decode.
-                    if result.success:
-                        prefill_tokens_total += input_token_count or 0
-                        decode_generated_tokens_total += output_token_count or 0
+                    input_token_count, output_token_count = _request_token_counts(
+                        result,
+                        fallback_input_tokens,
+                        self.tokenizer.encode,
+                    )
+                    # Prefill is attempted-input accounting, so a prompt rejected before decode
+                    # still counts. Decode is generated-token accounting; failed requests remain
+                    # zero through _request_token_counts.
+                    prefill_tokens_total += input_token_count
+                    decode_generated_tokens_total += output_token_count
                     record = {
                         "index": i,
                         # Historical fields kept for compatibility: input_tokens is a count,
