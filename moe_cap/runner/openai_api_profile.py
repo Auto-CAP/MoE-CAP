@@ -123,6 +123,54 @@ def _mean_server_request_ttft(
     return sum(completed) / len(completed)
 
 
+def _client_prefill_records(
+    server_records: Optional[List[Dict[str, Any]]],
+    n_client_requests: int,
+) -> List[Dict[str, Any]]:
+    """Prefill records restricted to the client's own requests.
+
+    The warm-up preamble is not always a tiny probe: it can include a
+    dataset-sample pass whose seq_lens_sum is indistinguishable from a real
+    prompt, so a size threshold alone under-excludes and dilutes every
+    prefill aggregate (batch size, pass latency, expert activation).
+    Client passes are anchored instead: their batch sizes must sum to the
+    client request count. Leading batch-1 passes shorter than any chunked
+    client pass are dropped only while that trim can land the sum exactly on
+    the anchor; when it cannot (chunked prefill legitimately repeats a
+    request across passes; retry-polluted traces carry extra rows), the
+    post-threshold list is returned unchanged — never a guessed subset.
+    """
+    passes = [
+        r
+        for r in server_records or []
+        if r.get("forward_mode") == "prefill"
+        and not (
+            r.get("seq_lens_sum") is not None and r["seq_lens_sum"] <= 10
+        )
+    ]
+    if n_client_requests <= 0:
+        return passes
+
+    def rows(recs: List[Dict[str, Any]]) -> int:
+        return sum(int(r.get("batch_size") or 0) for r in recs)
+
+    # The largest warm-up preamble ever observed is 3 passes; the cap keeps a
+    # trace whose surplus rows have another cause (e.g. a per-rank-duplicated
+    # recorder repeating every pass) from reaching the anchor by discarding
+    # real client passes wholesale.
+    max_trim = 4
+    trimmed = list(passes)
+    while (
+        trimmed
+        and len(passes) - len(trimmed) < max_trim
+        and rows(trimmed) > n_client_requests
+        and (trimmed[0].get("batch_size") or 0) == 1
+        and (trimmed[0].get("seq_lens_sum") or 0) < 1000
+    ):
+        trimmed = trimmed[1:]
+    return trimmed if rows(trimmed) == n_client_requests else passes
+
+
 class BackendType(Enum):
     """Backend server type for API calls."""
 
@@ -1273,32 +1321,35 @@ class OpenAIAPIMoEProfiler:
             prefill_batch_sizes = []
             decode_batch_sizes = []
             if server_records:
+                # Every prefill aggregate reads the same client pass set, so the
+                # three published quantities cannot disagree on which passes were
+                # warm-up (they did when only ttft excluded probes).
+                for sr in _client_prefill_records(server_records, num_requests):
+                    ea = sr.get("expert_activation")
+                    if ea is not None and ea >= 0:
+                        prefill_activations.append(ea)
+                    lat = sr.get("latency")
+                    if lat is not None and lat >= 0:
+                        prefill_latencies.append(lat)
+                    bs = sr.get("batch_size")
+                    if bs is not None and bs >= 0:
+                        prefill_batch_sizes.append(bs)
                 for sr in server_records:
-                    fm = sr.get("forward_mode")
-                    is_prefill = fm == "prefill"
                     # A "mixed" step carries both prefill and decode work. vLLM emits them and
                     # continuous_batching_utils treats anything that is not prefill as decode, so
                     # excluding them here made the two aggregation paths disagree by construction
                     # on tpot, decode_avg_batch_size and decode expert activation.
-                    is_decode = fm in ("decode", "decoding", "mixed")
+                    if sr.get("forward_mode") not in ("decode", "decoding", "mixed"):
+                        continue
                     ea = sr.get("expert_activation")
                     if ea is not None and ea >= 0:
-                        if is_prefill:
-                            prefill_activations.append(ea)
-                        elif is_decode:
-                            decode_activations.append(ea)
+                        decode_activations.append(ea)
                     lat = sr.get("latency")
                     if lat is not None and lat >= 0:
-                        if is_prefill:
-                            prefill_latencies.append(lat)
-                        elif is_decode:
-                            decode_latencies.append(lat)
+                        decode_latencies.append(lat)
                     bs = sr.get("batch_size")
                     if bs is not None and bs >= 0:
-                        if is_prefill:
-                            prefill_batch_sizes.append(bs)
-                        elif is_decode:
-                            decode_batch_sizes.append(bs)
+                        decode_batch_sizes.append(bs)
 
             avg_batch_size_prefill = (
                 sum(prefill_batch_sizes) / len(prefill_batch_sizes)
