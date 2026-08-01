@@ -1441,6 +1441,16 @@ class OpenAIAPIMoEProfiler:
                     "acc": res_dict["arena_hard_win_rate"] / 100.0,
                     "total": res_dict.get("arena_hard_total", 0),
                 }
+                # The score is a win rate AGAINST a baseline, so it is only comparable
+                # across runs judged against the same one: publish the judge and baseline
+                # identity next to the score instead of dropping them here.
+                for k in ("arena_hard_judge_model", "arena_hard_baseline_model"):
+                    if res_dict.get(k) is not None:
+                        metrics_dict["quality"][k] = res_dict[k]
+                if self.config.baseline_answers_path:
+                    metrics_dict["quality"]["arena_hard_baseline_path"] = (
+                        self.config.baseline_answers_path
+                    )
             elif "acc" in res_dict or "exact_match" in res_dict:
                 metrics_dict["quality"] = {
                     "acc": res_dict.get("acc", res_dict.get("exact_match", 0.0)),
