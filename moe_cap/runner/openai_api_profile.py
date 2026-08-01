@@ -1235,7 +1235,7 @@ class OpenAIAPIMoEProfiler:
             # Auto-detect GPU type and number from hardware_utils
             gpu_raw_type = res_dict.get("gpu_raw_type", None)
             res_dict["cost"] = calculate_cost(
-                round(total_time, 2), gpu_raw_type, num_gpus
+                total_time, gpu_raw_type, num_gpus
             )
             gpu_type = gpu_raw_type if gpu_raw_type else "Unknown"
 
@@ -1250,8 +1250,10 @@ class OpenAIAPIMoEProfiler:
             )  # Use detected/configured backend
             res_dict["precision"] = self.used_dtype
             num_requests = len(prompts)
-            res_dict["e2e_s"] = round(total_time / max(num_requests, 1), 2)
-            res_dict["request/s"] = round(num_requests / total_time, 4) if total_time > 0 else 0.0
+            # Full precision: sub-second makespans quantize by up to ±12.5% at
+            # two decimals, and $/request and J/request are priced on this field.
+            res_dict["e2e_s"] = total_time / max(num_requests, 1)
+            res_dict["request/s"] = num_requests / total_time if total_time > 0 else 0.0
             res_dict["server_batch_size"] = (
                 self.server_batch_size
             )  # None indicates all inputs sent at once
@@ -1381,11 +1383,11 @@ class OpenAIAPIMoEProfiler:
             metrics_dict = {
                 "performance": {
                     "e2e_s": res_dict.get(
-                        "e2e_s", round(total_time / max(len(prompts), 1), 2)
+                        "e2e_s", total_time / max(len(prompts), 1)
                     ),
                     "request/s": res_dict.get(
                         "request/s",
-                        round(len(prompts) / total_time, 4) if total_time > 0 else 0.0,
+                        len(prompts) / total_time if total_time > 0 else 0.0,
                     ),
                     # Time until a request's first token. res_dict['ttft'] accumulates each
                     # request's own prefill chunks and skips the warm-up probes; the mean over raw
