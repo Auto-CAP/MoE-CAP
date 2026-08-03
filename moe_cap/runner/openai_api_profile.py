@@ -23,6 +23,10 @@ from moe_cap.utils.acc_metrics import (
 from moe_cap.utils.cost_utils import calculate_cost
 from moe_cap.configs import CAPConfig
 from moe_cap.data_loader.loader_registry import get_loader_for_task
+from moe_cap.utils.recorder_paths import (
+    RECORDER_DIR_ENV,
+    get_sglang_record_path,
+)
 
 import json
 from transformers import AutoTokenizer
@@ -30,6 +34,18 @@ import re
 
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=100 * 60 * 60)
+
+
+class ServerRecordsUnavailableError(RuntimeError):
+    """The server's forward-pass records could not be read back.
+
+    Every server-derived metric -- TTFT, per-pass prefill latency, prefill and
+    decode batch size, expert activation -- collapses to a zero or a null that
+    is indistinguishable from a measurement when these records are missing, and
+    the run is then committed as healthy. Fail the run instead: raising before
+    any metrics file is written leaves nothing for the job's save step to
+    publish.
+    """
 
 
 def _tokenized_input_length(tokenized: Any) -> int:
@@ -700,31 +716,49 @@ class OpenAIAPIMoEProfiler:
                 response.raise_for_status()
                 print("Expert distribution record dumped to file")
 
-                # Read the dumped records from the file location
-                server_output_base = os.environ.get(
-                    "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR",
-                    os.path.join(os.getcwd(), "expert_records"),
-                )
-                record_file = os.path.join(
-                    server_output_base,
-                    self.hf_model_name,
-                    "expert_distribution_record.jsonl",
-                )
+                # Read the dumped records from the file location. Resolved by the
+                # same helper the server writes through, so the two processes
+                # cannot pick different directories.
+                record_file = get_sglang_record_path(self.hf_model_name)
 
-                if os.path.exists(record_file):
-                    records = []
-                    with open(record_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                records.append(json.loads(line))
-                    print(
-                        f"Retrieved {len(records)} expert distribution records from file"
+                if not os.path.exists(record_file):
+                    # The server acknowledged the dump, so an absent file is a
+                    # broken rendezvous, not an empty workload. Returning []
+                    # here used to publish zeroed batch sizes, zero expert
+                    # activation and null timings that read as measured, with a
+                    # zero exit code letting the dead run be committed.
+                    raise ServerRecordsUnavailableError(
+                        "SGLang reported the forward-record dump complete but no "
+                        f"record file exists at {record_file}. Server and client "
+                        f"must agree on {RECORDER_DIR_ENV} (currently "
+                        f"{os.environ.get(RECORDER_DIR_ENV) or 'unset'}); refusing "
+                        "to publish unmeasured timing and batch-size metrics."
                     )
-                    return records
-                else:
-                    print(f"Warning: Expected record file not found at {record_file}")
-                    return []
+
+                records = []
+                with open(record_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+
+                if not records:
+                    # Both dump paths truncate the file on open, so a present but
+                    # empty one means recording never started - the start/stop
+                    # calls report success through a return value nothing reads.
+                    # Downstream this is indistinguishable from a missing file:
+                    # the same zeroed batch sizes and null timings get published.
+                    raise ServerRecordsUnavailableError(
+                        f"SGLang wrote an empty record file at {record_file}: the "
+                        "forward-pass recording never started, so no timing or "
+                        "batch-size measurement exists for this run. Refusing to "
+                        "publish zeros in their place."
+                    )
+
+                print(
+                    f"Retrieved {len(records)} expert distribution records from file"
+                )
+                return records
             else:
                 response = requests.post(
                     f"{self.base_url}/dump_batch_recording", timeout=300
@@ -734,7 +768,13 @@ class OpenAIAPIMoEProfiler:
                 records = data.get("records", [])
                 print(f"Retrieved {len(records)} batch records from server")
                 return records
+        except ServerRecordsUnavailableError:
+            # Never degraded to a warning: this is the one failure that would
+            # otherwise be published as measured zeros.
+            raise
         except Exception as e:
+            # Transport-level failures keep the historical warn-and-degrade
+            # path so a run that can still fall back is not aborted.
             print(f"Warning: Could not dump recording: {e}")
             return []
 

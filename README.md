@@ -133,7 +133,7 @@ To enable verbose debug logging for troubleshooting:
 |----------|---------|-------------|
 | `MOE_CAP_PROFILING_ONLY` | `0` | Set to `1` to disable expert distribution recording entirely. Only collects TTFT/TPOT/throughput. Must be set on both server and client. See [Profiling-Only Guide](PROFILING_ONLY_GUIDE.md). |
 | `MOE_CAP_SKIP_EXPERT_PATCHING` | `0` | Set to `1` to skip expert distribution monkey patching on the vLLM server. Useful for models with incompatible MoE implementations (e.g., Mixtral). Automatically set when `MOE_CAP_PROFILING_ONLY=1`. |
-| `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` | `~/expert_records` | Directory where SGLang writes expert distribution JSONL records. |
+| `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` | `~/expert_records` | Server/client rendezvous directory for SGLang's per-forward-pass JSONL records. Under `MOE_CAP_PROFILING_ONLY=1` it carries the dense timing records rather than expert distribution, so it applies to every SGLang run. Server and client resolve it identically; set it on both or on neither. |
 
 ### Example: Quiet Run (default)
 

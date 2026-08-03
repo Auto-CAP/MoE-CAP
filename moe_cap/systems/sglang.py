@@ -35,6 +35,11 @@ import torch
 import json
 
 from moe_cap.utils.hardware_utils import get_gpu_details
+from moe_cap.utils.recorder_paths import (
+    RECORDER_DIR_ENV,
+    get_sglang_record_path,
+    get_sglang_recorder_dir,
+)
 
 _PROFILING_ONLY = os.environ.get("MOE_CAP_PROFILING_ONLY", "0") == "1"
 if _PROFILING_ONLY:
@@ -240,12 +245,9 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         if output_mode == "file":
-            # Use SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR as the base directory
-            save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
-            path_output = os.path.join(
-                save_dir,
-                f"{self._server_args.model_path}/expert_distribution_record.jsonl",
-            )
+            # Same helper the client reads back through, so the two processes
+            # cannot resolve different record files.
+            path_output = get_sglang_record_path(self._server_args.model_path)
             out_dirs = os.path.dirname(path_output)
             if not os.path.exists(out_dirs):
                 os.makedirs(out_dirs, exist_ok=True)
@@ -260,11 +262,10 @@ class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
         return self._recording
 
 
-# Set expert distribution recorder directory (can be overridden by environment variable)
-if "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR" not in os.environ:
-    os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = os.path.join(
-        os.path.expanduser("~"), "expert_records"
-    )
+# Publish the resolved recorder directory back into the environment so SGLang's
+# own env registry and any child process see the one directory the shared helper
+# picked (an explicit setting is kept, only normalised).
+os.environ[RECORDER_DIR_ENV] = get_sglang_recorder_dir()
 
 
 _original_forward = ModelRunner.forward
@@ -600,11 +601,7 @@ class _ProfilingOnlyRecorder(ExpertDistributionRecorder):
         """
         records = list(self.expert_record_list)
         if output_mode == "file":
-            save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
-            path_output = os.path.join(
-                save_dir,
-                f"{self._server_args.model_path}/expert_distribution_record.jsonl",
-            )
+            path_output = get_sglang_record_path(self._server_args.model_path)
             out_dir = os.path.dirname(path_output)
             if not os.path.exists(out_dir):
                 os.makedirs(out_dir, exist_ok=True)

@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
+from moe_cap.utils.recorder_paths import RECORDER_DIR_ENV, get_sglang_record_path
+
 SOURCE_PATH = Path(__file__).parents[1] / "moe_cap" / "systems" / "sglang.py"
 
 
@@ -37,13 +39,14 @@ class _ServerArgs:
 
 
 def _namespace(save_dir):
-    class _EnvVar:
-        def get(self):
-            return save_dir
+    """Execute the recorder blocks against the real shared path helper.
 
-    class _Envs:
-        SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = _EnvVar()
+    ``save_dir`` is exported as the recorder environment variable rather than
+    stubbed, so the block under test resolves its output file exactly the way
+    the client resolves the file it reads back.
+    """
 
+    os.environ[RECORDER_DIR_ENV] = save_dir
     namespace = {
         "contextmanager": contextmanager,
         "ExpertDistributionRecorder": _RecorderBase,
@@ -51,7 +54,7 @@ def _namespace(save_dir):
         "List": List,
         "_OutputMode": str,
         "logger": logging.getLogger(__name__),
-        "envs": _Envs(),
+        "get_sglang_record_path": get_sglang_record_path,
         "os": os,
         "json": json,
     }
@@ -62,6 +65,17 @@ def _namespace(save_dir):
 
 
 class ProfilingOnlyRecorderTest(unittest.TestCase):
+    def setUp(self):
+        saved = os.environ.get(RECORDER_DIR_ENV)
+
+        def restore():
+            if saved is None:
+                os.environ.pop(RECORDER_DIR_ENV, None)
+            else:
+                os.environ[RECORDER_DIR_ENV] = saved
+
+        self.addCleanup(restore)
+
     def test_factory_does_not_require_expert_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             ns = _namespace(tmp)
