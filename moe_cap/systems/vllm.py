@@ -366,15 +366,50 @@ def _safe_int(value, default=0):
         return default
 
 
+def _tp_rank_in_group(tp_group):
+    """Rank of this worker inside its own TP group.
+
+    GroupCoordinator.rank is the GLOBAL rank: with more than one TP group
+    (data- or pipeline-parallel layouts) it is non-zero on every group but
+    the first, so gating on it silences every other group's recorder.
+    rank_in_group is the position within this group; for coordinators
+    without it, derive that position from the group's rank list.
+    """
+    if tp_group is None:
+        return 0
+    rank_in_group = getattr(tp_group, "rank_in_group", None)
+    if rank_in_group is not None:
+        return _safe_int(rank_in_group, default=0)
+    rank = _safe_int(getattr(tp_group, "rank", 0), default=0)
+    ranks = getattr(tp_group, "ranks", None)
+    if ranks:
+        try:
+            return list(ranks).index(rank)
+        except ValueError:
+            pass
+    return rank
+
+
 def _get_tp_rank():
-    """Current TP rank; 0 when parallel state is unavailable (single GPU)."""
+    """Current in-group TP rank; 0 when parallel state is unavailable (single GPU)."""
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
-        tp_group = get_tp_group()
-        return tp_group.rank if tp_group is not None else 0
+        return _tp_rank_in_group(get_tp_group())
     except Exception:
         return 0
+
+
+def _finalize_pass_records(records):
+    """Stamp the engine-uniform token field on per-pass records before storing.
+
+    vLLM's seq_lens_sum is already the tokens scheduled in this pass, so
+    scheduled_tokens republishes it under the engine-uniform name (SGLang's
+    seq_lens_sum is a running context sum instead, a different quantity).
+    """
+    for rec in records:
+        rec["scheduled_tokens"] = rec["seq_lens_sum"]
+    return records
 
 
 # Prompt length at admission for requests currently mid-prefill.
@@ -494,6 +529,10 @@ def _build_prefill_per_req_info_vllm(scheduler_output: "SchedulerOutput"):
                 "req_id": req_id_str,
                 "extend_len": extend_len,
                 "total_len": _safe_int(prompt_len, default=0),
+                # Same value as total_len on vLLM, under the engine-uniform
+                # name: SGLang's total_len is a running computed total, so
+                # only prompt_len means the same thing on both engines.
+                "prompt_len": _safe_int(prompt_len, default=0),
                 "is_last_chunk": is_last_chunk,
             }
         )
@@ -735,7 +774,7 @@ def execute_model_custom(
                 records_to_add[-1]["req_ids"] = sorted(decode_req_ids)
             if forward_mode == "prefill" and per_req_info:
                 records_to_add[-1]["per_req_info"] = per_req_info
-        for rec_dict in records_to_add:
+        for rec_dict in _finalize_pass_records(records_to_add):
             recording_state.add_record(rec_dict)
 
     # Automatic expert distribution recording
@@ -743,8 +782,9 @@ def execute_model_custom(
         try:
             from vllm.distributed.parallel_state import get_tp_group
 
-            tp_group = get_tp_group()
-            tp_rank = tp_group.rank if tp_group is not None else 0
+            # In-group rank, not the global rank: the global rank is non-zero
+            # on every TP group but the first under DP/PP layouts.
+            tp_rank = _tp_rank_in_group(get_tp_group())
 
             if tp_rank == 0:
                 records_to_add = []
@@ -786,7 +826,7 @@ def execute_model_custom(
                     })
                     if forward_mode == "prefill" and per_req_info:
                         records_to_add[-1]["per_req_info"] = per_req_info
-                for record_dict in records_to_add:
+                for record_dict in _finalize_pass_records(records_to_add):
                     expert_distribution_recording_state.add_record(record_dict)
                 logger.debug(
                     f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}"

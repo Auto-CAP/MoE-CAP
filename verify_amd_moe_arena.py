@@ -148,6 +148,14 @@ async def main(args):
     summary_file.write_text(json.dumps(summary, indent=2) + "\n")
 
     metrics = json.loads(metrics_file.read_text())
+    # Cohort counts are run facts, not judge outputs: a post-hoc re-judge
+    # replaces the scores but must not erase them.
+    prior_quality = metrics.get("quality") or {}
+    cohort_fields = {
+        k: prior_quality[k]
+        for k in ("attempted", "served", "completed")
+        if k in prior_quality
+    }
     metrics["quality"] = {
         "acc": summary["arena_hard_win_rate"] / 100,
         "total": 256,
@@ -163,6 +171,7 @@ async def main(args):
         "posthoc_eval": True,
         "posthoc_eval_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+    metrics["quality"].update(cohort_fields)
     metrics_file.write_text(json.dumps(metrics, indent=2) + "\n")
     print("VERIFY_COMPLETE", json.dumps(summary, sort_keys=True), flush=True)
 

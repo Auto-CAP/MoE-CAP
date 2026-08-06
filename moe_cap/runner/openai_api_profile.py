@@ -187,6 +187,70 @@ def _client_prefill_records(
     return trimmed if rows(trimmed) == n_client_requests else passes
 
 
+def _cohort_counts(results) -> Tuple[int, int, int]:
+    """(attempted, served, completed) request cohorts for one run.
+
+    attempted: every request the client sent, including ones the server
+        rejected before any forward pass (context-length refusals).
+    served: requests whose prefill the server demonstrably ran -- the first
+        token arrived (ttft > 0), or the request succeeded outright (a
+        non-streaming success records ttft 0.0 but was necessarily served).
+        Includes streams that failed after the first token.
+    completed: success-flagged requests (full generation received).
+
+    completed <= served <= attempted by construction; attempted - served is
+    the refused count, served - completed the failed-after-first-token count.
+    """
+    attempted = len(results)
+    served = 0
+    completed = 0
+    for result in results:
+        success = bool(getattr(result, "success", False))
+        ttft = getattr(result, "ttft", 0) or 0
+        if success or ttft > 0:
+            served += 1
+        if success:
+            completed += 1
+    return attempted, served, completed
+
+
+def _prefill_step_totals(
+    server_records: Optional[List[Dict[str, Any]]],
+    n_client_requests: int,
+) -> Tuple[Optional[int], Optional[float]]:
+    """(forwarded_tokens, elapsed_s) over the client's own prefill passes.
+
+    forwarded_tokens sums each pass's scheduled_tokens -- the tokens the
+    server actually ran, cached prefixes excluded -- and is None unless
+    every counted pass carries the field: a sum over a subset of the passes
+    would read as a physical total while measuring only part of the run.
+    elapsed_s sums the same passes' durations under the same all-or-null
+    rule. Both read the pass set every other prefill aggregate uses, so a
+    rate formed from them divides token and time sums over identical passes.
+    """
+    passes = _client_prefill_records(server_records, n_client_requests)
+    if not passes:
+        return None, None
+    forwarded: Optional[int] = 0
+    elapsed: Optional[float] = 0.0
+    for record in passes:
+        scheduled = record.get("scheduled_tokens")
+        if isinstance(scheduled, (int, float)) and not isinstance(scheduled, bool):
+            if forwarded is not None:
+                forwarded += int(scheduled)
+        else:
+            forwarded = None
+        duration = record.get("latency", record.get("ttft"))
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            if elapsed is not None:
+                elapsed += float(duration)
+        else:
+            elapsed = None
+    return forwarded, elapsed
+
+
+
+
 class BackendType(Enum):
     """Backend server type for API calls."""
 
@@ -1318,6 +1382,7 @@ class OpenAIAPIMoEProfiler:
                 dest_dir, f"output_data_{dataset_name}_{timestamp}.jsonl"
             )
             prefill_tokens_total = 0
+            prefill_tokens_completed_total = 0
             decode_generated_tokens_total = 0
             with open(output_data_path, "w", encoding="utf-8") as f:
                 for i, result in enumerate(results):
@@ -1329,8 +1394,12 @@ class OpenAIAPIMoEProfiler:
                     )
                     # Prefill is attempted-input accounting, so a prompt rejected before decode
                     # still counts. Decode is generated-token accounting; failed requests remain
-                    # zero through _request_token_counts.
+                    # zero through _request_token_counts. The completed total restricts the same
+                    # tokenizer sum to success-flagged requests; the published basis stays
+                    # attempted -- both are recorded so either cohort is recomputable.
                     prefill_tokens_total += input_token_count
+                    if getattr(result, "success", False):
+                        prefill_tokens_completed_total += input_token_count
                     decode_generated_tokens_total += output_token_count
                     record = {
                         "index": i,
@@ -1420,6 +1489,16 @@ class OpenAIAPIMoEProfiler:
                     simple_tpots.append((latency - ttft) / out_len)
             simple_tpot = sum(simple_tpots) / len(simple_tpots) if simple_tpots else 0
 
+            # Measured prefill totals (null unless every counted pass carries
+            # them) and request cohorts; recorded alongside the historical
+            # aggregates, which keep their attempted-cohort basis unchanged.
+            prefill_forwarded_tokens, prefill_step_elapsed_s = _prefill_step_totals(
+                server_records, num_requests
+            )
+            attempted_requests, served_requests, completed_requests = _cohort_counts(
+                results
+            )
+
             metrics_dict = {
                 "performance": {
                     "e2e_s": res_dict.get(
@@ -1452,6 +1531,13 @@ class OpenAIAPIMoEProfiler:
                         else None
                     ),
                     "tpot": (sum(decode_latencies)/len(decode_latencies)) if decode_latencies else (res_dict.get("tpot") or simple_tpot),
+                    # The measured pair: tokens the server actually forwarded in
+                    # the client's prefill passes and those passes' summed
+                    # duration. Null when the trace does not carry per-pass
+                    # scheduled_tokens (recorders predating the field) or any
+                    # pass lacks a duration; never a partial sum.
+                    "prefill_forwarded_tokens": prefill_forwarded_tokens,
+                    "prefill_step_elapsed_s": prefill_step_elapsed_s,
                 },
                 "expert_activation": {
                     "avg_expert_activation_prefill": (
@@ -1472,6 +1558,11 @@ class OpenAIAPIMoEProfiler:
                     "decode_generated_tokens": decode_generated_tokens_total,
                     "decode_generated_tokens_per_request": decode_generated_tokens_total / max(num_requests, 1),
                     "decode_avg_batch_size": avg_batch_size_decode,
+                    # Dual-cohort totals: prefill_tokens above is and stays the
+                    # attempted-cohort sum; both bases are recorded explicitly
+                    # so neither has to be reconstructed from the other.
+                    "prefill_tokens_attempted": prefill_tokens_total,
+                    "prefill_tokens_completed": prefill_tokens_completed_total,
                 },
             }
 
@@ -1496,6 +1587,17 @@ class OpenAIAPIMoEProfiler:
                     "acc": res_dict.get("acc", res_dict.get("exact_match", 0.0)),
                     "total": res_dict.get("total", 0),
                 }
+
+            # Request cohorts (client-measured, per _cohort_counts). Recorded
+            # even when no accuracy evaluation ran: they are run facts, not
+            # quality scores.
+            metrics_dict.setdefault("quality", {}).update(
+                {
+                    "attempted": attempted_requests,
+                    "served": served_requests,
+                    "completed": completed_requests,
+                }
+            )
 
             metrics_path = os.path.join(
                 dest_dir, f"metrics_{dataset_name}_{timestamp}.json"
@@ -1567,6 +1669,10 @@ class OpenAIAPIMoEProfiler:
                             record["per_req_info"] = sr["per_req_info"]
                         if sr.get("req_ids"):
                             record["req_ids"] = sr["req_ids"]
+                        # Engine-uniform per-pass token count; absent on records
+                        # from recorders that predate the field.
+                        if sr.get("scheduled_tokens") is not None:
+                            record["scheduled_tokens"] = sr["scheduled_tokens"]
                         f.write(json.dumps(record) + "\n")
                 else:
                     print("Warning: No server records available for detailed results")

@@ -374,6 +374,10 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
         }
         if orig_len is not None:
             info["orig_len"] = int(orig_len)
+            # Admission prompt length under the field name vLLM's per_req_info
+            # uses; total_len here is the running computed total, which on
+            # vLLM holds the prompt length -- the asymmetry total_len keeps.
+            info["prompt_len"] = int(orig_len)
         per_req_info.append(info)
         if is_last_chunk:
             _prefill_pool_counters[pool_idx] = counter + 1
@@ -382,6 +386,33 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
             _prefill_pool_last_seq[pool_idx] = int(total_len)
 
     return per_req_info
+
+
+def _scheduled_tokens_for_record(forward_mode, batch_size, per_req_info):
+    """Tokens computed in this pass, uniform with vLLM's scheduled sum.
+
+    SGLang's seq_lens_sum cannot serve: it is the running context sum, so a
+    chunked prefill re-counts all previously computed context every chunk.
+    The per-chunk extend lengths are the tokens actually run in the pass; a
+    decode pass computes one token per running request. None (field omitted)
+    when the pass's per-request reads came back empty -- never a guess.
+    """
+    if forward_mode == "prefill":
+        if not per_req_info:
+            return None
+        total = 0
+        for info in per_req_info:
+            extend_len = info.get("extend_len")
+            if not isinstance(extend_len, int):
+                return None
+            total += extend_len
+        return total
+    if forward_mode == "decode":
+        try:
+            return int(batch_size)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 @lru_cache(maxsize=None)
@@ -522,16 +553,23 @@ def forward_expert_record(
             "gpu_num": gpu_num,
             "gpu_raw_type": gpu_raw_type,
         }
+        per_req_info = None
         if forward_mode == "prefill":
-            record_dict["per_req_info"] = _build_prefill_per_req_info(
+            per_req_info = _build_prefill_per_req_info(
                 forward_batch, self.server_args
             )
+            record_dict["per_req_info"] = per_req_info
         else:
             # Same ids per_req_info uses (req_pool_idx): client retries become
             # distinct pool entries, so retry pollution is diagnosable per trace.
             _rids = _to_cpu_list(forward_batch.req_pool_indices)
             if _rids:
                 record_dict["req_ids"] = [int(x) for x in _rids]
+        scheduled_tokens = _scheduled_tokens_for_record(
+            forward_mode, forward_batch.batch_size, per_req_info
+        )
+        if scheduled_tokens is not None:
+            record_dict["scheduled_tokens"] = scheduled_tokens
         get_global_expert_distribution_recorder().expert_record_list.append(record_dict)
         logger.debug(
             f"Forward pass {self.forward_pass_id} completed with latency {latency:.4f}s, expert activation {non_zero_value}"
@@ -673,16 +711,23 @@ def forward_profiling_only(
             "gpu_num": gpu_num,
             "gpu_raw_type": gpu_raw_type,
         }
+        per_req_info = None
         if forward_mode == "prefill":
-            record_dict["per_req_info"] = _build_prefill_per_req_info(
+            per_req_info = _build_prefill_per_req_info(
                 forward_batch, self.server_args
             )
+            record_dict["per_req_info"] = per_req_info
         else:
             # Same ids per_req_info uses (req_pool_idx): client retries become
             # distinct pool entries, so retry pollution is diagnosable per trace.
             _rids = _to_cpu_list(forward_batch.req_pool_indices)
             if _rids:
                 record_dict["req_ids"] = [int(x) for x in _rids]
+        scheduled_tokens = _scheduled_tokens_for_record(
+            forward_mode, forward_batch.batch_size, per_req_info
+        )
+        if scheduled_tokens is not None:
+            record_dict["scheduled_tokens"] = scheduled_tokens
         if hasattr(recorder, "expert_record_list"):
             recorder.expert_record_list.append(record_dict)
         logger.debug(
