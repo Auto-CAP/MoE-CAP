@@ -13,7 +13,8 @@ from functools import lru_cache
 from pathlib import Path
 
 SOURCE_PATH = Path(__file__).parents[1] / "moe_cap" / "systems" / "vllm.py"
-WANTED = {"_safe_int", "_tp_rank_in_group", "_get_tp_rank"}
+WANTED = {"_safe_int", "_tp_rank_in_group", "_get_tp_rank",
+          "_pp_is_first_stage", "_is_recording_rank"}
 
 
 def _load_helpers():
@@ -34,18 +35,21 @@ def _load_helpers():
 
 
 class _FakeGroup:
-    def __init__(self, rank, rank_in_group=None, ranks=None):
+    def __init__(self, rank, rank_in_group=None, ranks=None, is_first_rank=None):
         self.rank = rank
         if rank_in_group is not None:
             self.rank_in_group = rank_in_group
         if ranks is not None:
             self.ranks = ranks
+        if is_first_rank is not None:
+            self.is_first_rank = is_first_rank
 
 
-def _install_fake_parallel_state(tp_group):
-    """Install a fake vllm.distributed.parallel_state exposing get_tp_group."""
+def _install_fake_parallel_state(tp_group, pp_group=None):
+    """Install a fake vllm.distributed.parallel_state exposing both groups."""
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tp_group = lambda: tp_group
+    parallel_state.get_pp_group = lambda: pp_group
     distributed = types.ModuleType("vllm.distributed")
     distributed.parallel_state = parallel_state
     vllm_mod = types.ModuleType("vllm")
@@ -138,8 +142,78 @@ def test_group_without_rank_in_group_falls_back_to_ranks_index():
     assert helpers["_tp_rank_in_group"](None) == 0
 
 
+def test_exactly_one_recorder_across_a_tp_pp_layout():
+    """TP=2 x PP=2: every stage's TP leader has in-group rank 0, but the
+    stages execute the SAME scheduled pass — recording on each would append
+    every pass pp_size times. Exactly one rank in the world may record."""
+    helpers = _load_helpers()
+    world = {
+        0: (_FakeGroup(rank=0, rank_in_group=0, ranks=[0, 1]),
+            _FakeGroup(rank=0, ranks=[0, 2], is_first_rank=True)),
+        1: (_FakeGroup(rank=1, rank_in_group=1, ranks=[0, 1]),
+            _FakeGroup(rank=1, ranks=[1, 3], is_first_rank=True)),
+        2: (_FakeGroup(rank=2, rank_in_group=0, ranks=[2, 3]),
+            _FakeGroup(rank=2, ranks=[0, 2], is_first_rank=False)),
+        3: (_FakeGroup(rank=3, rank_in_group=1, ranks=[2, 3]),
+            _FakeGroup(rank=3, ranks=[1, 3], is_first_rank=False)),
+    }
+    recorders = []
+    for global_rank, (tp, pp) in world.items():
+        saved = _install_fake_parallel_state(tp, pp)
+        try:
+            if helpers["_is_recording_rank"]():
+                recorders.append(global_rank)
+        finally:
+            _restore_modules(saved)
+    assert recorders == [0]
+
+
+def test_dp_replica_leaders_both_record_without_pp():
+    """DP=2 x TP=4 (no PP): each replica computes distinct requests, so both
+    TP-group leaders must record — the layout the in-group gate exists for."""
+    helpers = _load_helpers()
+    layouts = {
+        0: _FakeGroup(rank=0, rank_in_group=0, ranks=[0, 1, 2, 3]),
+        4: _FakeGroup(rank=4, rank_in_group=0, ranks=[4, 5, 6, 7]),
+        5: _FakeGroup(rank=5, rank_in_group=1, ranks=[4, 5, 6, 7]),
+    }
+    decisions = {}
+    for global_rank, tp in layouts.items():
+        saved = _install_fake_parallel_state(tp, pp_group=None)
+        try:
+            decisions[global_rank] = helpers["_is_recording_rank"]()
+        finally:
+            _restore_modules(saved)
+    assert decisions == {0: True, 4: True, 5: False}
+
+
+def test_pp_group_without_is_first_rank_falls_back_to_ranks():
+    helpers = _load_helpers()
+    assert helpers["_pp_is_first_stage"](_FakeGroup(rank=2, ranks=[2, 5])) is True
+    assert helpers["_pp_is_first_stage"](_FakeGroup(rank=5, ranks=[2, 5])) is False
+    assert helpers["_pp_is_first_stage"](None) is True
+
+
+def test_unavailable_pp_state_keeps_the_tp_gate():
+    """A version without get_pp_group must keep the TP-leader behaviour."""
+    helpers = _load_helpers()
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_tp_group = lambda: _FakeGroup(
+        rank=0, rank_in_group=0, ranks=[0, 1])
+    saved = {
+        name: sys.modules.get(name)
+        for name in ("vllm", "vllm.distributed", "vllm.distributed.parallel_state")
+    }
+    sys.modules["vllm.distributed.parallel_state"] = parallel_state
+    try:
+        assert helpers["_is_recording_rank"]() is True
+    finally:
+        _restore_modules(saved)
+
+
 def test_no_global_rank_gate_left_in_source():
-    """No recording gate may read the coordinator's global rank directly."""
+    """No recording gate may read the coordinator's global rank directly,
+    and both recording branches must gate through _is_recording_rank."""
     source = SOURCE_PATH.read_text(encoding="utf-8")
     assert "tp_group.rank if" not in source
-    assert source.count("_tp_rank_in_group(get_tp_group())") >= 2
+    assert source.count("_is_recording_rank()") >= 2

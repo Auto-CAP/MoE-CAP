@@ -370,10 +370,11 @@ def _tp_rank_in_group(tp_group):
     """Rank of this worker inside its own TP group.
 
     GroupCoordinator.rank is the GLOBAL rank: with more than one TP group
-    (data- or pipeline-parallel layouts) it is non-zero on every group but
-    the first, so gating on it silences every other group's recorder.
-    rank_in_group is the position within this group; for coordinators
-    without it, derive that position from the group's rank list.
+    it is non-zero on every group but the first, so gating on it silences
+    every other group's recorder — under data parallelism those groups hold
+    distinct requests that must be recorded. rank_in_group is the position
+    within this group; for coordinators without it, derive that position
+    from the group's rank list.
     """
     if tp_group is None:
         return 0
@@ -398,6 +399,44 @@ def _get_tp_rank():
         return _tp_rank_in_group(get_tp_group())
     except Exception:
         return 0
+
+
+def _pp_is_first_stage(pp_group):
+    """True on the first pipeline stage, or when no PP state exists.
+
+    Pipeline stages execute the SAME scheduled pass: unlike DP replicas,
+    recording on every stage duplicates each pass pp_size times.
+    """
+    if pp_group is None:
+        return True
+    is_first = getattr(pp_group, "is_first_rank", None)
+    if is_first is not None:
+        return bool(is_first)
+    rank = _safe_int(getattr(pp_group, "rank", 0), default=0)
+    ranks = getattr(pp_group, "ranks", None)
+    if ranks:
+        try:
+            return list(ranks).index(rank) == 0
+        except ValueError:
+            pass
+    return True
+
+
+def _is_recording_rank():
+    """True on exactly one rank per distinct forward pass.
+
+    The TP-group leader records, and only on the first pipeline stage; DP
+    replicas each keep their own leader because their passes are distinct
+    work, not copies. Missing PP state means no pipeline parallelism.
+    """
+    if _get_tp_rank() != 0:
+        return False
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        return _pp_is_first_stage(get_pp_group())
+    except Exception:
+        return True
 
 
 def _finalize_pass_records(records):
@@ -732,7 +771,7 @@ def execute_model_custom(
     # data file is shared node-wide, so an un-gated append wrote every forward
     # pass world_size times on multi-GPU runs (the expert-distribution branch
     # below already carries this gate).
-    if recording_state.is_recording() and _get_tp_rank() == 0:
+    if recording_state.is_recording() and _is_recording_rank():
         records_to_add = []
         if forward_mode == "mixed":
             if prefill_req_ids:
@@ -780,13 +819,7 @@ def execute_model_custom(
     # Automatic expert distribution recording
     if expert_distribution_recording_state.enabled:
         try:
-            from vllm.distributed.parallel_state import get_tp_group
-
-            # In-group rank, not the global rank: the global rank is non-zero
-            # on every TP group but the first under DP/PP layouts.
-            tp_rank = _tp_rank_in_group(get_tp_group())
-
-            if tp_rank == 0:
+            if _is_recording_rank():
                 records_to_add = []
                 if forward_mode == "mixed":
                     if prefill_req_ids:
