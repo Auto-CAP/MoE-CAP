@@ -409,7 +409,14 @@ def get_peak_bw(gpu_name):
     return MEM_BW_DICT.get(gpu_name, 0)
 
 
+# Checkpoint-native precision labels whose tensor-core peak is another
+# section's: mxfp4 is fp4 at the cores — block-scaled microscaling changes
+# the storage format, not the peak.
+PRECISION_ALIASES = {"mxfp4": "fp4"}
+
+
 def get_peak_flops(gpu_name, precision):
     if gpu_name is None:
         return 0
+    precision = PRECISION_ALIASES.get(precision, precision)
     return PEAK_FLOPS_DICT.get(precision, {}).get(gpu_name, 0)

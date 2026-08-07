@@ -76,3 +76,21 @@ def test_normalize_model_id():
     assert normalize_model_id("unsloth/gpt-oss-120b") == "unsloth/gpt-oss-120b"
     assert normalize_model_id("gpt-oss-120b") == "gpt-oss-120b"
     assert normalize_model_id("") == ""
+
+
+def test_resolved_mxfp4_precision_has_a_peak_flops_entry():
+    # resolve_precision records gpt-oss checkpoints as "mxfp4"; the peak
+    # lookup must not silently return 0 for that label — a zero peak either
+    # crashes the sMFU reduction (division by zero) or drops the utilization
+    # block for every mxfp4 run. mxfp4 is fp4 at the tensor cores, so the
+    # lookup must agree with the fp4 section everywhere (including that
+    # section's deliberate zeros for cards without an FP4 datapath) and be
+    # positive on the cards that actually serve mxfp4 checkpoints.
+    from moe_cap.utils.hardware_utils import PEAK_FLOPS_DICT, get_peak_flops
+
+    for gpu, fp4_peak in PEAK_FLOPS_DICT["fp4"].items():
+        assert get_peak_flops(gpu, "mxfp4") == fp4_peak
+    for gpu in ("NVIDIA-B200-183GB", "NVIDIA-H100-HBM3-80GB",
+                "NVIDIA-H200-141GB", "NVIDIA-A100-SXM4-80GB",
+                "AMD-Instinct-MI355X-288GB"):
+        assert get_peak_flops(gpu, "mxfp4") > 0
