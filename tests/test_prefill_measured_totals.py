@@ -157,6 +157,44 @@ class DetailedWriterProjectionTest(unittest.TestCase):
         source = SOURCE_PATH.read_text(encoding="utf-8")
         self.assertNotIn("record_schema", source)
 
+    def test_writer_carries_wall_clock_bounds_only_when_present(self):
+        """Expected: the detailed-results writer copies t_start and t_end from
+        a server record into the written record when they are set, and leaves
+        them out when they are missing or None, so records from older
+        recorders are written as before.
+
+        Check: find the writer's single loop over ("t_start", "t_end") in
+        openai_api_profile.py and run it on three server records: one with
+        both bounds, one with neither, and one with both set to None. Assert
+        the first yields exactly its bounds and the other two yield nothing."""
+        tree = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"))
+        loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Tuple)
+            and {
+                elt.value
+                for elt in node.iter.elts
+                if isinstance(elt, ast.Constant)
+            }
+            == {"t_start", "t_end"}
+        ]
+        self.assertEqual(len(loops), 1, "expected one t_start/t_end copy loop")
+        code = compile(
+            ast.Module(body=loops, type_ignores=[]), str(SOURCE_PATH), "exec"
+        )
+
+        def project(sr):
+            namespace = {"sr": sr, "record": {}}
+            exec(code, namespace)
+            return namespace["record"]
+
+        bounds = {"t_start": 1700000000.123456, "t_end": 1700000000.234567}
+        self.assertEqual(project({"latency": 0.1, **bounds}), bounds)
+        self.assertEqual(project({"latency": 0.1}), {})
+        self.assertEqual(project({"t_start": None, "t_end": None}), {})
+
 
 class MetricsWiringTest(unittest.TestCase):
     """The run loop must persist the new quantities into metrics_*.json."""
