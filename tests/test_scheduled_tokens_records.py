@@ -1,4 +1,4 @@
-"""Engine-uniform scheduled_tokens on per-pass records.
+"""Engine-uniform scheduled_tokens and wall time bounds on per-pass records.
 
 SGLang's per-pass seq_lens_sum is the RUNNING CONTEXT sum: under chunked
 prefill every chunk re-counts all previously computed context, so summing it
@@ -6,6 +6,11 @@ over a request's chunks exceeds the prompt length. vLLM's seq_lens_sum is
 the tokens scheduled in the pass. scheduled_tokens carries the vLLM meaning
 on both engines; seq_lens_sum stays byte-identical to its historical
 per-engine meaning.
+
+Every per-pass record on both engines also carries t_start and t_end, the
+forward pass's wall time bounds (time.time()), taken inside the same
+torch.cuda.synchronize() bracket as latency, so passes can be lined up with
+external traces such as GPU energy counters.
 """
 
 import ast
@@ -178,7 +183,7 @@ def test_vllm_records_carry_scheduled_tokens():
 
 def test_vllm_records_carry_wall_clock_pass_bounds():
     """Expected: _finalize_pass_records stamps every record it is given with
-    the same t_start and t_end, the wall-clock bounds of the forward pass. When
+    the same t_start and t_end, the wall time bounds of the forward pass. When
     vLLM runs a mixed pass, its prefill and decode records therefore carry
     identical bounds.
 
@@ -197,32 +202,82 @@ def test_vllm_records_carry_wall_clock_pass_bounds():
 
 
 def test_both_vllm_recording_branches_route_through_finalize():
-    source = VLLM_PATH.read_text(encoding="utf-8")
-    assert source.count("_finalize_pass_records(records_to_add, t_start, t_end)") == 2
+    """Expected: both of execute_model_custom's recording branches (batch
+    recording and expert distribution) store only records that have been
+    through _finalize_pass_records, called with the pass's t_start and t_end.
+
+    Check: parse execute_model_custom and find the loops that iterate over a
+    _finalize_pass_records(...) call. Assert there are two, that each passes
+    the t_start and t_end variables as the bounds (positionally or by
+    keyword), and that each loop body stores records with add_record."""
+    func = _function_def(VLLM_PATH, "execute_model_custom")
+    loops = [
+        n
+        for n in ast.walk(func)
+        if isinstance(n, ast.For)
+        and isinstance(n.iter, ast.Call)
+        and isinstance(n.iter.func, ast.Name)
+        and n.iter.func.id == "_finalize_pass_records"
+    ]
+    assert len(loops) == 2, "expected two loops over _finalize_pass_records(...)"
+    for loop in loops:
+        call = loop.iter
+        bounds = dict(zip(("t_start", "t_end"), call.args[1:3]))
+        bounds.update({kw.arg: kw.value for kw in call.keywords})
+        for key in ("t_start", "t_end"):
+            value = bounds.get(key)
+            assert isinstance(value, ast.Name) and value.id == key, (
+                f"line {call.lineno}: {key} is not passed the {key} variable"
+            )
+        stores = [
+            n
+            for stmt in loop.body
+            for n in ast.walk(stmt)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add_record"
+        ]
+        assert stores, f"line {loop.lineno}: loop body does not call add_record"
 
 
 def test_both_sglang_record_builders_attach_wall_clock_bounds():
     """Expected: both SGLang forward-pass wrappers, forward_expert_record and
-    forward_profiling_only, put t_start and t_end into the record they build
-    for each pass.
+    forward_profiling_only, set the "t_start" and "t_end" entries of the
+    record they build for each pass to their t_start and t_end variables.
 
-    Check: parse each wrapper's source, collect the string keys of every dict
-    literal in it, and assert "t_start" and "t_end" are among them."""
-    tree = ast.parse(SGLANG_PATH.read_text(encoding="utf-8"))
+    Check: parse each wrapper's source and find its record dict, the one dict
+    literal with a "latency" key. Assert its "t_start" and "t_end" values are
+    the t_start and t_end variables, so a swapped pair or a perf_counter value
+    (start_time, end_time) fails."""
     for name in ("forward_expert_record", "forward_profiling_only"):
-        func = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        )
-        record_keys = {
-            key.value
+        func = _function_def(SGLANG_PATH, name)
+        records = [
+            n
             for n in ast.walk(func)
             if isinstance(n, ast.Dict)
-            for key in n.keys
-            if isinstance(key, ast.Constant)
+            and any(
+                isinstance(k, ast.Constant) and k.value == "latency" for k in n.keys
+            )
+        ]
+        assert len(records) == 1, f"{name}: expected one record dict with latency"
+        entries = {
+            k.value: v
+            for k, v in zip(records[0].keys, records[0].values)
+            if isinstance(k, ast.Constant)
         }
-        assert {"t_start", "t_end"} <= record_keys, name
+        for key in ("t_start", "t_end"):
+            value = entries.get(key)
+            assert isinstance(value, ast.Name) and value.id == key, (
+                f"{name}: record[{key!r}] is not the {key} variable"
+            )
+
+
+def _function_def(path, name):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path.name}")
 
 
 def _is_time_time(node):
@@ -251,25 +306,22 @@ def test_wall_clock_bounds_are_taken_inside_the_synchronize_bracket():
     t_end are each set once from time.time(), the clock external traces use.
     t_start is taken after the synchronize that precedes the forward call and
     before the call itself; t_end is taken after the synchronize that follows
-    it. The bounds then cover the same GPU work as the latency timer.
+    it and before latency is computed. The bounds then cover the same GPU
+    work as the latency timer.
 
     Check: parse each wrapper's source. Assert t_start and t_end are each
     assigned exactly once, from time.time(). Then compare line numbers: the
     last torch.cuda.synchronize() before the forward call must come before
-    t_start, t_start before the forward call, and the first synchronize after
-    the forward call before t_end."""
+    t_start, t_start before the forward call, the first synchronize after the
+    forward call before t_end, and t_end before the first latency assignment
+    after the forward call."""
     cases = [
         (SGLANG_PATH, "forward_expert_record", "_call_forward_raw"),
         (SGLANG_PATH, "forward_profiling_only", "_call_forward_raw"),
         (VLLM_PATH, "execute_model_custom", "_original_execute_model"),
     ]
     for path, name, forward_call in cases:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        func = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        )
+        func = _function_def(path, name)
         assigned = {}
         for n in ast.walk(func):
             if (
@@ -286,17 +338,34 @@ def test_wall_clock_bounds_are_taken_inside_the_synchronize_bracket():
 
         syncs = sorted(n.lineno for n in ast.walk(func) if _is_cuda_synchronize(n))
         forward = min(
-            n.lineno
-            for n in ast.walk(func)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == forward_call
+            (
+                n.lineno
+                for n in ast.walk(func)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == forward_call
+            ),
+            default=None,
         )
+        assert forward is not None, f"{name}: {forward_call}() not found"
+        latency = min(
+            (
+                n.lineno
+                for n in ast.walk(func)
+                if isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "latency" for t in n.targets
+                )
+                and n.lineno > forward
+            ),
+            default=None,
+        )
+        assert latency is not None, f"{name}: no latency assignment after {forward_call}()"
         before = [line for line in syncs if line < forward]
         after = [line for line in syncs if line > forward]
         assert before and after, f"{name}: forward call not bracketed by synchronize"
         assert before[-1] < assigned["t_start"] < forward, name
-        assert after[0] < assigned["t_end"], name
+        assert after[0] < assigned["t_end"] < latency, name
 
 
 def test_both_sglang_record_builders_attach_scheduled_tokens():
