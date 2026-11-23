@@ -488,7 +488,7 @@ def forward_expert_record(
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         # Get wall time also so we can match external traces to the
-        # phase boundaries we find here.
+        # forward pass boundaries we find here.
         t_start = time.time()
         output = _call_forward_raw(
             self,
@@ -682,7 +682,7 @@ def forward_profiling_only(
     with recorder.disable_this_region():
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        # As above, get walltime to enable matches to external traces.
+        # As above, get wall time to enable matches to external traces.
         t_start = time.time()
         output = _call_forward_raw(
             self,

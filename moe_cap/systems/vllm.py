@@ -440,13 +440,14 @@ def _is_recording_rank():
 
 
 def _finalize_pass_records(records, t_start, t_end):
-    """Stamp the engine-uniform token field on per-pass records before storing.
+    """Stamp the engine-uniform token field and the pass's wall time bounds on
+    per-pass records before storing.
 
     vLLM's seq_lens_sum is already the tokens scheduled in this pass, so
     scheduled_tokens republishes it under the engine-uniform name (SGLang's
     seq_lens_sum is a running context sum instead, a different quantity).
 
-    t_start/t_end are the pass's wall-clock bounds (time.time()), so passes
+    t_start/t_end are the pass's wall time bounds (time.time()), so passes
     can be lined up against external traces such as GPU energy counters.
     """
     for rec in records:
