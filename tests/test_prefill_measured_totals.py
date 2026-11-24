@@ -7,6 +7,8 @@ published aggregates keep their historical bases.
 """
 
 import ast
+import io
+import json
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,9 +144,10 @@ class PrefillStepTotalsTest(unittest.TestCase):
 
 class DetailedWriterProjectionTest(unittest.TestCase):
     """The detailed-results writer stays the historical inline projection;
-    the only change is carrying scheduled_tokens through when a record has
-    it (records without it project byte-identically — evidenced end-to-end
-    against real archived traces in the writer dry run)."""
+    the changes are carrying scheduled_tokens and the t_start/t_end wall time
+    bounds through when a record has them (records without them project
+    byte-identically — for scheduled_tokens, evidenced end-to-end against
+    real archived traces in the writer dry run)."""
 
     def test_writer_carries_scheduled_tokens_only_when_present(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
@@ -156,6 +159,55 @@ class DetailedWriterProjectionTest(unittest.TestCase):
     def test_writer_does_not_project_a_schema_field(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
         self.assertNotIn("record_schema", source)
+
+    def test_writer_carries_wall_clock_bounds_only_when_present(self):
+        """Expected: for every server record, prefill or decode, the line the
+        detailed-results writer writes carries t_start and t_end when the
+        record has them set, and leaves them out when they are missing or
+        None, so records from older recorders are written as before.
+
+        Check: find the writer's loop over enumerate(server_records) in
+        openai_api_profile.py and run it, writing into an in-memory file, on
+        four server records: a prefill and a decode record with bounds, one
+        record without them, and one with both set to None. Parse the lines
+        written and assert the first two carry exactly their bounds and the
+        other two carry neither key."""
+        tree = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"))
+        loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "enumerate"
+            and isinstance(node.iter.args[0], ast.Name)
+            and node.iter.args[0].id == "server_records"
+        ]
+        self.assertEqual(len(loops), 1, "expected one detailed-results writer loop")
+        code = compile(
+            ast.Module(body=loops, type_ignores=[]), str(SOURCE_PATH), "exec"
+        )
+
+        prefill_bounds = {"t_start": 1700000000.123456, "t_end": 1700000000.234567}
+        decode_bounds = {"t_start": 1700000000.3, "t_end": 1700000000.31}
+        server_records = [
+            {"forward_mode": "prefill", "latency": 0.11, **prefill_bounds},
+            {"forward_mode": "decode", "latency": 0.01, **decode_bounds},
+            {"forward_mode": "decode", "latency": 0.01},
+            {"forward_mode": "decode", "latency": 0.01, "t_start": None, "t_end": None},
+        ]
+        f = io.StringIO()
+        exec(code, {"server_records": server_records, "f": f, "json": json})
+        written = [json.loads(line) for line in f.getvalue().splitlines()]
+
+        self.assertEqual(len(written), 4)
+        for line, bounds in zip(written[:2], (prefill_bounds, decode_bounds)):
+            self.assertEqual(
+                {k: line[k] for k in ("t_start", "t_end") if k in line}, bounds
+            )
+        for line in written[2:]:
+            self.assertNotIn("t_start", line)
+            self.assertNotIn("t_end", line)
 
 
 class MetricsWiringTest(unittest.TestCase):

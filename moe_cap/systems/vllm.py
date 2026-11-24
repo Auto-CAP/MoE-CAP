@@ -439,15 +439,21 @@ def _is_recording_rank():
         return True
 
 
-def _finalize_pass_records(records):
-    """Stamp the engine-uniform token field on per-pass records before storing.
+def _finalize_pass_records(records, t_start, t_end):
+    """Stamp the engine-uniform token field and the pass's wall time bounds on
+    per-pass records before storing.
 
     vLLM's seq_lens_sum is already the tokens scheduled in this pass, so
     scheduled_tokens republishes it under the engine-uniform name (SGLang's
     seq_lens_sum is a running context sum instead, a different quantity).
+
+    t_start/t_end are the pass's wall time bounds (time.time()), so passes
+    can be lined up against external traces such as GPU energy counters.
     """
     for rec in records:
         rec["scheduled_tokens"] = rec["seq_lens_sum"]
+        rec["t_start"] = t_start
+        rec["t_end"] = t_end
     return records
 
 
@@ -629,6 +635,7 @@ def execute_model_custom(
     # ======== START TIMING ========
     torch.cuda.synchronize()
     start_time = time.perf_counter()
+    t_start = time.time()
 
     # Call original execute_model
     result = _original_execute_model(self, scheduler_output, intermediate_tensors)
@@ -636,6 +643,7 @@ def execute_model_custom(
     # ======== END TIMING ========
     torch.cuda.synchronize()
     end_time = time.perf_counter()
+    t_end = time.time()
     latency = end_time - start_time
 
     # Determine batch info from vLLM v1 SchedulerOutput.
@@ -813,7 +821,7 @@ def execute_model_custom(
                 records_to_add[-1]["req_ids"] = sorted(decode_req_ids)
             if forward_mode == "prefill" and per_req_info:
                 records_to_add[-1]["per_req_info"] = per_req_info
-        for rec_dict in _finalize_pass_records(records_to_add):
+        for rec_dict in _finalize_pass_records(records_to_add, t_start, t_end):
             recording_state.add_record(rec_dict)
 
     # Automatic expert distribution recording
@@ -859,7 +867,7 @@ def execute_model_custom(
                     })
                     if forward_mode == "prefill" and per_req_info:
                         records_to_add[-1]["per_req_info"] = per_req_info
-                for record_dict in _finalize_pass_records(records_to_add):
+                for record_dict in _finalize_pass_records(records_to_add, t_start, t_end):
                     expert_distribution_recording_state.add_record(record_dict)
                 logger.debug(
                     f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}"

@@ -1673,6 +1673,10 @@ class OpenAIAPIMoEProfiler:
                         # from recorders that predate the field.
                         if sr.get("scheduled_tokens") is not None:
                             record["scheduled_tokens"] = sr["scheduled_tokens"]
+                        # Keep the time bounds for the forward pass if we have them.
+                        for key in ("t_start", "t_end"):
+                            if sr.get(key) is not None:
+                                record[key] = sr[key]
                         f.write(json.dumps(record) + "\n")
                 else:
                     print("Warning: No server records available for detailed results")

@@ -487,6 +487,9 @@ def forward_expert_record(
     ):
         torch.cuda.synchronize()
         start_time = time.perf_counter()
+        # Get wall time also so we can match external traces to the
+        # forward pass boundaries we find here.
+        t_start = time.time()
         output = _call_forward_raw(
             self,
             forward_batch,
@@ -498,6 +501,7 @@ def forward_expert_record(
 
         torch.cuda.synchronize()
         end_time = time.perf_counter()
+        t_end = time.time()
         latency = end_time - start_time
 
     logger.debug(f"Batch size: {forward_batch.batch_size}")
@@ -547,6 +551,8 @@ def forward_expert_record(
             "forward_pass_id": self.forward_pass_id,
             "batch_size": forward_batch.batch_size,
             "latency": latency,
+            "t_start": t_start,
+            "t_end": t_end,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
             "expert_activation": non_zero_value,
@@ -676,6 +682,8 @@ def forward_profiling_only(
     with recorder.disable_this_region():
         torch.cuda.synchronize()
         start_time = time.perf_counter()
+        # As above, get wall time to enable matches to external traces.
+        t_start = time.time()
         output = _call_forward_raw(
             self,
             forward_batch,
@@ -686,6 +694,7 @@ def forward_profiling_only(
         )
         torch.cuda.synchronize()
         end_time = time.perf_counter()
+        t_end = time.time()
         latency = end_time - start_time
 
     sum_seq_len = forward_batch.seq_lens_sum
@@ -705,6 +714,8 @@ def forward_profiling_only(
             "forward_pass_id": self.forward_pass_id,
             "batch_size": forward_batch.batch_size,
             "latency": latency,
+            "t_start": t_start,
+            "t_end": t_end,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
             "expert_activation": 0,
